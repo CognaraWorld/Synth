@@ -1,0 +1,12 @@
+{
+  "preset": "ts-jest",
+  "testEnvironment": "node",
+  "roots": ["<rootDir>/tests"],
+  "testMatch": ["**/*.test.ts"],
+  "collectCoverageFrom": ["src/**/*.ts"],
+  "coveragePathIgnorePatterns": ["/node_modules/", "/dist/"],
+  "moduleFileExtensions": ["ts", "js", "json"],
+  "moduleNameMapper": {
+    "^(\\.{1,2}/.*)\\.js$": "$1"
+  }
+}
