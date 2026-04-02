@@ -1,0 +1,38 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.18
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# AI / ML
+anthropic==0.42.0
+chromadb==0.5.23
+sentence-transformers==3.3.1
+
+# Audio
+silero-vad==5.1.2
+faster-whisper==1.1.0
+
+# TTS
+kokoro==0.3.4
+
+# Document processing
+python-docx==1.1.2
+pdfplumber==0.11.4
+
+# Web search
+httpx==0.28.1
+
+# Utils
+python-dotenv==1.0.1
+pydantic==2.10.0
+pydantic-settings==2.7.0
