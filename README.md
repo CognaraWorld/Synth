@@ -23,7 +23,7 @@ Synth joins your meetings and participates like a real team member:
 | Voice Activity Detection | Silero VAD |
 | Speech-to-Text | Whisper Large-v3 Turbo (local) |
 | Text-to-Speech | Kokoro (local) |
-| LLM | Claude Haiku 4.5 + Sonnet 4.6 (hybrid routing) |
+| LLM | Claude Haiku 4.5 |
 | Web Search | SearXNG (self-hosted) |
 | Embeddings | all-MiniLM-L6-v2 (local) |
 | Vector DB | ChromaDB (in-memory) |
