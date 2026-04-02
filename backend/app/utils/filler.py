@@ -10,6 +10,10 @@ Phase 3 implementation.
 from __future__ import annotations
 
 import random
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.core.tts import TextToSpeech
 
 
 FILLER_PHRASES: list[str] = [
@@ -28,8 +32,8 @@ FILLER_PHRASES: list[str] = [
 class FillerManager:
     """Manages filler audio responses for latency masking.
 
-    Pre-synthesizes filler phrases into audio on initialization so they
-    can be played instantly when needed, without waiting for TTS.
+    Pre-synthesizes filler phrases into audio when ``preload`` is called
+    so they can be played instantly when needed, without waiting for TTS.
 
     Attributes:
         phrases: List of filler phrase strings.
@@ -37,24 +41,47 @@ class FillerManager:
     """
 
     def __init__(self) -> None:
-        """Initialize the filler manager and pre-synthesize audio.
+        """Initialize the filler manager.
 
-        Pre-generates audio for all filler phrases so they can be
-        served instantly without TTS latency.
+        Sets up the phrase list and an empty audio cache. Call
+        ``preload(tts_engine)`` once a TTS instance is available to
+        pre-synthesize audio for all phrases.
         """
         self.phrases = FILLER_PHRASES
         self._cache: dict[str, bytes] = {}
-        # TODO: Initialize TTS and pre-synthesize all filler phrases
-        raise NotImplementedError("Phase 3 implementation")
 
-    def get_random_filler(self) -> bytes:
-        """Return a random pre-synthesized filler audio response.
+    def get_random_filler(self) -> str:
+        """Return a random filler phrase string.
 
-        Selects a random filler phrase and returns its pre-generated
-        audio bytes for immediate playback.
+        Useful before TTS is available or when only the text is needed.
+
+        Returns:
+            A random filler phrase as a plain string.
+        """
+        return random.choice(self.phrases)
+
+    def preload(self, tts_engine: TextToSpeech) -> None:
+        """Pre-synthesize all filler phrases using the provided TTS engine.
+
+        Args:
+            tts_engine: An initialized TextToSpeech instance used to
+                convert each phrase into audio bytes.
+        """
+        for phrase in self.phrases:
+            self._cache[phrase] = tts_engine.synthesize(phrase)
+
+    def get_random_filler_audio(self) -> bytes:
+        """Return random pre-synthesized filler audio bytes.
+
+        Raises:
+            RuntimeError: If ``preload`` has not been called yet.
 
         Returns:
             Raw audio bytes (PCM format) of a random filler phrase.
         """
-        # TODO: Select random phrase, return cached audio bytes
-        raise NotImplementedError("Phase 3 implementation")
+        if not self._cache:
+            raise RuntimeError(
+                "Filler audio not preloaded. Call preload(tts_engine) first."
+            )
+        phrase = random.choice(self.phrases)
+        return self._cache[phrase]

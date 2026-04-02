@@ -9,7 +9,8 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 
 
 class RawTranscriptBuffer:
@@ -18,6 +19,8 @@ class RawTranscriptBuffer:
     Stores timestamped transcript entries and provides efficient
     retrieval of the most recent conversation window. Automatically
     prunes entries older than max_minutes.
+
+    Thread-safe: all public methods acquire an internal lock.
 
     Attributes:
         max_minutes: Maximum number of minutes of transcript to retain.
@@ -32,8 +35,17 @@ class RawTranscriptBuffer:
         """
         self.max_minutes = max_minutes
         self._entries: list[tuple[datetime, str]] = []
-        # TODO: Initialize internal buffer data structure
-        raise NotImplementedError("Phase 3 implementation")
+        self._lock = threading.Lock()
+
+    def _prune(self) -> None:
+        """Remove entries older than max_minutes.
+
+        Must be called while holding ``self._lock``.
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=self.max_minutes)
+        self._entries = [
+            (ts, text) for ts, text in self._entries if ts >= cutoff
+        ]
 
     def append(self, text: str, timestamp: datetime | None = None) -> None:
         """Add a new transcript entry to the buffer.
@@ -42,8 +54,12 @@ class RawTranscriptBuffer:
             text: The transcript text to store.
             timestamp: When this text was captured. Defaults to now.
         """
-        # TODO: Append entry with timestamp, prune old entries
-        raise NotImplementedError("Phase 3 implementation")
+        if timestamp is None:
+            timestamp = datetime.utcnow()
+
+        with self._lock:
+            self._entries.append((timestamp, text))
+            self._prune()
 
     def get_recent(self, minutes: int = 5) -> str:
         """Retrieve the most recent transcript text.
@@ -56,13 +72,34 @@ class RawTranscriptBuffer:
             Concatenated transcript text from the requested time window,
             ordered chronologically.
         """
-        # TODO: Filter entries by timestamp, concatenate and return
-        raise NotImplementedError("Phase 3 implementation")
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+
+        with self._lock:
+            filtered = [
+                text for ts, text in self._entries if ts >= cutoff
+            ]
+
+        return "\n".join(filtered)
+
+    def get_full_text(self) -> str:
+        """Return all buffered text concatenated chronologically.
+
+        Returns:
+            Concatenated transcript text from all entries currently in
+            the buffer, joined by newlines.
+        """
+        with self._lock:
+            return "\n".join(text for _ts, text in self._entries)
 
     def clear(self) -> None:
         """Clear all entries from the buffer.
 
         Used when resetting between sessions or when the meeting ends.
         """
-        # TODO: Clear internal buffer
-        raise NotImplementedError("Phase 3 implementation")
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        """Return the number of entries currently in the buffer."""
+        with self._lock:
+            return len(self._entries)
