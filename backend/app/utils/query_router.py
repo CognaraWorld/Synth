@@ -9,6 +9,49 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+# Analytical keywords that signal a question requiring deeper reasoning.
+_ANALYTICAL_KEYWORDS: tuple[str, ...] = (
+    "summarize",
+    "analyze",
+    "compare",
+    "contrast",
+    "explain why",
+    "implications",
+    "impact",
+    "pros and cons",
+    "trade-offs",
+    "evaluate",
+    "assess",
+    "recommend",
+    "strategy",
+    "how does this affect",
+    "what are the consequences",
+)
+
+# Multi-part indicators that suggest the question has several sub-parts.
+_MULTI_PART_INDICATORS: tuple[str, ...] = (
+    "and also",
+    "additionally",
+    "furthermore",
+    "as well as",
+    "on top of that",
+)
+
+# Keywords that suggest the question needs live web data.
+_WEB_SEARCH_KEYWORDS: tuple[str, ...] = (
+    "current",
+    "latest",
+    "today",
+    "price",
+    "stock",
+    "news",
+    "weather",
+    "recent",
+    "right now",
+    "how much does",
+    "what time",
+)
+
 
 def route(question: str) -> str:
     """Classify a question and determine the target model tier.
@@ -35,6 +78,46 @@ def route(question: str) -> str:
     Returns:
         "haiku" for simple questions or "sonnet" for complex ones.
     """
-    # TODO: Implement keyword-based heuristics for complexity classification
-    # TODO: Consider question length, structure, and analytical keywords
-    raise NotImplementedError("Phase 3 implementation")
+    question_lower = question.lower()
+
+    # Check for analytical keywords.
+    for keyword in _ANALYTICAL_KEYWORDS:
+        if keyword in question_lower:
+            return "sonnet"
+
+    # Check for multi-part indicators.
+    for indicator in _MULTI_PART_INDICATORS:
+        if indicator in question_lower:
+            return "sonnet"
+
+    # Long questions (> 50 words) are likely complex.
+    if len(question.split()) > 50:
+        return "sonnet"
+
+    # Multiple question marks suggest a multi-part question.
+    if question.count("?") > 1:
+        return "sonnet"
+
+    return "haiku"
+
+
+def needs_web_search(question: str) -> bool:
+    """Determine whether a question likely needs live web data.
+
+    Uses keyword heuristics to identify questions about current events,
+    real-time prices, weather, news, and other time-sensitive topics
+    that cannot be answered from static meeting context alone.
+
+    Args:
+        question: The user's question text.
+
+    Returns:
+        True if the question likely requires a web search, False otherwise.
+    """
+    question_lower = question.lower()
+
+    for keyword in _WEB_SEARCH_KEYWORDS:
+        if keyword in question_lower:
+            return True
+
+    return False
