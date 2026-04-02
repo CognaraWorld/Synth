@@ -278,34 +278,32 @@ class TestSearchClientResults:
 
     def test_search_error_graceful(self) -> None:
         """An HTTP error should be handled gracefully, returning an empty list."""
+        import httpx
+
         with patch("app.core.search.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock(searxng_url="http://localhost:8080")
 
-            with patch("app.core.search.httpx", create=True) as mock_httpx:
-                mock_async_client = AsyncMock()
-                mock_async_client.get.side_effect = Exception(
-                    "Connection refused"
-                )
-                mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-                mock_async_client.__aexit__ = AsyncMock(return_value=False)
-                mock_httpx.AsyncClient.return_value = mock_async_client
+            mock_async_client = AsyncMock()
+            mock_async_client.get.side_effect = httpx.ConnectError(
+                "Connection refused"
+            )
 
-                client = object.__new__(
-                    __import__(
-                        "app.core.search", fromlist=["SearchClient"]
-                    ).SearchClient
-                )
-                client.base_url = "http://localhost:8080"
-                client.max_results = 5
-                client.settings = mock_settings.return_value
-                client._client = mock_async_client
+            client = object.__new__(
+                __import__(
+                    "app.core.search", fromlist=["SearchClient"]
+                ).SearchClient
+            )
+            client.base_url = "http://localhost:8080"
+            client.max_results = 5
+            client.settings = mock_settings.return_value
+            client._client = mock_async_client
 
-                async def _run() -> list:
-                    return await client.search("test query")
+            async def _run() -> list:
+                return await client.search("test query")
 
-                results = asyncio.get_event_loop().run_until_complete(_run())
+            results = asyncio.get_event_loop().run_until_complete(_run())
 
-                assert results == []
+            assert results == []
 
     def test_search_formatted(self) -> None:
         """Search results should produce a formatted string summary."""
