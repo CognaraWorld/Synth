@@ -56,6 +56,12 @@ class SearchClient:
         self.max_results = max_results
         self._client = httpx.AsyncClient(timeout=10.0)
 
+    async def __aenter__(self) -> SearchClient:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
     async def search(self, query: str) -> list[SearchResult]:
         """Execute a web search query.
 

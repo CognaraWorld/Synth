@@ -9,6 +9,8 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+import re
+
 # Analytical keywords that signal a question requiring deeper reasoning.
 _ANALYTICAL_KEYWORDS: tuple[str, ...] = (
     "summarize",
@@ -80,14 +82,14 @@ def route(question: str) -> str:
     """
     question_lower = question.lower()
 
-    # Check for analytical keywords.
+    # Check for analytical keywords using word boundaries.
     for keyword in _ANALYTICAL_KEYWORDS:
-        if keyword in question_lower:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', question_lower):
             return "sonnet"
 
-    # Check for multi-part indicators.
+    # Check for multi-part indicators using word boundaries.
     for indicator in _MULTI_PART_INDICATORS:
-        if indicator in question_lower:
+        if re.search(r'\b' + re.escape(indicator) + r'\b', question_lower):
             return "sonnet"
 
     # Long questions (> 50 words) are likely complex.
@@ -117,7 +119,7 @@ def needs_web_search(question: str) -> bool:
     question_lower = question.lower()
 
     for keyword in _WEB_SEARCH_KEYWORDS:
-        if keyword in question_lower:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', question_lower):
             return True
 
     return False

@@ -44,6 +44,8 @@ class VisionProcessor:
                 "claude-vision" (uses Claude's vision capabilities).
         """
         self.ocr_engine = ocr_engine
+        self._client = None
+        self._async_client = None
 
         if self.ocr_engine == "claude-vision":
             settings = get_settings()
