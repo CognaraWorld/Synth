@@ -7,8 +7,10 @@ import {
   Bot,
   Video,
   Settings,
+  LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 
 const navigation = [
   { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
@@ -16,6 +18,11 @@ const navigation = [
   { name: "Meetings", href: "/dashboard/meetings", icon: Video },
   { name: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
+
+function handleLogout() {
+  localStorage.removeItem("auth_token");
+  window.location.href = "/";
+}
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -50,8 +57,17 @@ export function Sidebar() {
           );
         })}
       </nav>
-      <div className="border-t border-border p-4">
-        <p className="text-xs text-muted-foreground">Synth v0.1.0</p>
+      <div className="border-t border-border p-3">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+          onClick={handleLogout}
+        >
+          <LogOut className="size-4" />
+          Logout
+        </Button>
+        <p className="mt-2 px-3 text-xs text-muted-foreground">Synth v0.1.0</p>
       </div>
     </aside>
   );

@@ -1,5 +1,10 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Video } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -8,54 +13,18 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { MeetingsPageSkeleton } from "@/components/dashboard/loading-skeleton";
+import { getMeetings } from "@/lib/api";
 
-const meetings = [
-  {
-    id: "1",
-    title: "Product Sync",
-    platform: "Google Meet",
-    agent: "Note Taker",
-    date: "2026-04-01",
-    duration: "32 min",
-    status: "completed" as const,
-  },
-  {
-    id: "2",
-    title: "Sprint Retrospective",
-    platform: "Zoom",
-    agent: "Standup Bot",
-    date: "2026-03-31",
-    duration: "45 min",
-    status: "completed" as const,
-  },
-  {
-    id: "3",
-    title: "Client Demo",
-    platform: "Teams",
-    agent: "Sales Call Analyst",
-    date: "2026-03-30",
-    duration: "28 min",
-    status: "processing" as const,
-  },
-  {
-    id: "4",
-    title: "Design Review",
-    platform: "Google Meet",
-    agent: "Note Taker",
-    date: "2026-03-29",
-    duration: "51 min",
-    status: "completed" as const,
-  },
-  {
-    id: "5",
-    title: "Investor Update",
-    platform: "Zoom",
-    agent: "Sales Call Analyst",
-    date: "2026-03-28",
-    duration: "38 min",
-    status: "completed" as const,
-  },
-];
+interface Meeting {
+  id: string;
+  title: string;
+  platform: string;
+  agent: string;
+  date: string;
+  duration: string;
+  status: "completed" | "processing" | "failed";
+}
 
 function EmptyState() {
   return (
@@ -74,6 +43,48 @@ function EmptyState() {
 }
 
 export default function MeetingsPage() {
+  const router = useRouter();
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function fetchMeetings() {
+      try {
+        const data = await getMeetings();
+        setMeetings(Array.isArray(data) ? data : []);
+      } catch (err) {
+        setError("Failed to load meetings. Please try again.");
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchMeetings();
+  }, []);
+
+  if (loading) {
+    return <MeetingsPageSkeleton />;
+  }
+
+  if (error) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Meetings</h1>
+          <p className="text-sm text-muted-foreground">
+            View transcripts and summaries from past meetings.
+          </p>
+        </div>
+        <div className="flex flex-col items-center justify-center gap-4 py-16">
+          <p className="text-sm text-destructive">{error}</p>
+          <Button variant="outline" size="sm" onClick={() => window.location.reload()}>
+            Retry
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   const hasMeetings = meetings.length > 0;
 
   return (
@@ -103,12 +114,16 @@ export default function MeetingsPage() {
                 <TableRow
                   key={meeting.id}
                   className="cursor-pointer"
+                  onClick={() => router.push(`/dashboard/meetings/${meeting.id}`)}
                 >
                   <TableCell className="font-medium">
                     {meeting.title}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {meeting.platform}
+                    <span className="inline-flex items-center gap-1.5">
+                      <Video className="size-3.5" />
+                      {meeting.platform}
+                    </span>
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {meeting.agent}
