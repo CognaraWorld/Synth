@@ -10,6 +10,8 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class RollingSummary:
     """Incrementally summarizes meeting transcripts.
@@ -35,8 +37,16 @@ class RollingSummary:
         self.summary: str = ""
         self.update_interval_chars = update_interval_chars
         self._pending_text: str = ""
-        # TODO: Initialize LLM client for summarization calls
-        raise NotImplementedError("Phase 3 implementation")
+        self._llm_client: Any | None = None
+
+    def set_llm_client(self, llm_client: Any) -> None:
+        """Inject the LLM client used for summarization calls.
+
+        Args:
+            llm_client: An object with a ``query(context, question)`` method
+                (e.g. :class:`~app.core.llm.LLMClient`).
+        """
+        self._llm_client = llm_client
 
     async def update(self, new_transcript_chunk: str) -> None:
         """Incorporate a new transcript chunk into the summary.
@@ -47,15 +57,63 @@ class RollingSummary:
         Args:
             new_transcript_chunk: New transcript text to incorporate.
         """
-        # TODO: Accumulate chunk, check interval, call LLM to update summary
-        raise NotImplementedError("Phase 3 implementation")
+        self._pending_text += new_transcript_chunk
+
+        if (
+            len(self._pending_text) >= self.update_interval_chars
+            and self._llm_client is not None
+        ):
+            prompt = (
+                "You are summarizing a meeting. Here is the current summary:\n"
+                f"{self.summary}\n\n"
+                "New transcript:\n"
+                f"{self._pending_text}\n\n"
+                "Update the summary to include the key points from the new "
+                "transcript. Keep it concise (under 500 words). Focus on "
+                "decisions, action items, and important topics discussed."
+            )
+
+            # Support both sync and async LLM clients gracefully.
+            import asyncio
+
+            result = self._llm_client.query(context="", question=prompt)
+            if asyncio.iscoroutine(result):
+                result = await result
+
+            self.summary = result
+            self._pending_text = ""
 
     def get_summary(self) -> str:
         """Return the current rolling summary.
 
+        If there is pending text that has not yet been summarized, it is
+        appended as a note so the caller always sees the freshest content.
+
         Returns:
-            The accumulated summary text. Returns empty string if no
-            transcript has been processed yet.
+            The accumulated summary text, potentially with a pending-text
+            addendum. Returns empty string if no transcript has been
+            processed yet and no pending text exists.
         """
-        # TODO: Return current summary, possibly with pending text appended
-        raise NotImplementedError("Phase 3 implementation")
+        if self._pending_text:
+            return (
+                self.summary
+                + "\n\n[Recent, not yet summarized]: "
+                + self._pending_text
+            )
+        return self.summary
+
+    def get_pending_length(self) -> int:
+        """Return the character length of text awaiting summarization.
+
+        Returns:
+            Number of characters in the pending buffer.
+        """
+        return len(self._pending_text)
+
+    def reset(self) -> None:
+        """Clear the summary and all pending text.
+
+        Used when resetting between sessions or when the meeting ends.
+        """
+        self.summary = ""
+        self._pending_text = ""

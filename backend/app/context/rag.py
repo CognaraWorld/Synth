@@ -11,6 +11,10 @@ Phase 4 implementation.
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
+
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 
 class RAGPipeline:
@@ -38,9 +42,11 @@ class RAGPipeline:
         """
         self.collection_name = collection_name
         self.embedding_model = embedding_model
-        # TODO: Initialize ChromaDB client and collection
-        # TODO: Load sentence-transformers model
-        raise NotImplementedError("Phase 4 implementation")
+        self._client = chromadb.Client()
+        self._collection = self._client.get_or_create_collection(
+            name=self.collection_name,
+        )
+        self._model = SentenceTransformer(self.embedding_model)
 
     def add_chunk(self, text: str, metadata: dict[str, Any]) -> None:
         """Add a text chunk to the vector store.
@@ -50,8 +56,35 @@ class RAGPipeline:
             metadata: Associated metadata (e.g., document_id, filename,
                 chunk_index, page_number).
         """
-        # TODO: Generate embedding, store in ChromaDB with metadata
-        raise NotImplementedError("Phase 4 implementation")
+        embedding = self._model.encode(text).tolist()
+        self._collection.add(
+            ids=[str(uuid4())],
+            documents=[text],
+            metadatas=[metadata],
+            embeddings=[embedding],
+        )
+
+    def add_chunks_batch(self, chunks: list[dict[str, Any]]) -> None:
+        """Add multiple text chunks to the vector store in a single operation.
+
+        Args:
+            chunks: List of dicts, each containing ``text`` (str) and
+                ``metadata`` (dict) keys.
+        """
+        if not chunks:
+            return
+
+        texts = [c["text"] for c in chunks]
+        metadatas = [c["metadata"] for c in chunks]
+        ids = [str(uuid4()) for _ in chunks]
+        embeddings = self._model.encode(texts).tolist()
+
+        self._collection.add(
+            ids=ids,
+            documents=texts,
+            metadatas=metadatas,
+            embeddings=embeddings,
+        )
 
     def search(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
         """Search for the most relevant document chunks.
@@ -64,8 +97,28 @@ class RAGPipeline:
             List of dictionaries containing matched text, metadata,
             and similarity scores, sorted by relevance.
         """
-        # TODO: Embed query, search ChromaDB, return top_k results
-        raise NotImplementedError("Phase 4 implementation")
+        if self._collection.count() == 0:
+            return []
+
+        query_embedding = self._model.encode(query).tolist()
+        results = self._collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k, self._collection.count()),
+        )
+
+        output: list[dict[str, Any]] = []
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        for text, metadata, score in zip(documents, metadatas, distances):
+            output.append({
+                "text": text,
+                "metadata": metadata,
+                "score": score,
+            })
+
+        return output
 
     def embed(self, text: str) -> list[float]:
         """Generate an embedding vector for a text string.
@@ -76,5 +129,15 @@ class RAGPipeline:
         Returns:
             A list of floats representing the embedding vector.
         """
-        # TODO: Run text through sentence-transformers model
-        raise NotImplementedError("Phase 4 implementation")
+        return self._model.encode(text).tolist()
+
+    def clear(self) -> None:
+        """Delete the current collection and recreate it empty."""
+        self._client.delete_collection(name=self.collection_name)
+        self._collection = self._client.get_or_create_collection(
+            name=self.collection_name,
+        )
+
+    def count(self) -> int:
+        """Return the number of chunks currently stored in the collection."""
+        return self._collection.count()
