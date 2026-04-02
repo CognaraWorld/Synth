@@ -38,6 +38,9 @@ class User(Base):
 
     agents = relationship("Agent", back_populates="user", cascade="all, delete-orphan")
     meetings = relationship("Meeting", back_populates="user", cascade="all, delete-orphan")
+    credit_transactions = relationship(
+        "CreditTransaction", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Agent(Base):
