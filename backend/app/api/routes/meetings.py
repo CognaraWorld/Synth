@@ -1,4 +1,3 @@
-import re
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,23 +8,17 @@ from sqlalchemy.orm import joinedload
 from app.api.routes.auth import get_current_user
 from app.models.database import Agent, Meeting, MeetingSummary, User, get_db
 from app.models.schemas import MeetingCreate, MeetingDetailResponse, MeetingResponse
+from app.utils.meeting_links import detect_meeting_platform
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
 
 def detect_platform(meeting_link: str) -> str:
-    """Auto-detect meeting platform from URL."""
-    link = meeting_link.lower()
-    if "zoom.us" in link or "zoom.com" in link:
-        return "zoom"
-    elif "teams.microsoft.com" in link or "teams.live.com" in link:
-        return "teams"
-    elif "meet.google.com" in link:
-        return "meet"
-    raise HTTPException(
-        status_code=400,
-        detail="Unsupported meeting platform. Provide a Zoom, Teams, or Google Meet link.",
-    )
+    """Auto-detect meeting platform from a validated URL."""
+    try:
+        return detect_meeting_platform(meeting_link)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/", response_model=MeetingResponse, status_code=status.HTTP_201_CREATED)

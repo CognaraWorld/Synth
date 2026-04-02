@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
@@ -9,6 +9,7 @@ from app.api.routes.auth import get_current_user
 from app.config import get_settings
 from app.models.database import Agent, Document, User, get_db
 from app.models.schemas import DocumentResponse
+from app.utils.storage import build_agent_upload_path, is_managed_path
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -32,49 +33,49 @@ async def upload_document(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify agent
-    result = await db.execute(
-        select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
-    )
-    agent = result.scalar_one_or_none()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    # Validate file
-    ext = get_file_extension(file.filename or "")
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type '.{ext}' not supported. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+    try:
+        result = await db.execute(
+            select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
         )
+        agent = result.scalar_one_or_none()
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
 
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
+        original_filename = Path(file.filename or "").name
+        ext = get_file_extension(original_filename)
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type '.{ext}' not supported. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            )
 
-    # Save file
-    upload_dir = os.path.join(settings.upload_dir, str(agent_id))
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, file.filename)
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
 
-    with open(file_path, "wb") as f:
-        f.write(content)
+        display_name, file_path = build_agent_upload_path(
+            Path(settings.upload_dir),
+            str(agent_id),
+            original_filename,
+        )
+        file_path.write_bytes(content)
 
-    document = Document(
-        agent_id=agent_id,
-        filename=file.filename,
-        file_path=file_path,
-        file_type=ext,
-        file_size=len(content),
-    )
-    db.add(document)
-    await db.commit()
-    await db.refresh(document)
+        document = Document(
+            agent_id=agent_id,
+            filename=display_name,
+            file_path=str(file_path),
+            file_type=ext,
+            file_size=len(content),
+        )
+        db.add(document)
+        await db.commit()
+        await db.refresh(document)
 
-    # TODO Phase 4: Parse document → chunk → embed into ChromaDB
-    # await document_processor.process(document)
-
-    return document
+        return document
+    finally:
+        await file.close()
 
 
 @router.get("/{agent_id}", response_model=list[DocumentResponse])
@@ -112,8 +113,10 @@ async def delete_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     # Delete file from disk
-    if os.path.exists(document.file_path):
-        os.remove(document.file_path)
+    if is_managed_path(Path(settings.upload_dir), document.file_path):
+        file_path = Path(document.file_path)
+        if file_path.exists():
+            file_path.unlink()
 
     await db.delete(document)
     await db.commit()
