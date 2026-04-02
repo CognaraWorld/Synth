@@ -3,25 +3,46 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { createAgent } from "@/lib/api";
 
 export default function NewAgentPage() {
   const router = useRouter();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<"general" | "custom">("general");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    // Will integrate with API later
-    console.log({ name, description, mode });
-    router.push("/dashboard/agents");
+    setError(null);
+    setSubmitting(true);
+
+    try {
+      await createAgent({ name: name.trim(), description: description.trim(), mode });
+      router.push("/dashboard/agents");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to create agent. Please try again.";
+      setError(message);
+    } finally {
+      setSubmitting(false);
+    }
   }
+
+  const isFormValid = name.trim().length > 0 && description.trim().length > 0;
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
@@ -50,6 +71,12 @@ export default function NewAgentPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-5">
+            {error && (
+              <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3">
+                <p className="text-sm text-destructive">{error}</p>
+              </div>
+            )}
+
             <div className="space-y-2">
               <Label htmlFor="name">Agent Name</Label>
               <Input
@@ -57,6 +84,7 @@ export default function NewAgentPage() {
                 placeholder="e.g. Meeting Note Taker"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
+                disabled={submitting}
                 required
               />
             </div>
@@ -68,6 +96,7 @@ export default function NewAgentPage() {
                 placeholder="Describe what this agent should focus on during meetings..."
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
+                disabled={submitting}
                 rows={3}
               />
             </div>
@@ -78,6 +107,7 @@ export default function NewAgentPage() {
                 <button
                   type="button"
                   onClick={() => setMode("general")}
+                  disabled={submitting}
                   className={`flex flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
                     mode === "general"
                       ? "border-primary bg-primary/5"
@@ -92,6 +122,7 @@ export default function NewAgentPage() {
                 <button
                   type="button"
                   onClick={() => setMode("custom")}
+                  disabled={submitting}
                   className={`flex flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
                     mode === "custom"
                       ? "border-primary bg-primary/5"
@@ -107,12 +138,20 @@ export default function NewAgentPage() {
             </div>
 
             <div className="flex gap-3 pt-2">
-              <Button type="submit" disabled={!name.trim()}>
-                Create Agent
+              <Button type="submit" disabled={!isFormValid || submitting}>
+                {submitting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" data-icon="inline-start" />
+                    Creating...
+                  </>
+                ) : (
+                  "Create Agent"
+                )}
               </Button>
               <Button
                 type="button"
                 variant="outline"
+                disabled={submitting}
                 render={<Link href="/dashboard/agents" />}
               >
                 Cancel

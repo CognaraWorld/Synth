@@ -22,7 +22,7 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401 && typeof window !== "undefined") {
       localStorage.removeItem("auth_token");
-      window.location.href = "/";
+      window.location.href = "/login";
     }
     return Promise.reject(error);
   }
@@ -43,9 +43,19 @@ export async function register(
   return data;
 }
 
+export async function getMe() {
+  const { data } = await api.get("/auth/me");
+  return data;
+}
+
 // Agents
 export async function getAgents() {
   const { data } = await api.get("/agents");
+  return data;
+}
+
+export async function getAgent(id: string) {
+  const { data } = await api.get(`/agents/${id}`);
   return data;
 }
 
@@ -58,9 +68,19 @@ export async function createAgent(agent: {
   return data;
 }
 
+export async function deleteAgent(id: string) {
+  const { data } = await api.delete(`/agents/${id}`);
+  return data;
+}
+
 // Meetings
 export async function getMeetings() {
   const { data } = await api.get("/meetings");
+  return data;
+}
+
+export async function getMeeting(id: string) {
+  const { data } = await api.get(`/meetings/${id}`);
   return data;
 }
 
@@ -77,9 +97,19 @@ export async function createMeeting(meeting: {
 export async function uploadDocument(agentId: string, file: File) {
   const formData = new FormData();
   formData.append("file", file);
-  const { data } = await api.post(`/agents/${agentId}/documents`, formData, {
+  const { data } = await api.post(`/documents/upload/${agentId}`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
   });
+  return data;
+}
+
+export async function getDocuments(agentId: string) {
+  const { data } = await api.get(`/documents/${agentId}`);
+  return data;
+}
+
+export async function deleteDocument(id: string) {
+  const { data } = await api.delete(`/documents/${id}`);
   return data;
 }
 
