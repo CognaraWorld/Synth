@@ -1,7 +1,7 @@
 """Credit transaction model for tracking all credit movements."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
@@ -22,6 +22,6 @@ class CreditTransaction(Base):
     )  # "purchase", "meeting_used", "refund", "free_credit"
     description = Column(String(500), nullable=False)
     stripe_session_id = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="credit_transactions")

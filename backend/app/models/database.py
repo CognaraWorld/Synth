@@ -1,5 +1,9 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 from sqlalchemy import (
     Column,
@@ -33,8 +37,8 @@ class User(Base):
     hashed_password = Column(String(255), nullable=True)  # null if OAuth only
     provider = Column(String(50), default="email")  # email, google
     credits = Column(Integer, default=3)  # start with 3 free credits
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     agents = relationship("Agent", back_populates="user", cascade="all, delete-orphan")
     meetings = relationship("Meeting", back_populates="user", cascade="all, delete-orphan")
@@ -52,8 +56,8 @@ class Agent(Base):
     description = Column(Text, nullable=False)
     system_prompt = Column(Text, nullable=False)
     mode = Column(Enum("general", "custom", name="agent_mode"), default="general")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     user = relationship("User", back_populates="agents")
     documents = relationship("Document", back_populates="agent", cascade="all, delete-orphan")
@@ -71,7 +75,7 @@ class Document(Base):
     file_size = Column(Integer, default=0)
     parsed = Column(Boolean, default=False)
     chunk_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     agent = relationship("Agent", back_populates="documents")
 
@@ -94,7 +98,7 @@ class Meeting(Base):
     ended_at = Column(DateTime, nullable=True)
     duration_minutes = Column(Float, nullable=True)
     credits_used = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     user = relationship("User", back_populates="meetings")
     agent = relationship("Agent", back_populates="meetings")
@@ -112,7 +116,7 @@ class MeetingSummary(Base):
     decisions = Column(Text, nullable=True)
     pdf_path = Column(String(1024), nullable=True)
     docx_path = Column(String(1024), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     meeting = relationship("Meeting", back_populates="summary")
 
