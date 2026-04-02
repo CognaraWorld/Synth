@@ -9,6 +9,15 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+import re
+
+
+# Pattern handles: "hey synth", "hey, synth", "hey  synth", or just "synth"
+_WAKE_WORD_PATTERN = re.compile(
+    r"\b(?:hey[,\s]*)?synth\b",
+    re.IGNORECASE,
+)
+
 
 def detect(
     transcript_text: str,
@@ -36,7 +45,14 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
-    # TODO: Case-insensitive wake word matching
-    # TODO: Handle variations (e.g., "hey synth," vs "hey synth")
-    # TODO: Extract and clean the question text after the wake word
-    raise NotImplementedError("Phase 3 implementation")
+    match = _WAKE_WORD_PATTERN.search(transcript_text)
+    if match is None:
+        return (False, "")
+
+    # Extract everything after the wake word match
+    after = transcript_text[match.end():]
+
+    # Strip leading punctuation (commas, colons, etc.) and whitespace
+    question = re.sub(r"^[\s,;:!?\-]+", "", after).strip()
+
+    return (True, question)
