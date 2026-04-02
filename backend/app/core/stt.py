@@ -14,7 +14,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import numpy as np
-from faster_whisper import WhisperModel
+
+try:
+    from faster_whisper import WhisperModel
+except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+    WhisperModel = None
 
 
 @dataclass
@@ -81,13 +85,16 @@ class SpeechToText:
         self.language = language
         self.device = device
 
-        # Load faster-whisper model with CTranslate2 backend.
-        # int8 compute type for M4 Max CPU — fast and memory-efficient.
-        self._model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type="int8",
-        )
+        self._model = None
+        if WhisperModel is not None:
+            try:
+                self._model = WhisperModel(
+                    model_size,
+                    device=device,
+                    compute_type="int8",
+                )
+            except Exception:
+                self._model = None
 
     def transcribe(self, audio_segment: np.ndarray) -> TranscriptSegment:
         """Transcribe an audio segment into text.
@@ -103,6 +110,13 @@ class SpeechToText:
         # Ensure float32 dtype
         if audio_segment.dtype != np.float32:
             audio_segment = audio_segment.astype(np.float32)
+
+        if self._model is None:
+            return TranscriptSegment(
+                text="",
+                timestamp=datetime.now(timezone.utc),
+                confidence=0.0,
+            )
 
         segments_iter, _info = self._model.transcribe(
             audio_segment,
@@ -134,7 +148,7 @@ class SpeechToText:
 
         return TranscriptSegment(
             text=full_text,
-            timestamp=lambda: datetime.now(timezone.utc)(),
+            timestamp=datetime.now(timezone.utc),
             confidence=avg_confidence,
         )
 
@@ -151,6 +165,9 @@ class SpeechToText:
         """
         if audio_segment.dtype != np.float32:
             audio_segment = audio_segment.astype(np.float32)
+
+        if self._model is None:
+            return []
 
         segments_iter, _info = self._model.transcribe(
             audio_segment,
