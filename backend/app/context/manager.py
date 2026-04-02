@@ -10,6 +10,13 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
+from typing import Any
+
+from app.context.raw_buffer import RawTranscriptBuffer
+from app.context.rolling_summary import RollingSummary
+
 
 class ContextManager:
     """Assembles and manages the context window for LLM queries.
@@ -21,10 +28,10 @@ class ContextManager:
         max_context_tokens: Maximum tokens allocated for context.
         rolling_summary: The rolling transcript summarizer.
         raw_buffer: The raw transcript buffer.
-        rag_pipeline: The RAG retrieval pipeline.
+        rag_pipeline: The RAG retrieval pipeline (``None`` until set).
     """
 
-    def __init__(self, max_context_tokens: int = 4000) -> None:
+    def __init__(self, max_context_tokens: int = 8000) -> None:
         """Initialize the context manager and its sub-components.
 
         Args:
@@ -33,8 +40,88 @@ class ContextManager:
                 prompt and model response.
         """
         self.max_context_tokens = max_context_tokens
-        # TODO: Initialize RollingSummary, RawBuffer, RAGPipeline
-        raise NotImplementedError("Phase 3 implementation")
+        self.rolling_summary: RollingSummary = RollingSummary()
+        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=10)
+        self.rag_pipeline: Any | None = None
+
+    def set_rag_pipeline(self, rag: Any) -> None:
+        """Inject the RAG retrieval pipeline.
+
+        Args:
+            rag: An object with a ``search(query, top_k)`` method
+                (e.g. :class:`~app.context.rag.RAGPipeline`).
+        """
+        self.rag_pipeline = rag
+
+    # ------------------------------------------------------------------
+    # Token helpers
+    # ------------------------------------------------------------------
+
+    def get_token_count(self, text: str) -> int:
+        """Estimate the token count for a text string.
+
+        Uses a fast word-based approximation (words x 1.3) rather than
+        a full tokenizer, trading perfect accuracy for zero dependencies.
+
+        Args:
+            text: The text to count tokens for.
+
+        Returns:
+            Estimated token count.
+        """
+        return int(len(text.split()) * 1.3)
+
+    # ------------------------------------------------------------------
+    # Transcript ingestion
+    # ------------------------------------------------------------------
+
+    def add_transcript(self, text: str, timestamp: datetime | None = None) -> None:
+        """Append new transcript text to the raw buffer and rolling summary.
+
+        This is the primary entry point for feeding live transcript data
+        into the context layers.  The rolling summary update is async, so
+        it is stored for a later ``await`` by the caller if needed.
+
+        Args:
+            text: Transcript text segment.
+            timestamp: When the segment was captured. Defaults to now.
+        """
+        self.raw_buffer.append(text, timestamp=timestamp)
+
+        # RollingSummary.update is async. We schedule it on the running
+        # loop when one exists; otherwise the pending text simply
+        # accumulates and will be summarized on the next async call.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.rolling_summary.update(text))
+        except RuntimeError:
+            # No running event loop — accumulate in pending buffer directly
+            # so get_summary still shows the text.
+            self.rolling_summary._pending_text += text
+
+    # ------------------------------------------------------------------
+    # Context assembly
+    # ------------------------------------------------------------------
+
+    def _truncate_from_beginning(self, text: str, max_tokens: int) -> str:
+        """Truncate *text* from the beginning to fit within *max_tokens*.
+
+        Keeps the most recent content (end of string) which is typically
+        the most relevant for meeting context.
+
+        Args:
+            text: The source text.
+            max_tokens: Token budget for this section.
+
+        Returns:
+            The (possibly truncated) text.
+        """
+        words = text.split()
+        # Reverse the approximation: max_tokens / 1.3 ~ max_words
+        max_words = int(max_tokens / 1.3)
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[-max_words:])
 
     def assemble_context(self, question: str, session_id: str) -> str:
         """Build the full context string for an LLM query.
@@ -43,7 +130,11 @@ class ContextManager:
         1. Rolling summary of the full conversation
         2. Recent raw transcript (last ~5 minutes)
         3. RAG-retrieved document chunks relevant to the question
-        4. Web search results (if enabled and relevant)
+
+        Token budget allocation (approximate):
+        - 30 % summary
+        - 40 % recent buffer
+        - 30 % RAG / documents
 
         Args:
             question: The user's question, used to guide RAG retrieval.
@@ -54,22 +145,61 @@ class ContextManager:
             A formatted context string ready for inclusion in the
             LLM prompt, within the token budget.
         """
-        # TODO: Collect context from each source
-        # TODO: Apply token budget allocation across sources
-        # TODO: Format and return assembled context string
-        raise NotImplementedError("Phase 3 implementation")
+        budget_summary = int(self.max_context_tokens * 0.30)
+        budget_buffer = int(self.max_context_tokens * 0.40)
+        budget_rag = int(self.max_context_tokens * 0.30)
 
-    def get_token_count(self, text: str) -> int:
-        """Estimate the token count for a text string.
+        # --- Section 1: Rolling summary ---
+        summary_text = self.rolling_summary.get_summary()
+        summary_text = self._truncate_from_beginning(summary_text, budget_summary)
 
-        Uses a fast tokenizer approximation to count tokens without
-        calling the API.
+        # --- Section 2: Recent raw transcript ---
+        recent_text = self.raw_buffer.get_recent(minutes=5)
+        recent_text = self._truncate_from_beginning(recent_text, budget_buffer)
 
-        Args:
-            text: The text to count tokens for.
+        # --- Section 3: RAG results ---
+        rag_text = ""
+        if self.rag_pipeline is not None:
+            try:
+                results: list[dict[str, Any]] = self.rag_pipeline.search(
+                    query=question, top_k=3
+                )
+                chunks: list[str] = []
+                for result in results:
+                    text_content = result.get("text", "")
+                    metadata = result.get("metadata", {})
+                    source = metadata.get("filename", "unknown source")
+                    chunks.append(f"[{source}]: {text_content}")
+                rag_text = "\n\n".join(chunks)
+            except Exception:
+                # RAG pipeline may not be fully initialized yet (Phase 4).
+                rag_text = ""
 
-        Returns:
-            Estimated token count.
+        rag_text = self._truncate_from_beginning(rag_text, budget_rag)
+
+        # --- Assemble ---
+        sections = [
+            "=== MEETING SUMMARY ===",
+            summary_text,
+            "",
+            "=== RECENT CONVERSATION (last 5 minutes) ===",
+            recent_text,
+            "",
+            "=== RELEVANT DOCUMENTS ===",
+            rag_text,
+        ]
+
+        return "\n".join(sections)
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Clear all context layers.
+
+        Used when resetting between sessions or when the meeting ends.
         """
-        # TODO: Implement cl100k_base tokenizer or word-based approximation
-        raise NotImplementedError("Phase 3 implementation")
+        self.rolling_summary.reset()
+        self.raw_buffer.clear()
+        self.rag_pipeline = None
