@@ -1,7 +1,7 @@
 """Tests for Phase 5 search and routing modules.
 
 Covers:
-    - app.utils.query_router (route, needs_web_search)
+    - app.utils.query_router (needs_web_search)
     - app.utils.prompt_builder (build_general_prompt, build_custom_prompt)
     - app.core.search (SearchClient, SearchResult)
     - app.core.vision (VisionProcessor)
@@ -23,64 +23,6 @@ from unittest.mock import MagicMock, patch, AsyncMock
 # =====================================================================
 # Query Router Tests
 # =====================================================================
-
-
-class TestRouteSimpleQuestions:
-    """Simple factual questions should be routed to haiku."""
-
-    def test_route_simple_question(self) -> None:
-        """Short factual questions route to haiku for speed."""
-        from app.utils.query_router import route
-
-        result = route("What time is it?")
-        assert result == "haiku"
-
-    def test_route_default_haiku(self) -> None:
-        """Single-topic factual lookups default to haiku."""
-        from app.utils.query_router import route
-
-        result = route("Who is the CEO?")
-        assert result == "haiku"
-
-
-class TestRouteComplexQuestions:
-    """Analytical or multi-part questions should be routed to sonnet."""
-
-    def test_route_complex_analyze(self) -> None:
-        """Questions with analytical keywords route to sonnet."""
-        from app.utils.query_router import route
-
-        result = route("Analyze the quarterly revenue trends")
-        assert result == "sonnet"
-
-    def test_route_complex_compare(self) -> None:
-        """Questions with comparison keywords route to sonnet."""
-        from app.utils.query_router import route
-
-        result = route("Compare our approach with competitors")
-        assert result == "sonnet"
-
-    def test_route_complex_long(self) -> None:
-        """Questions with 60+ words route to sonnet based on length alone."""
-        from app.utils.query_router import route
-
-        long_question = " ".join(["word"] * 65)
-        result = route(long_question)
-        assert result == "sonnet"
-
-    def test_route_complex_multi_question(self) -> None:
-        """Multi-part questions with conjunctions route to sonnet."""
-        from app.utils.query_router import route
-
-        result = route("What's the budget? And what are the implications?")
-        assert result == "sonnet"
-
-    def test_route_case_insensitive(self) -> None:
-        """Routing keywords should match regardless of casing."""
-        from app.utils.query_router import route
-
-        result = route("SUMMARIZE the meeting")
-        assert result == "sonnet"
 
 
 class TestNeedsWebSearch:

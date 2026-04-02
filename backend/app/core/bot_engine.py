@@ -24,7 +24,7 @@ from app.meeting.recall_client import RecallClient, RecallClientError
 from app.meeting.session import MeetingSession, SessionState
 from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-from app.utils.query_router import needs_web_search, route as route_query
+from app.utils.query_router import needs_web_search
 from app.utils.wake_word import detect as detect_wake_word
 
 logger = logging.getLogger(__name__)
