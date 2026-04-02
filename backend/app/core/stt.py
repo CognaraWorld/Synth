@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -29,7 +29,7 @@ class TranscriptSegment:
     """
 
     text: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     speaker: str = "unknown"
     confidence: float = 0.0
 
@@ -134,7 +134,7 @@ class SpeechToText:
 
         return TranscriptSegment(
             text=full_text,
-            timestamp=datetime.utcnow(),
+            timestamp=lambda: datetime.now(timezone.utc)(),
             confidence=avg_confidence,
         )
 

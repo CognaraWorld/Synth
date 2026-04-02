@@ -10,7 +10,7 @@ All tests are fast (no external services, no database).
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -258,7 +258,7 @@ class TestPaymentSchemas:
     def test_credit_transaction_response(self) -> None:
         from app.models.schemas import CreditTransactionResponse
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         uid = uuid4()
         resp = CreditTransactionResponse(
             id=uid,

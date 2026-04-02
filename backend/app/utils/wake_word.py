@@ -10,13 +10,33 @@ Phase 3 implementation.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 
-# Pattern handles: "hey synth", "hey, synth", "hey  synth", or just "synth"
-_WAKE_WORD_PATTERN = re.compile(
-    r"\b(?:hey[,\s]*)?synth\b",
-    re.IGNORECASE,
-)
+@lru_cache(maxsize=16)
+def _build_pattern(wake_word: str) -> re.Pattern:
+    """Build a regex pattern for the given wake word.
+
+    Supports "hey <name>" and bare "<name>" patterns with optional
+    punctuation between words. Cached for performance.
+
+    Args:
+        wake_word: The trigger phrase (e.g. "hey synth").
+
+    Returns:
+        Compiled regex pattern.
+    """
+    parts = wake_word.strip().lower().split()
+    if len(parts) == 2 and parts[0] == "hey":
+        # "hey synth" → matches "hey synth", "hey, synth", or just "synth"
+        name = re.escape(parts[1])
+        return re.compile(
+            rf"\b(?:hey[,\s]*)?{name}\b",
+            re.IGNORECASE,
+        )
+    # Single word or custom phrase — exact match with word boundaries
+    escaped = re.escape(wake_word.strip())
+    return re.compile(rf"\b{escaped}\b", re.IGNORECASE)
 
 
 def detect(
@@ -45,7 +65,8 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
-    match = _WAKE_WORD_PATTERN.search(transcript_text)
+    pattern = _build_pattern(wake_word)
+    match = pattern.search(transcript_text)
     if match is None:
         return (False, "")
 

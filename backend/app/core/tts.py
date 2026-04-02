@@ -16,6 +16,8 @@ import wave
 import numpy as np
 from kokoro import KPipeline
 
+from app.utils.filler import FILLER_PHRASES
+
 
 class TextToSpeech:
     """Wrapper around the Kokoro TTS model for speech synthesis.
@@ -28,14 +30,6 @@ class TextToSpeech:
         sample_rate: Output audio sample rate in Hz.
         speed: Speech speed multiplier (1.0 = normal).
     """
-
-    FILLER_PHRASES: list[str] = [
-        "Let me think about that for a moment.",
-        "That's a great question, give me a second.",
-        "One moment while I look into that.",
-        "Hmm, let me consider that.",
-        "Sure, let me pull that up.",
-    ]
 
     def __init__(
         self,
@@ -123,5 +117,5 @@ class TextToSpeech:
         Returns:
             Raw audio bytes of a synthesized filler phrase.
         """
-        phrase = random.choice(self.FILLER_PHRASES)
+        phrase = random.choice(FILLER_PHRASES)
         return self.synthesize(phrase)
