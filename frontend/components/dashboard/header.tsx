@@ -15,11 +15,11 @@ export function Header() {
         <Separator orientation="vertical" className="h-6" />
         <div className="flex items-center gap-3">
           <div className="text-right">
-            <p className="text-sm font-medium leading-none">Yash Goel</p>
-            <p className="text-xs text-muted-foreground">yash@synth.dev</p>
+            <p className="text-sm font-medium leading-none">Cognara World</p>
+            <p className="text-xs text-muted-foreground">team@cognaraworld.com</p>
           </div>
           <Avatar className="size-8">
-            <AvatarFallback className="text-xs">YG</AvatarFallback>
+            <AvatarFallback className="text-xs">CW</AvatarFallback>
           </Avatar>
         </div>
       </div>

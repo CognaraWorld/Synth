@@ -43,8 +43,8 @@ Synth joins your meetings and participates like a real team member:
 
 ```bash
 # Clone the repo
-git clone https://github.com/CongaraWorld/TranscibeAI.git
-cd TranscibeAI
+git clone https://github.com/CongaraWorld/Synth.git
+cd Synth
 
 # Copy environment config
 cp .env.example .env
@@ -77,7 +77,7 @@ See `.env.example` for all required configuration. At minimum you need:
 ## Project Structure
 
 ```
-TranscibeAI/
+Synth/
 ├── frontend/          # Next.js dashboard
 ├── backend/           # FastAPI + AI pipeline
 │   ├── app/
