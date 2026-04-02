@@ -3,7 +3,6 @@
 import logging
 from typing import Any
 
-import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +18,11 @@ from app.models.schemas import (
     CreditTransactionResponse,
 )
 
+try:
+    import stripe
+except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+    stripe = None
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -29,6 +33,15 @@ CREDIT_PACKS: dict[str, dict[str, Any]] = {
     "pack_20": {"credits": 20, "price_cents": 10000, "label": "20 Credits"},
     "pack_50": {"credits": 50, "price_cents": 20000, "label": "50 Credits"},
 }
+
+
+def _require_stripe_sdk() -> Any:
+    if stripe is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Payment service is unavailable because the Stripe SDK is not installed.",
+        )
+    return stripe
 
 
 @router.post("/create-checkout", response_model=CheckoutResponse)
@@ -50,10 +63,12 @@ async def create_checkout(
             detail="Payment service is not configured",
         )
 
-    stripe.api_key = settings.stripe_secret_key
+    stripe_sdk = _require_stripe_sdk()
+    stripe_error = getattr(stripe_sdk, "StripeError", Exception)
+    stripe_sdk.api_key = settings.stripe_secret_key
 
     try:
-        session = stripe.checkout.Session.create(
+        session = stripe_sdk.checkout.Session.create(
             mode="payment",
             line_items=[
                 {
@@ -75,7 +90,7 @@ async def create_checkout(
             success_url=settings.frontend_success_url,
             cancel_url=settings.frontend_cancel_url,
         )
-    except stripe.StripeError as exc:
+    except stripe_error as exc:
         logger.error("Stripe checkout creation failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -100,10 +115,16 @@ async def stripe_webhook(
             detail="Webhook secret not configured",
         )
 
-    stripe.api_key = settings.stripe_secret_key
+    stripe_sdk = _require_stripe_sdk()
+    signature_error = getattr(
+        getattr(stripe_sdk, "error", None),
+        "SignatureVerificationError",
+        Exception,
+    )
+    stripe_sdk.api_key = settings.stripe_secret_key
 
     try:
-        event = stripe.Webhook.construct_event(
+        event = stripe_sdk.Webhook.construct_event(
             payload, sig_header, settings.stripe_webhook_secret
         )
     except ValueError:
@@ -112,7 +133,7 @@ async def stripe_webhook(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid payload",
         )
-    except stripe.SignatureVerificationError:
+    except signature_error:
         logger.warning("Webhook signature verification failed")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

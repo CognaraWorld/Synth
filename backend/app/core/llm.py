@@ -8,9 +8,12 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
-import anthropic
-
 from app.config import get_settings
+
+try:
+    import anthropic
+except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+    anthropic = None
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Synth, an intelligent meeting assistant. You have access to "
@@ -41,6 +44,12 @@ class LLMClient:
         self.settings = get_settings()
         self.api_key = self.settings.anthropic_api_key
         self.model = model
+        self.client = None
+        self._async_client = None
+
+        if anthropic is None or not self.api_key:
+            return
+
         self.client = anthropic.Anthropic(api_key=self.api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self.api_key)
 
@@ -61,6 +70,11 @@ class LLMClient:
         Returns:
             The model's response text.
         """
+        if self.client is None:
+            raise RuntimeError(
+                "Anthropic SDK or API key is not configured for synchronous queries."
+            )
+
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
 
         user_content = (
@@ -95,6 +109,11 @@ class LLMClient:
         Returns:
             The model's response text.
         """
+        if self._async_client is None:
+            raise RuntimeError(
+                "Anthropic SDK or API key is not configured for asynchronous queries."
+            )
+
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
 
         user_content = (

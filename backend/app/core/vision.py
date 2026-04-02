@@ -12,9 +12,12 @@ from __future__ import annotations
 import base64
 import logging
 
-import anthropic
-
 from app.config import get_settings
+
+try:
+    import anthropic
+except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+    anthropic = None
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +50,13 @@ class VisionProcessor:
         self._client = None
         self._async_client = None
 
-        if self.ocr_engine == "claude-vision":
+        if self.ocr_engine == "claude-vision" and anthropic is not None:
             settings = get_settings()
-            self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-            self._async_client = anthropic.AsyncAnthropic(
-                api_key=settings.anthropic_api_key,
-            )
+            if settings.anthropic_api_key:
+                self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+                self._async_client = anthropic.AsyncAnthropic(
+                    api_key=settings.anthropic_api_key,
+                )
 
     def _detect_media_type(self, screenshot_bytes: bytes) -> str:
         """Detect the image media type from its magic bytes.
@@ -85,7 +89,7 @@ class VisionProcessor:
             Extracted text content from the screenshot. Returns empty
             string if no text is detected or on error.
         """
-        if self.ocr_engine != "claude-vision":
+        if self.ocr_engine != "claude-vision" or self._client is None:
             logger.warning("OCR engine %r is not supported", self.ocr_engine)
             return ""
 
@@ -135,7 +139,7 @@ class VisionProcessor:
             Extracted text content from the screenshot. Returns empty
             string if no text is detected or on error.
         """
-        if self.ocr_engine != "claude-vision":
+        if self.ocr_engine != "claude-vision" or self._async_client is None:
             logger.warning("OCR engine %r is not supported", self.ocr_engine)
             return ""
 

@@ -118,6 +118,41 @@ class TestCreateCheckoutAuth:
 
 
 # =====================================================================
+# Stripe SDK availability
+# =====================================================================
+
+
+class TestStripeDependencyGuard:
+    """Verify graceful behavior when the optional Stripe SDK is absent."""
+
+    @pytest.mark.asyncio
+    async def test_create_checkout_without_stripe_sdk_returns_503(self) -> None:
+        from fastapi import HTTPException
+
+        from app.api.routes import payments
+        from app.models.schemas import CheckoutRequest
+
+        with patch.object(payments, "stripe", None):
+            with patch.object(
+                payments,
+                "settings",
+                MagicMock(
+                    stripe_secret_key="sk_test_123",
+                    frontend_success_url="https://example.com/success",
+                    frontend_cancel_url="https://example.com/cancel",
+                ),
+            ):
+                with pytest.raises(HTTPException) as exc_info:
+                    await payments.create_checkout(
+                        CheckoutRequest(pack_id="pack_5"),
+                        current_user=MagicMock(id=uuid4()),
+                    )
+
+        assert exc_info.value.status_code == 503
+        assert "Stripe SDK" in exc_info.value.detail
+
+
+# =====================================================================
 # Webhook event structure
 # =====================================================================
 
