@@ -1,8 +1,7 @@
-"""Claude API client with hybrid complexity routing.
+"""Claude API client.
 
-Provides intelligent routing between Haiku (fast/cheap) and Sonnet
-(powerful/expensive) based on question complexity classification.
-Handles system prompt generation for both general and custom agent modes.
+Provides a single-model interface to Claude Haiku 4.5 for all LLM
+operations: meeting Q&A, summarization, and system prompt generation.
 
 Phase 3 implementation.
 """
@@ -13,32 +12,8 @@ import anthropic
 
 from app.config import get_settings
 
-# Keywords / phrases that signal an analytical or multi-step question.
-_COMPLEX_INDICATORS: tuple[str, ...] = (
-    "summarize",
-    "analyze",
-    "compare",
-    "explain why",
-    "what are the implications",
-    "how does this affect",
-    "evaluate",
-    "contrast",
-    "assess",
-    "elaborate",
-    "break down",
-    "what factors",
-    "pros and cons",
-    "trade-offs",
-    "in what ways",
-    "critically",
-    "synthesize",
-    "interpret",
-    "what would happen if",
-    "how might",
-)
-
 _DEFAULT_SYSTEM_PROMPT = (
-    "You are Synth, an intelligent AI meeting assistant. You have access to "
+    "You are Synth, an intelligent meeting assistant. You have access to "
     "the meeting transcript and any uploaded documents. Answer questions "
     "accurately and concisely based on the provided context. If the context "
     "does not contain enough information to answer, say so honestly rather "
@@ -47,32 +22,25 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 
 class LLMClient:
-    """Client for the Anthropic Claude API with hybrid model routing.
+    """Client for the Anthropic Claude API.
 
-    Routes simple factual questions to Haiku for speed and cost savings,
-    while directing complex analytical questions to Sonnet for quality.
+    Uses Claude Haiku 4.5 for all queries — fast, cheap, and sufficient
+    for real-time meeting Q&A.
 
     Attributes:
         api_key: Anthropic API key.
-        haiku_model: Model identifier for the fast/cheap tier.
-        sonnet_model: Model identifier for the powerful tier.
+        model: Model identifier.
     """
 
-    def __init__(
-        self,
-        haiku_model: str = "claude-haiku-4-5-20251001",
-        sonnet_model: str = "claude-sonnet-4-5-20250514",
-    ) -> None:
+    def __init__(self, model: str = "claude-haiku-4-5-20251001") -> None:
         """Initialize the Claude API client.
 
         Args:
-            haiku_model: Model ID for simple queries (fast, low cost).
-            sonnet_model: Model ID for complex queries (high quality).
+            model: Model ID to use for all queries.
         """
         self.settings = get_settings()
         self.api_key = self.settings.anthropic_api_key
-        self.haiku_model = haiku_model
-        self.sonnet_model = sonnet_model
+        self.model = model
         self.client = anthropic.Anthropic(api_key=self.api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self.api_key)
 
@@ -84,9 +52,6 @@ class LLMClient:
     ) -> str:
         """Send a question to Claude with assembled context.
 
-        Automatically classifies the question complexity and routes
-        to the appropriate model tier.
-
         Args:
             context: Assembled context string from the context manager,
                 including transcript, RAG results, and document excerpts.
@@ -96,8 +61,6 @@ class LLMClient:
         Returns:
             The model's response text.
         """
-        complexity = self.classify_complexity(question)
-        model = self.sonnet_model if complexity == "complex" else self.haiku_model
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
 
         user_content = (
@@ -106,7 +69,7 @@ class LLMClient:
         )
 
         response = self.client.messages.create(
-            model=model,
+            model=self.model,
             max_tokens=4096,
             system=prompt,
             messages=[
@@ -124,9 +87,6 @@ class LLMClient:
     ) -> str:
         """Send a question to Claude asynchronously.
 
-        Behaves identically to ``query`` but uses the async Anthropic
-        client, making it suitable for use inside async request handlers.
-
         Args:
             context: Assembled context string from the context manager.
             question: The user's question text.
@@ -135,8 +95,6 @@ class LLMClient:
         Returns:
             The model's response text.
         """
-        complexity = self.classify_complexity(question)
-        model = self.sonnet_model if complexity == "complex" else self.haiku_model
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
 
         user_content = (
@@ -145,7 +103,7 @@ class LLMClient:
         )
 
         response = await self._async_client.messages.create(
-            model=model,
+            model=self.model,
             max_tokens=4096,
             system=prompt,
             messages=[
@@ -155,31 +113,8 @@ class LLMClient:
 
         return response.content[0].text
 
-    def classify_complexity(self, question: str) -> str:
-        """Classify question complexity for model routing.
-
-        Uses lightweight keyword heuristics to determine whether a
-        question needs the more capable (and expensive) model. No API
-        call is made, keeping classification fast and free.
-
-        Args:
-            question: The user's question text.
-
-        Returns:
-            "simple" for factual/lookup questions routed to Haiku,
-            "complex" for analytical/multi-step questions routed to Sonnet.
-        """
-        question_lower = question.lower()
-        for indicator in _COMPLEX_INDICATORS:
-            if indicator in question_lower:
-                return "complex"
-        return "simple"
-
     def generate_system_prompt(self, description: str) -> str:
         """Generate a system prompt from an agent description.
-
-        Creates a tailored system prompt based on the agent's description,
-        incorporating role-specific instructions and behavioral guidelines.
 
         Args:
             description: The agent's natural language description provided
@@ -189,7 +124,7 @@ class LLMClient:
             A formatted system prompt string for use in Claude API calls.
         """
         return (
-            f"You are a specialized AI meeting assistant with the following "
+            f"You are a specialized meeting assistant with the following "
             f"role and expertise:\n\n"
             f"{description}\n\n"
             f"Guidelines:\n"
