@@ -78,7 +78,7 @@ class SearchClient:
             )
             response.raise_for_status()
             data = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except Exception as exc:
             logger.warning("SearXNG search failed for query %r: %s", query, exc)
             return []
 
