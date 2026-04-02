@@ -22,10 +22,12 @@ Treat this document as the default contribution contract for everyone opening a 
 ## Before You Start
 
 1. Read the relevant docs and feature files before editing.
-2. Confirm the issue, bug, or feature scope you are solving.
-3. Check whether another PR already covers the same work.
-4. Pull the latest `main` and branch from it.
-5. If the work is unclear or large, open a draft PR early instead of disappearing with a long-lived branch.
+2. Open a GitHub issue first, even if you are an owner. Do not open a PR until the corresponding issue exists.
+3. Make the issue detailed and accurate enough for a reviewer to understand the problem, intended outcome, scope, constraints, and any relevant context without guessing.
+4. Confirm the issue, bug, or feature scope you are solving.
+5. Check whether another PR already covers the same work.
+6. Pull the latest `main` and branch from it.
+7. If the work is unclear or large, open a draft PR early instead of disappearing with a long-lived branch.
 
 ## Branching and Commit Hygiene
 
@@ -74,8 +76,8 @@ If you could not run a relevant check, say so clearly in the PR and explain why.
 
 Every PR must use the repository PR template and include:
 
-1. The issue or problem being solved.
-2. A link to the issue when one exists.
+1. The issue being solved, with a required link to the GitHub issue that was opened first. PRs without a corresponding issue are out of policy.
+2. A problem statement that matches the issue accurately. If the scope changed after the issue was opened, update the issue and explain the delta in the PR.
 3. A proposed solution section that explains why this approach is correct and what tradeoffs were considered.
 4. Verification steps with exact commands or manual test notes.
 5. Risks, follow-ups, or known limitations.
@@ -130,6 +132,7 @@ Approval means the reviewer believes the change is safe to merge, not just that 
 A contribution is done when:
 
 - the scope is clear
+- a detailed, accurate GitHub issue was opened before the PR and the PR links to it
 - the implementation matches repo conventions
 - relevant docs are updated
 - relevant checks were run or explicitly explained
