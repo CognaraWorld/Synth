@@ -13,13 +13,12 @@ import io
 import json
 import logging
 import re
+import zipfile
 from datetime import datetime
 from typing import Any
+from xml.sax.saxutils import escape
 
-from docx import Document
-from docx.shared import Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from fpdf import FPDF
+from app.core.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +32,94 @@ _SUMMARY_SYSTEM_PROMPT = (
     '4. "decisions": A list of strings, each a decision made during the meeting.\n\n'
     "Respond ONLY with valid JSON. No markdown fences, no extra text."
 )
+
+
+def _docx_paragraph_xml(text: str) -> str:
+    escaped = escape(text)
+    if not escaped:
+        return "<w:p/>"
+    return (
+        '<w:p><w:r><w:t xml:space="preserve">'
+        f"{escaped}"
+        "</w:t></w:r></w:p>"
+    )
+
+
+def _build_minimal_docx(paragraphs: list[str]) -> bytes:
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        f"{''.join(_docx_paragraph_xml(paragraph) for paragraph in paragraphs)}"
+        '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" '
+        'w:right="1440" w:bottom="1440" w:left="1440" w:header="720" '
+        'w:footer="720" w:gutter="0"/></w:sectPr>'
+        "</w:body></w:document>"
+    )
+    content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>
+"""
+    rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>
+"""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types_xml)
+        archive.writestr("_rels/.rels", rels_xml)
+        archive.writestr("word/document.xml", document_xml)
+    return buffer.getvalue()
+
+
+def _escape_pdf_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _build_minimal_pdf(lines: list[str]) -> bytes:
+    content_lines = ["BT", "/F1 12 Tf", "50 760 Td"]
+    for index, line in enumerate(lines):
+        if index > 0:
+            content_lines.append("0 -16 Td")
+        content_lines.append(f"({_escape_pdf_text(line)}) Tj")
+    content_lines.append("ET")
+    stream = "\n".join(content_lines).encode("latin-1", errors="replace")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+
+    buffer = io.BytesIO()
+    buffer.write(b"%PDF-1.4\n")
+
+    offsets = [0]
+    for index, payload in enumerate(objects, start=1):
+        offsets.append(buffer.tell())
+        buffer.write(f"{index} 0 obj\n".encode("ascii"))
+        buffer.write(payload)
+        buffer.write(b"\nendobj\n")
+
+    xref_start = buffer.tell()
+    buffer.write(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    buffer.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        buffer.write(f"{offset:010d} 00000 n \n".encode("ascii"))
+
+    buffer.write(
+        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode(
+            "ascii"
+        )
+    )
+    return buffer.getvalue()
 
 
 class SummaryGenerator:
@@ -83,7 +170,6 @@ class SummaryGenerator:
         try:
             client = llm_client
             if client is None:
-                from app.core.llm import LLMClient
                 client = LLMClient()
 
             raw_response = await client.async_query(
@@ -172,7 +258,7 @@ class SummaryGenerator:
         summary: dict[str, Any],
         meeting_info: dict[str, Any] | None = None,
     ) -> bytes:
-        """Export a summary to PDF format using fpdf2.
+        """Export a summary to PDF format.
 
         Args:
             summary: The summary dictionary from ``generate()``.
@@ -186,6 +272,28 @@ class SummaryGenerator:
         date_str = info.get("date", datetime.now().strftime("%Y-%m-%d"))
         duration = info.get("duration", "N/A")
         platform = info.get("platform", "N/A")
+
+        pdf_lines = [
+            "Meeting Summary",
+            f"Synth  |  {date_str}  |  Duration: {duration}  |  Platform: {platform}",
+            "",
+            "Summary",
+            summary.get("content", ""),
+            "",
+            "Key Points",
+            *[(f"- {item}") for item in summary.get("key_points", []) or ["None recorded."]],
+            "",
+            "Action Items",
+            *[(f"- {item}") for item in summary.get("action_items", []) or ["None recorded."]],
+            "",
+            "Decisions",
+            *[(f"- {item}") for item in summary.get("decisions", []) or ["None recorded."]],
+        ]
+
+        try:
+            from fpdf import FPDF
+        except ModuleNotFoundError:
+            return _build_minimal_pdf(pdf_lines)
 
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=20)
@@ -255,7 +363,7 @@ class SummaryGenerator:
 
         for item in items:
             safe_text = item.encode("latin-1", "replace").decode("latin-1")
-            pdf.cell(6, 6, chr(8226))  # bullet
+            pdf.cell(6, 6, "-")
             pdf.multi_cell(0, 6, f"  {safe_text}")
             pdf.ln(1)
         pdf.ln(4)
@@ -265,7 +373,7 @@ class SummaryGenerator:
         summary: dict[str, Any],
         meeting_info: dict[str, Any] | None = None,
     ) -> bytes:
-        """Export a summary to DOCX format using python-docx.
+        """Export a summary to DOCX format.
 
         Args:
             summary: The summary dictionary from ``generate()``.
@@ -279,6 +387,33 @@ class SummaryGenerator:
         date_str = info.get("date", datetime.now().strftime("%Y-%m-%d"))
         duration = info.get("duration", "N/A")
         platform = info.get("platform", "N/A")
+
+        paragraphs = [
+            "Meeting Summary",
+            f"Synth  |  {date_str}  |  Duration: {duration}  |  Platform: {platform}",
+            "",
+            "Summary",
+        ]
+        paragraphs.extend(
+            [text for text in summary.get("content", "").split("\n\n") if text.strip()]
+            or ["None recorded."]
+        )
+        paragraphs.append("")
+        paragraphs.append("Key Points")
+        paragraphs.extend(summary.get("key_points", []) or ["None recorded."])
+        paragraphs.append("")
+        paragraphs.append("Action Items")
+        paragraphs.extend(summary.get("action_items", []) or ["None recorded."])
+        paragraphs.append("")
+        paragraphs.append("Decisions")
+        paragraphs.extend(summary.get("decisions", []) or ["None recorded."])
+
+        try:
+            from docx import Document
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+            from docx.shared import Pt, RGBColor
+        except ModuleNotFoundError:
+            return _build_minimal_docx(paragraphs)
 
         doc = Document()
 
