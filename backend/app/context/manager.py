@@ -10,8 +10,12 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any
+
+from app.context.raw_buffer import RawTranscriptBuffer
+from app.context.rolling_summary import RollingSummary
 
 
 class ContextManager:
@@ -36,12 +40,6 @@ class ContextManager:
                 prompt and model response.
         """
         self.max_context_tokens = max_context_tokens
-
-        # Lazy imports to avoid circular / missing-dependency issues when
-        # sibling modules are being implemented simultaneously.
-        from app.context.rolling_summary import RollingSummary
-        from app.context.raw_buffer import RawTranscriptBuffer
-
         self.rolling_summary: RollingSummary = RollingSummary()
         self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=10)
         self.rag_pipeline: Any | None = None
@@ -93,8 +91,6 @@ class ContextManager:
         # RollingSummary.update is async. We schedule it on the running
         # loop when one exists; otherwise the pending text simply
         # accumulates and will be summarized on the next async call.
-        import asyncio
-
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.rolling_summary.update(text))

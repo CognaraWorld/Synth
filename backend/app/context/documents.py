@@ -196,12 +196,15 @@ class DocumentProcessor:
         filename = os.path.basename(file_path)
 
         if self.rag_pipeline is not None:
-            for idx, chunk in enumerate(chunks):
-                self.rag_pipeline.add_chunk(
-                    text=chunk,
-                    metadata={
+            batch = [
+                {
+                    "text": chunk,
+                    "metadata": {
                         "filename": filename,
                         "chunk_index": idx,
                         "file_type": file_type_lower,
                     },
-                )
+                }
+                for idx, chunk in enumerate(chunks)
+            ]
+            self.rag_pipeline.add_chunks_batch(batch)

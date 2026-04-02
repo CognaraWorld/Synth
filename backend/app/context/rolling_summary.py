@@ -10,6 +10,7 @@ Phase 3 implementation.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -74,8 +75,6 @@ class RollingSummary:
             )
 
             # Support both sync and async LLM clients gracefully.
-            import asyncio
-
             result = self._llm_client.query(context="", question=prompt)
             if asyncio.iscoroutine(result):
                 result = await result

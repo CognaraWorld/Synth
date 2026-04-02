@@ -42,7 +42,7 @@ class RAGPipeline:
         """
         self.collection_name = collection_name
         self.embedding_model = embedding_model
-        self._client = chromadb.Client()
+        self._client = chromadb.EphemeralClient()
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
         )
