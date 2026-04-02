@@ -12,7 +12,11 @@ from __future__ import annotations
 import time
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+    torch = None
 
 
 class VoiceActivityDetector:
@@ -50,12 +54,16 @@ class VoiceActivityDetector:
         self._speech_start_time: float | None = None
         self._speech_end_time: float | None = None
 
-        # Load Silero VAD model via torch.hub
-        self._model, _utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-        )
+        self._model = None
+        if torch is not None:
+            try:
+                self._model, _utils = torch.hub.load(
+                    repo_or_dir="snakers4/silero-vad",
+                    model="silero_vad",
+                    trust_repo=True,
+                )
+            except Exception:
+                self._model = None
 
     @property
     def is_speech_active(self) -> bool:
@@ -101,9 +109,11 @@ class VoiceActivityDetector:
             else:
                 frame = frame[: self._expected_frame_size]
 
-        # Convert to torch tensor and run through the model
-        tensor = torch.from_numpy(frame)
-        confidence = self._model(tensor, self.sample_rate).item()
+        if self._model is None or torch is None:
+            confidence = float(np.sqrt(np.mean(np.square(frame))))
+        else:
+            tensor = torch.from_numpy(frame)
+            confidence = self._model(tensor, self.sample_rate).item()
 
         speech_detected = confidence > self.threshold
 
@@ -126,7 +136,8 @@ class VoiceActivityDetector:
         Should be called between separate audio streams or meeting sessions
         to clear any accumulated hidden state in the model.
         """
-        self._model.reset_states()
+        if self._model is not None:
+            self._model.reset_states()
         self._is_speech_active = False
         self._speech_start_time = None
         self._speech_end_time = None
