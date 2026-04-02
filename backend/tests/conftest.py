@@ -1,4 +1,4 @@
-"""Shared fixtures and configuration for the TranscribeAI test suite."""
+"""Shared fixtures and configuration for the Synth test suite."""
 
 from __future__ import annotations
 

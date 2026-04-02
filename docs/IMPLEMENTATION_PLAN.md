@@ -2,9 +2,9 @@
 
 ## Context
 
-Yash is building **Synth**, an AI-powered meeting bot that joins Zoom/Teams/Google Meet as an active voice participant. Unlike existing tools (Hedy AI, Vibe Bot, Zoom Companion) that do passive transcription or whisper-mode coaching, Synth speaks out loud in meetings — always on mute by default, raises hand before answering, and goes back on mute. It answers questions when invoked by name ("Hey Synth"), reads uploaded docs, searches the web live, and watches screen shares.
+Cognara World is building **Synth**, an AI-powered meeting bot that joins Zoom/Teams/Google Meet as an active voice participant. Unlike existing tools (Hedy AI, Vibe Bot, Zoom Companion) that do passive transcription or whisper-mode coaching, Synth speaks out loud in meetings — always on mute by default, raises hand before answering, and goes back on mute. It answers questions when invoked by name ("Hey Synth"), reads uploaded docs, searches the web live, and watches screen shares.
 
-**Repo:** https://github.com/CongaraWorld/TranscibeAI
+**Repo:** https://github.com/CongaraWorld/Synth
 **Infra:** Mac Studio M4 Max 32GB (dev + early production)
 **Stack:** Next.js (App Router) frontend + Python (FastAPI) backend
 
@@ -31,7 +31,7 @@ Yash is building **Synth**, an AI-powered meeting bot that joins Zoom/Teams/Goog
 ## Project Structure
 
 ```
-TranscibeAI/
+Synth/
 ├── frontend/                    # Next.js App Router
 │   ├── app/
 │   │   ├── layout.tsx
