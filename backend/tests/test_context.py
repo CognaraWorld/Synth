@@ -10,7 +10,7 @@ All tests are fast (no ML models, no network calls).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -215,7 +215,7 @@ class TestContextManagerAddTranscript:
 
     def test_add_transcript_with_timestamp(self) -> None:
         cm = ContextManager()
-        ts = datetime.utcnow()  # Use current time so it's within buffer window
+        ts = datetime.now(timezone.utc)  # Use current time so it's within buffer window
         cm.add_transcript("Specific time entry", timestamp=ts)
         full = cm.raw_buffer.get_full_text()
         assert "Specific time entry" in full

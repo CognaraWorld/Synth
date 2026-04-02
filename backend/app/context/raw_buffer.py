@@ -10,7 +10,7 @@ Phase 3 implementation.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 class RawTranscriptBuffer:
@@ -42,7 +42,7 @@ class RawTranscriptBuffer:
 
         Must be called while holding ``self._lock``.
         """
-        cutoff = datetime.utcnow() - timedelta(minutes=self.max_minutes)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.max_minutes)
         self._entries = [
             (ts, text) for ts, text in self._entries if ts >= cutoff
         ]
@@ -55,7 +55,7 @@ class RawTranscriptBuffer:
             timestamp: When this text was captured. Defaults to now.
         """
         if timestamp is None:
-            timestamp = datetime.utcnow()
+            timestamp = datetime.now(timezone.utc)
 
         with self._lock:
             self._entries.append((timestamp, text))
@@ -72,7 +72,7 @@ class RawTranscriptBuffer:
             Concatenated transcript text from the requested time window,
             ordered chronologically.
         """
-        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
         with self._lock:
             filtered = [

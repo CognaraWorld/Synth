@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import numpy as np
@@ -97,7 +97,7 @@ class TestRawTranscriptBuffer:
         from app.context.raw_buffer import RawTranscriptBuffer
 
         buf = RawTranscriptBuffer(max_minutes=10)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         buf.append("Hello, welcome to the meeting.", timestamp=now)
         buf.append("Thanks, glad to be here.", timestamp=now + timedelta(seconds=5))
@@ -115,7 +115,7 @@ class TestRawTranscriptBuffer:
         from app.context.raw_buffer import RawTranscriptBuffer
 
         buf = RawTranscriptBuffer(max_minutes=10)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Entry from 8 minutes ago -- outside a 5-minute window
         buf.append("Old entry", timestamp=now - timedelta(minutes=8))
@@ -131,7 +131,7 @@ class TestRawTranscriptBuffer:
         from app.context.raw_buffer import RawTranscriptBuffer
 
         buf = RawTranscriptBuffer(max_minutes=10)
-        buf.append("Something important", timestamp=datetime.utcnow())
+        buf.append("Something important", timestamp=datetime.now(timezone.utc))
 
         buf.clear()
 
@@ -147,7 +147,7 @@ class TestRawTranscriptBuffer:
         from app.context.raw_buffer import RawTranscriptBuffer
 
         buf = RawTranscriptBuffer(max_minutes=5)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Entry from 10 minutes ago -- well past the 5-minute max
         buf.append("Very old entry", timestamp=now - timedelta(minutes=10))
@@ -178,7 +178,7 @@ class TestRawTranscriptBuffer:
             for i in range(entries_per_thread):
                 buf.append(
                     f"Thread-{thread_id} entry-{i}",
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                 )
 
         threads = [

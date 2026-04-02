@@ -24,8 +24,24 @@ class Settings(BaseSettings):
     upload_dir: str = "./uploads"
     summary_dir: str = "./summaries"
 
+    # Email — Resend (preferred)
+    resend_api_key: str = ""
+
+    # Email — SMTP (fallback)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    from_email: str = "synth@example.com"
+
+    # Stripe
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+
     # Frontend
     frontend_url: str = "http://localhost:3000"
+    frontend_success_url: str = "http://localhost:3000/dashboard/settings?payment=success"
+    frontend_cancel_url: str = "http://localhost:3000/dashboard/settings?payment=cancelled"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

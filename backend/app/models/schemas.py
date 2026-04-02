@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 # Auth
@@ -108,3 +108,37 @@ class MeetingSummaryResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# Payments
+class CheckoutRequest(BaseModel):
+    pack_id: str = Field(..., description="Credit pack identifier (pack_5, pack_20, pack_50)")
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+
+
+# Credits
+class CreditBalanceResponse(BaseModel):
+    credits: int
+    user_id: UUID
+
+
+class CreditTransactionResponse(BaseModel):
+    id: UUID
+    amount: int
+    balance_after: int
+    transaction_type: str
+    description: str
+    stripe_session_id: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CreditTransactionListResponse(BaseModel):
+    transactions: list[CreditTransactionResponse]
+    total: int
+    page: int
+    per_page: int
