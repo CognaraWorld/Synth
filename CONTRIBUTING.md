@@ -89,11 +89,16 @@ These are merge gates, not suggestions:
 2. The PR description must keep the `@copilot` mention as a team convention, and the author must also request Copilot review through GitHub's reviewer flow or rely on automatic Copilot code review if it is enabled for the repository or organization.
 3. The PR author must read Copilot comments and either fix the issue or respond with a clear reason.
 4. The author must request review from the other two owners.
-5. The PR must receive approval from at least one of those two owners before merge.
-6. All blocking comments and conversations must be resolved before merge.
-7. Relevant verification must pass before merge.
+5. When an owner reviews the PR, that owner has only two acceptable paths:
+   - approve the PR and allow it to move toward merge if the change is ready
+   - leave a PR comment with the exact concern, the requested change, and a specialized prompt the PR author can give to their LLM to address the concern correctly
+6. Owner review comments must be concrete. Do not leave vague requests like "fix this" or "needs work" without a detailed concern and an actionable prompt.
+7. If an owner requests changes, the PR author must address the concern, push the updated commits, and only then move the PR back toward merge.
+8. The PR must receive approval from at least one of those two owners before merge.
+9. All blocking comments and conversations must be resolved before merge.
+10. Relevant verification must pass before merge.
 
-No PR is merged before the Copilot review is handled and at least one other owner approval is in place.
+No PR is merged before the Copilot review is handled, owner feedback is either approved or resolved through a repush, and at least one other owner approval is in place.
 
 ## GitHub Enforcement Settings
 
