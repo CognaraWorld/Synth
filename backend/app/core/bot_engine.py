@@ -115,6 +115,7 @@ class BotEngine:
         self,
         meeting_link: str,
         agent_config: dict[str, Any],
+        meeting_id: str | None = None,
     ) -> str:
         """Deploy the bot into a meeting.
 
@@ -127,6 +128,8 @@ class BotEngine:
             agent_config: Agent configuration including ``system_prompt``,
                 ``mode`` ("general" or "custom"), ``agent_name``, and
                 optionally ``description`` for custom agents.
+            meeting_id: Stable backend meeting identifier. Falls back to
+                the meeting link when the caller does not provide one.
 
         Returns:
             A unique session ID for tracking and controlling this session.
@@ -138,8 +141,10 @@ class BotEngine:
         self._lazy_load_models()
 
         # Build session
-        meeting_id = meeting_link  # Use the link as the meeting identifier
-        session = MeetingSession(meeting_id=meeting_id, agent_config=agent_config)
+        session = MeetingSession(
+            meeting_id=meeting_id or meeting_link,
+            agent_config=agent_config,
+        )
 
         # Build the system prompt based on agent mode
         mode = agent_config.get("mode", "general")
@@ -300,6 +305,33 @@ class BotEngine:
 
         return info
 
+    def find_session_for_meeting(self, meeting_id: str) -> MeetingSession | None:
+        """Return the current in-memory session for a backend meeting identifier."""
+        for session in self.sessions.values():
+            if session.meeting_id == meeting_id:
+                return session
+        return None
+
+    def set_session_muted(self, session_id: str, muted: bool) -> None:
+        """Toggle dashboard mute for a live session."""
+        session = self._get_session(session_id)
+        session.set_operator_muted(muted)
+
+    def submit_operator_instruction(self, session_id: str, instruction_text: str) -> None:
+        """Attach a dashboard instruction to a live session."""
+        session = self._get_session(session_id)
+        session.add_operator_instruction(instruction_text)
+
+    def request_stop_speaking(self, session_id: str) -> None:
+        """Request interruption of any in-flight response for the session."""
+        session = self._get_session(session_id)
+        session.request_output_stop()
+
+    def get_transcript_text(self, session_id: str) -> str:
+        """Return the current transcript buffer for a session."""
+        session = self._get_session(session_id)
+        return session.context_manager.raw_buffer.get_full_text()
+
     def get_active_sessions(self) -> list[dict[str, Any]]:
         """Return a list of all currently active session dicts.
 
@@ -404,6 +436,10 @@ class BotEngine:
         if not wake_detected or not question:
             return None
 
+        if session.operator_muted:
+            logger.info("Session %s ignored wake word while muted", session_id)
+            return None
+
         logger.info("Session %s wake word detected, question: %s", session_id, question)
 
         # Step 5: Process the question
@@ -436,6 +472,11 @@ class BotEngine:
             logger.warning("Could not transition to RESPONDING for session %s", session.session_id)
 
         try:
+            if session.output_stop_requested:
+                session.clear_output_stop()
+                session.transition(SessionState.LISTENING)
+                return None
+
             # Send filler audio to mask latency
             if session.bot_id:
                 filler_audio = self._filler_manager.get_random_filler_audio()
@@ -450,6 +491,12 @@ class BotEngine:
                 question=question,
                 session_id=session.session_id,
             )
+            operator_context = session.get_operator_instruction_context()
+            if operator_context:
+                context = (
+                    f"{context}\n\n=== OPERATOR INSTRUCTIONS ===\n"
+                    f"{operator_context}"
+                )
 
             # Check if web search is needed and augment context
             if needs_web_search(question):
@@ -473,6 +520,15 @@ class BotEngine:
 
             # Synthesize response to audio
             response_audio = self._tts.synthesize(response_text)
+
+            if session.output_stop_requested:
+                logger.info(
+                    "Session %s dropped response because stop was requested",
+                    session.session_id,
+                )
+                session.clear_output_stop()
+                session.transition(SessionState.LISTENING)
+                return None
 
             # Send the response audio into the meeting
             if session.bot_id and response_audio:
