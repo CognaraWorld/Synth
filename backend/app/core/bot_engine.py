@@ -152,6 +152,20 @@ class BotEngine:
         # Wire up the rolling summary with the LLM client
         session.context_manager.rolling_summary.set_llm_client(self._llm_client)
 
+        # Wire up the RAG pipeline and load document summaries for this agent
+        agent_id = agent_config.get("agent_id")
+        if agent_id:
+            from app.api.routes.documents import _get_rag_pipeline
+            rag = _get_rag_pipeline(str(agent_id))
+            session.context_manager.set_rag_pipeline(rag)
+
+            # Load document summaries from DB into context manager
+            doc_summaries = agent_config.get("document_summaries", [])
+            for doc in doc_summaries:
+                session.context_manager.add_document_summary(
+                    doc["filename"], doc["summary"]
+                )
+
         try:
             # Transition: PENDING -> JOINING
             session.transition(SessionState.JOINING)
