@@ -66,6 +66,7 @@ class DocumentResponse(BaseModel):
     file_size: int
     parsed: bool
     chunk_count: int
+    doc_summary: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
