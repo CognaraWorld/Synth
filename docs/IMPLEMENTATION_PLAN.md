@@ -16,9 +16,9 @@ Cognara World is building **Synth**, an AI-powered meeting bot that joins Zoom/T
 | Backend (API + Bot Engine) | Python 3.12, FastAPI, WebSockets | Local |
 | VAD | Silero VAD (~2MB, MIT) | Local, $0 |
 | STT | Whisper Large-v3 Turbo via whisper.cpp/MLX | Local, $0 |
-| LLM | Claude Haiku 4.5 + Sonnet 4.6 (hybrid routing) | Paid API |
-| TTS | Kokoro (82M params, Apache 2.0) | Local, $0 |
-| Web Search | SearXNG (self-hosted) | Local, $0 |
+| LLM | Claude Haiku 4.5 (single model, streaming) | Paid API |
+| TTS | Kokoro (82M params, Apache 2.0, am_michael voice) | Local, $0 |
+| Web Search | Serper (primary) + SearXNG (fallback) | Serper paid, SearXNG local |
 | Embeddings | all-MiniLM-L6-v2 (sentence-transformers) | Local, $0 |
 | Vector DB | ChromaDB (in-memory per session) | Local, $0 |
 | Meeting Infra | Recall.ai API | Paid, $0.65/hr |
@@ -64,9 +64,10 @@ Synth/
 │   │   ├── config.py            # Settings, env vars
 │   │   ├── api/
 │   │   │   ├── routes/
-│   │   │   │   ├── agents.py    # CRUD for agents
+│   │   │   │   │   ├── agents.py    # CRUD for agents
 │   │   │   │   ├── meetings.py  # Meeting management
 │   │   │   │   ├── documents.py # File upload/parse
+│   │   │   │   ├── webhook.py   # Recall.ai webhook receiver
 │   │   │   │   └── auth.py      # Auth verification
 │   │   │   └── websocket.py     # Live meeting status WS
 │   │   ├── core/
@@ -74,8 +75,9 @@ Synth/
 │   │   │   ├── vad.py           # Silero VAD wrapper
 │   │   │   ├── stt.py           # Whisper wrapper
 │   │   │   ├── tts.py           # Kokoro wrapper
-│   │   │   ├── llm.py           # Claude API (Haiku/Sonnet router)
-│   │   │   ├── search.py        # SearXNG client
+│   │   │   ├── llm.py           # Claude Haiku 4.5 client (streaming)
+│   │   │   ├── search.py        # Serper + SearXNG search client
+│   │   │   ├── insight_detector.py # Passive fact-checking system
 │   │   │   └── vision.py        # Screen share OCR via Claude
 │   │   ├── context/
 │   │   │   ├── manager.py       # Three-layer context orchestrator
@@ -92,9 +94,9 @@ Synth/
 │   │   │   └── schemas.py       # Pydantic schemas
 │   │   └── utils/
 │   │       ├── prompt_builder.py # System prompt from description
-│   │       ├── wake_word.py     # "Hey Synth" detection
-│   │       ├── query_router.py  # Haiku vs Sonnet classifier
-│   │       └── filler.py        # Pre-recorded filler responses
+│   │       ├── wake_word.py     # "Hey Assistant" detection (14 phonetic variants)
+│   │       ├── query_router.py  # Query classifier (6 categories) + web search router
+│   │       └── filler.py        # Context-aware filler phrases (25 across 6 categories)
 │   ├── requirements.txt
 │   └── Dockerfile
 │
