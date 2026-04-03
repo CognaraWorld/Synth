@@ -225,7 +225,11 @@ class TestMeetingOverrides:
             db=db,
         )
 
-        created_meeting = db.add.call_args.args[0]
+        created_meeting = next(
+            call.args[0]
+            for call in db.add.call_args_list
+            if hasattr(call.args[0], "agent_id")
+        )
         assert created_meeting.agent_id == primary_agent.id
         assert meeting is created_meeting
         assert current_user.credits == 2
