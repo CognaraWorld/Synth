@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -112,6 +112,7 @@ async def get_meeting(
 @router.post("/{meeting_id}/stop", response_model=MeetingResponse)
 async def stop_meeting(
     meeting_id: UUID,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -131,13 +132,14 @@ async def stop_meeting(
         meeting.duration_minutes = calculate_minutes_used(meeting)
 
     # TODO Phase 6: Stop bot via Recall.ai
-    await finalize_meeting_artifacts(
-        db=db,
-        meeting=meeting,
-        current_user=current_user,
-        settings=settings,
-    )
-
     await db.commit()
     await db.refresh(meeting)
+
+    background_tasks.add_task(
+        finalize_meeting_artifacts_for_meeting_id,
+        meeting.id,
+        current_user.email,
+        settings,
+    )
+
     return meeting

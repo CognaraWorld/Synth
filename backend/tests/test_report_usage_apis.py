@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from fastapi import BackgroundTasks
 
 
 class TestReportFinalization:
@@ -87,6 +88,31 @@ class TestReportFinalization:
 
 
 class TestReportsApi:
+    def test_meeting_summary_response_hides_server_paths(self) -> None:
+        from app.models.schemas import MeetingSummaryResponse
+
+        report_id = uuid4()
+        summary = SimpleNamespace(
+            id=report_id,
+            content="Long-form summary",
+            key_points='["Budget approved"]',
+            action_items='["Send notes"]',
+            decisions='["Proceed with rollout"]',
+            pdf_path="C:/reports/a.pdf",
+            docx_path=None,
+            email_delivery_status="sent",
+            email_delivered_at=datetime(2026, 4, 3, 11, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 3, 10, 50, tzinfo=timezone.utc),
+        )
+
+        response = MeetingSummaryResponse.model_validate(summary)
+
+        assert response.has_pdf is True
+        assert response.has_docx is False
+        assert response.pdf_download_path == f"/api/reports/{report_id}/download/pdf"
+        assert "pdf_path" not in response.model_dump()
+        assert "docx_path" not in response.model_dump()
+
     @pytest.mark.anyio
     async def test_list_reports_returns_dashboard_friendly_payload(self) -> None:
         from app.api.routes.reports import list_reports
@@ -139,6 +165,44 @@ class TestReportsApi:
 
 
 class TestUsageApi:
+    @pytest.mark.anyio
+    async def test_stop_meeting_defers_report_finalization(self) -> None:
+        from app.api.routes.meetings import stop_meeting
+        from app.meeting.reporting import finalize_meeting_artifacts_for_meeting_id
+
+        current_user = SimpleNamespace(id=uuid4(), email="owner@example.com")
+        meeting = SimpleNamespace(
+            id=uuid4(),
+            user_id=current_user.id,
+            status="active",
+            started_at=datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc),
+            ended_at=None,
+            duration_minutes=None,
+        )
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = meeting
+
+        db = AsyncMock()
+        db.execute.return_value = result
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        background_tasks = BackgroundTasks()
+        response = await stop_meeting(
+            meeting_id=meeting.id,
+            background_tasks=background_tasks,
+            current_user=current_user,
+            db=db,
+        )
+
+        assert response is meeting
+        assert meeting.status == "ended"
+        assert len(background_tasks.tasks) == 1
+        scheduled_task = background_tasks.tasks[0]
+        assert scheduled_task.func is finalize_meeting_artifacts_for_meeting_id
+        assert scheduled_task.args[0] == meeting.id
+        assert scheduled_task.args[1] == current_user.email
+
     @pytest.mark.anyio
     async def test_get_usage_summary_returns_month_totals(self) -> None:
         from app.api.routes.usage import get_usage_summary

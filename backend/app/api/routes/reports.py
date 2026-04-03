@@ -8,14 +8,10 @@ from sqlalchemy.orm import joinedload
 
 from app.api.routes.auth import get_current_user
 from app.config import get_settings
-from app.meeting.reporting import (
-    build_report_preview,
-    deserialize_summary_items,
-    finalize_meeting_artifacts,
-    resolve_report_export_path,
-)
+from app.meeting.reporting import finalize_meeting_artifacts, resolve_report_export_path
 from app.models.database import Meeting, MeetingSummary, User, get_db
 from app.models.schemas import ReportDetailResponse, ReportListItemResponse, ReportListResponse
+from app.utils.report_data import build_report_preview, deserialize_summary_items
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 settings = get_settings()
@@ -142,6 +138,7 @@ async def generate_report_for_meeting(
         select(Meeting)
         .options(joinedload(Meeting.summary))
         .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
+        .with_for_update()
     )
     meeting = result.scalar_one_or_none()
     if meeting is None:
