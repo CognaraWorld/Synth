@@ -1,16 +1,31 @@
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, StringConstraints
+
+
+NameField = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+LongTextField = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=5000),
+]
+PromptField = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=20000),
+]
+MeetingLinkField = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1024),
+]
 
 
 # Auth
 class UserCreate(BaseModel):
     email: EmailStr
-    name: str
-    password: Optional[str] = None
-    provider: str = "email"
+    name: NameField
+    password: Optional[str] = Field(default=None, max_length=128)
+    provider: Literal["email", "google"] = "email"
 
 
 class UserResponse(BaseModel):
@@ -30,21 +45,21 @@ class TokenResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: Annotated[str, StringConstraints(min_length=1, max_length=128)]
 
 
 # Agent
 class AgentCreate(BaseModel):
-    name: str = "Synth"
-    description: str
-    mode: str = "general"  # general or custom
+    name: NameField = "Synth"
+    description: LongTextField
+    mode: Literal["general", "custom"] = "general"
 
 
 class AgentUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    system_prompt: Optional[str] = None
-    mode: Optional[str] = None
+    name: Optional[NameField] = None
+    description: Optional[LongTextField] = None
+    system_prompt: Optional[PromptField] = None
+    mode: Optional[Literal["general", "custom"]] = None
 
 
 class AgentResponse(BaseModel):
@@ -75,7 +90,7 @@ class DocumentResponse(BaseModel):
 # Meeting
 class MeetingCreate(BaseModel):
     agent_id: UUID
-    meeting_link: str
+    meeting_link: MeetingLinkField
 
 
 class MeetingResponse(BaseModel):
@@ -113,7 +128,12 @@ class MeetingSummaryResponse(BaseModel):
 
 # Payments
 class CheckoutRequest(BaseModel):
-    pack_id: str = Field(..., description="Credit pack identifier (pack_5, pack_20, pack_50)")
+    pack_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=32,
+        description="Credit pack identifier (pack_5, pack_20, pack_50)",
+    )
 
 
 class CheckoutResponse(BaseModel):
@@ -128,6 +148,7 @@ class CreditBalanceResponse(BaseModel):
 
 class CreditTransactionResponse(BaseModel):
     id: UUID
+    meeting_id: Optional[UUID] = None
     amount: int
     balance_after: int
     transaction_type: str

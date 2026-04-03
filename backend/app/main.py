@@ -23,6 +23,11 @@ def _run_migrations(connection):
         if "doc_summary" not in columns:
             connection.execute(text("ALTER TABLE documents ADD COLUMN doc_summary TEXT"))
             logger.info("Migration: added doc_summary column to documents table")
+    if inspector.has_table("credit_transactions"):
+        columns = [c["name"] for c in inspector.get_columns("credit_transactions")]
+        if "meeting_id" not in columns:
+            connection.execute(text("ALTER TABLE credit_transactions ADD COLUMN meeting_id UUID"))
+            logger.info("Migration: added meeting_id column to credit_transactions table")
 
 
 @asynccontextmanager

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.security import OAuth2PasswordBearer
 
 from app.config import get_settings
+from app.models.credit_transaction import CreditTransaction
 from app.models.database import User, get_db
 from app.models.schemas import (
     LoginRequest,
@@ -75,6 +76,17 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This endpoint only supports email/password registration.",
         )
+    password = (user_data.password or "").strip()
+    if not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is required for email/password registration.",
+        )
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long.",
+        )
 
     result = await db.execute(select(User).where(User.email == user_data.email))
     if result.scalar_one_or_none():
@@ -83,10 +95,23 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     user = User(
         email=user_data.email,
         name=user_data.name,
-        hashed_password=pwd_context.hash(user_data.password or ""),
+        hashed_password=pwd_context.hash(password),
         provider=user_data.provider,
     )
     db.add(user)
+    await db.flush()
+
+    if user.credits:
+        db.add(
+            CreditTransaction(
+                user_id=user.id,
+                amount=user.credits,
+                balance_after=user.credits,
+                transaction_type="free_credit",
+                description="Starter credits granted on registration",
+            )
+        )
+
     await db.commit()
     await db.refresh(user)
     return user
