@@ -1,7 +1,9 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.config import get_settings
 from app.models.database import engine, Base
@@ -9,14 +11,27 @@ from app.models.credit_transaction import CreditTransaction  # noqa: F401 — re
 from app.api.routes import auth, agents, meetings, documents, payments, credits
 from app.api.websocket import router as ws_router
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def _run_migrations(connection):
+    """Add missing columns to existing tables for backwards compatibility."""
+    inspector = inspect(connection)
+    if inspector.has_table("documents"):
+        columns = [c["name"] for c in inspector.get_columns("documents")]
+        if "doc_summary" not in columns:
+            connection.execute(text("ALTER TABLE documents ADD COLUMN doc_summary TEXT"))
+            logger.info("Migration: added doc_summary column to documents table")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup
     async with engine.begin() as conn:
+        # Create new tables
         await conn.run_sync(Base.metadata.create_all)
+        # Backfill missing columns on existing tables
+        await conn.run_sync(_run_migrations)
     yield
     await engine.dispose()
 
