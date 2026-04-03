@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,11 +8,14 @@ from sqlalchemy.orm import joinedload
 
 from app.api.routes.auth import get_current_user
 from app.models.credit_transaction import CreditTransaction
-from app.models.database import Agent, Meeting, MeetingSummary, User, get_db
+from app.config import get_settings
+from app.meeting.reporting import calculate_minutes_used, finalize_meeting_artifacts_for_meeting_id
+from app.models.database import Agent, Meeting, User, get_db
 from app.models.schemas import MeetingCreate, MeetingDetailResponse, MeetingResponse
 from app.utils.meeting_links import detect_meeting_platform
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
+settings = get_settings()
 
 
 def detect_platform(meeting_link: str) -> str:
@@ -122,8 +126,17 @@ async def stop_meeting(
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
     meeting.status = "ended"
+    meeting.ended_at = datetime.now(timezone.utc)
+    if meeting.duration_minutes is None:
+        meeting.duration_minutes = calculate_minutes_used(meeting)
+
     # TODO Phase 6: Stop bot via Recall.ai
-    # TODO Phase 7: Trigger summary generation
+    await finalize_meeting_artifacts(
+        db=db,
+        meeting=meeting,
+        current_user=current_user,
+        settings=settings,
+    )
 
     await db.commit()
     await db.refresh(meeting)
