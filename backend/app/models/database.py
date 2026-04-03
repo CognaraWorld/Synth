@@ -45,6 +45,11 @@ class User(Base):
     credit_transactions = relationship(
         "CreditTransaction", back_populates="user", cascade="all, delete-orphan"
     )
+    operator_instructions = relationship(
+        "OperatorInstruction",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class Agent(Base):
@@ -104,6 +109,17 @@ class Meeting(Base):
     user = relationship("User", back_populates="meetings")
     agent = relationship("Agent", back_populates="meetings")
     summary = relationship("MeetingSummary", back_populates="meeting", uselist=False)
+    live_session = relationship(
+        "LiveSession",
+        back_populates="meeting",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    operator_instructions = relationship(
+        "OperatorInstruction",
+        back_populates="meeting",
+        cascade="all, delete-orphan",
+    )
 
 
 class MeetingSummary(Base):
@@ -120,6 +136,49 @@ class MeetingSummary(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     meeting = relationship("Meeting", back_populates="summary")
+
+
+class LiveSession(Base):
+    __tablename__ = "live_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), unique=True, nullable=False)
+    engine_session_id = Column(String(64), nullable=True, unique=True)
+    provider_bot_id = Column(String(255), nullable=True)
+    session_status = Column(String(50), nullable=False, default="pending")
+    is_muted = Column(Boolean, nullable=False, default=False)
+    stop_requested = Column(Boolean, nullable=False, default=False)
+    last_instruction_at = Column(DateTime, nullable=True)
+    last_transcript_at = Column(DateTime, nullable=True)
+    provider_last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    ended_at = Column(DateTime, nullable=True)
+
+    meeting = relationship("Meeting", back_populates="live_session")
+    instructions = relationship(
+        "OperatorInstruction",
+        back_populates="live_session",
+        cascade="all, delete-orphan",
+    )
+
+
+class OperatorInstruction(Base):
+    __tablename__ = "operator_instructions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=False)
+    live_session_id = Column(UUID(as_uuid=True), ForeignKey("live_sessions.id"), nullable=True)
+    instruction_text = Column(Text, nullable=False)
+    delivery_status = Column(String(50), nullable=False, default="queued")
+    delivery_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    applied_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="operator_instructions")
+    meeting = relationship("Meeting", back_populates="operator_instructions")
+    live_session = relationship("LiveSession", back_populates="instructions")
 
 
 # Database engine setup

@@ -164,3 +164,59 @@ class CreditTransactionListResponse(BaseModel):
     total: int
     page: int
     per_page: int
+
+
+# Live sessions
+class LiveSessionResponse(BaseModel):
+    meeting_id: UUID
+    meeting_status: str
+    platform: str
+    meeting_link: str
+    engine_session_id: Optional[str] = None
+    provider_bot_id: Optional[str] = None
+    session_status: str
+    is_active: bool
+    is_muted: bool
+    stop_requested: bool
+    websocket_path: Optional[str] = None
+    transcript_length: int = 0
+    last_instruction_at: Optional[datetime] = None
+    last_transcript_at: Optional[datetime] = None
+    provider_last_error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    ended_at: Optional[datetime] = None
+
+
+class LiveTranscriptResponse(BaseModel):
+    meeting_id: UUID
+    engine_session_id: Optional[str] = None
+    session_status: str
+    source: str
+    transcript: str
+    updated_at: datetime
+
+
+class OperatorInstructionCreate(BaseModel):
+    instruction: LongTextField
+
+
+class OperatorInstructionResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    live_session_id: Optional[UUID] = None
+    instruction: str
+    delivery_status: str
+    delivery_error: Optional[str] = None
+    created_at: datetime
+    applied_at: Optional[datetime] = None
+
+
+class LiveControlActionResponse(BaseModel):
+    meeting_id: UUID
+    session_status: str
+    provider_status: str
+    detail: Optional[str] = None
+    is_muted: Optional[bool] = None
+    stop_requested: Optional[bool] = None
+    ended_at: Optional[datetime] = None
