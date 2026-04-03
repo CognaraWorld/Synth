@@ -45,6 +45,11 @@ class User(Base):
     credit_transactions = relationship(
         "CreditTransaction", back_populates="user", cascade="all, delete-orphan"
     )
+    usage_records = relationship(
+        "UsageRecord",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class Agent(Base):
@@ -104,6 +109,11 @@ class Meeting(Base):
     user = relationship("User", back_populates="meetings")
     agent = relationship("Agent", back_populates="meetings")
     summary = relationship("MeetingSummary", back_populates="meeting", uselist=False)
+    usage_record = relationship(
+        "UsageRecord",
+        back_populates="meeting",
+        uselist=False,
+    )
 
 
 class MeetingSummary(Base):
@@ -117,9 +127,31 @@ class MeetingSummary(Base):
     decisions = Column(Text, nullable=True)
     pdf_path = Column(String(1024), nullable=True)
     docx_path = Column(String(1024), nullable=True)
+    email_delivery_status = Column(String(50), nullable=False, default="pending")
+    email_delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
     meeting = relationship("Meeting", back_populates="summary")
+
+
+class UsageRecord(Base):
+    __tablename__ = "usage_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    meeting_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("meetings.id"),
+        unique=True,
+        nullable=False,
+    )
+    minutes_used = Column(Float, nullable=False, default=0.0)
+    recorded_at = Column(DateTime, nullable=False, default=_utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = relationship("User", back_populates="usage_records")
+    meeting = relationship("Meeting", back_populates="usage_record")
 
 
 # Database engine setup
@@ -137,3 +169,7 @@ async def get_db():
             yield session
         finally:
             await session.close()
+
+
+# Register late-bound models that reference this declarative base.
+from app.models.credit_transaction import CreditTransaction  # noqa: E402,F401
