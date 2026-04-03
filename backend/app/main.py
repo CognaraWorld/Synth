@@ -8,7 +8,7 @@ from sqlalchemy import inspect, text
 from app.config import get_settings
 from app.models.database import engine, Base
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
-from app.api.routes import auth, agents, meetings, documents, payments, credits, reports, usage
+from app.api.routes import auth, agents, bot, meetings, documents, payments, credits, reports, usage
 from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,38 @@ def _run_migrations(connection):
             logger.info(
                 "Migration: added email_delivered_at column to meeting_summaries table"
             )
+    if inspector.has_table("agents"):
+        columns = [c["name"] for c in inspector.get_columns("agents")]
+        if "voice" not in columns:
+            connection.execute(
+                text("ALTER TABLE agents ADD COLUMN voice VARCHAR(32) NOT NULL DEFAULT 'female'")
+            )
+            logger.info("Migration: added voice column to agents table")
+        if "response_mode" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE agents ADD COLUMN response_mode VARCHAR(32) "
+                    "NOT NULL DEFAULT 'name_only'"
+                )
+            )
+            logger.info("Migration: added response_mode column to agents table")
+        if "is_primary" not in columns:
+            connection.execute(
+                text("ALTER TABLE agents ADD COLUMN is_primary BOOLEAN NOT NULL DEFAULT FALSE")
+            )
+            connection.execute(
+                text(
+                    "WITH ranked AS ("
+                    " SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC, id DESC) AS rank"
+                    " FROM agents"
+                    ") "
+                    "UPDATE agents "
+                    "SET is_primary = CASE WHEN ranked.rank = 1 THEN TRUE ELSE FALSE END "
+                    "FROM ranked "
+                    "WHERE agents.id = ranked.id"
+                )
+            )
+            logger.info("Migration: added is_primary column to agents table")
 
 
 @asynccontextmanager
@@ -78,6 +110,7 @@ app.add_middleware(
 # Routes
 app.include_router(auth.router, prefix="/api")
 app.include_router(agents.router, prefix="/api")
+app.include_router(bot.router, prefix="/api")
 app.include_router(meetings.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")

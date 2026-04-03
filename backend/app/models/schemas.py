@@ -20,6 +20,8 @@ MeetingLinkField = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=1024),
 ]
+VoiceField = Literal["female", "male"]
+ResponseModeField = Literal["name_only", "proactive"]
 
 
 # Auth
@@ -55,6 +57,8 @@ class AgentCreate(BaseModel):
     name: NameField = "Synth"
     description: LongTextField
     mode: Literal["general", "custom"] = "general"
+    voice: VoiceField = "female"
+    response_mode: ResponseModeField = "name_only"
 
 
 class AgentUpdate(BaseModel):
@@ -62,6 +66,8 @@ class AgentUpdate(BaseModel):
     description: Optional[LongTextField] = None
     system_prompt: Optional[PromptField] = None
     mode: Optional[Literal["general", "custom"]] = None
+    voice: Optional[VoiceField] = None
+    response_mode: Optional[ResponseModeField] = None
 
 
 class AgentResponse(BaseModel):
@@ -70,9 +76,26 @@ class AgentResponse(BaseModel):
     description: str
     system_prompt: str
     mode: str
+    voice: str
+    response_mode: str
+    is_primary: bool
     created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class BotProfileUpsert(BaseModel):
+    name: NameField = "Synth"
+    description: LongTextField
+    mode: Literal["general", "custom"] = "general"
+    voice: VoiceField = "female"
+    response_mode: ResponseModeField = "name_only"
+    system_prompt: Optional[PromptField] = None
+
+
+class BotProfileResponse(AgentResponse):
+    pass
 
 
 # Document
@@ -91,7 +114,7 @@ class DocumentResponse(BaseModel):
 
 # Meeting
 class MeetingCreate(BaseModel):
-    agent_id: UUID
+    agent_id: Optional[UUID] = None
     meeting_link: MeetingLinkField
 
 
@@ -112,6 +135,7 @@ class MeetingResponse(BaseModel):
 class MeetingDetailResponse(MeetingResponse):
     transcript: Optional[str] = None
     summary: Optional["MeetingSummaryResponse"] = None
+    override: Optional["MeetingOverrideResponse"] = None
 
 
 # Summary
@@ -140,6 +164,43 @@ class MeetingSummaryResponse(BaseModel):
     @classmethod
     def _parse_list_fields(cls, value: object) -> list[str]:
         return deserialize_summary_items(value)
+
+    model_config = {"from_attributes": True}
+
+
+class MeetingOverrideUpsert(BaseModel):
+    description: Optional[LongTextField] = None
+    mode: Optional[Literal["general", "custom"]] = None
+    system_prompt: Optional[PromptField] = None
+    voice: Optional[VoiceField] = None
+    response_mode: Optional[ResponseModeField] = None
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "MeetingOverrideUpsert":
+        if not any(
+            value is not None
+            for value in (
+                self.description,
+                self.mode,
+                self.system_prompt,
+                self.voice,
+                self.response_mode,
+            )
+        ):
+            raise ValueError("At least one override field must be provided.")
+        return self
+
+
+class MeetingOverrideResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    description: Optional[str] = None
+    mode: Optional[str] = None
+    system_prompt: Optional[str] = None
+    voice: Optional[str] = None
+    response_mode: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
 
