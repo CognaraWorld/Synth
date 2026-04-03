@@ -37,29 +37,37 @@ class RawTranscriptBuffer:
         self._entries: list[tuple[datetime, str]] = []
         self._lock = threading.Lock()
 
-    def _prune(self) -> None:
-        """Remove entries older than max_minutes.
+    def _prune(self) -> list[tuple[datetime, str]]:
+        """Remove entries older than max_minutes and return them.
 
         Must be called while holding ``self._lock``.
+
+        Returns:
+            List of pruned (timestamp, text) tuples.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.max_minutes)
+        pruned = [(ts, text) for ts, text in self._entries if ts < cutoff]
         self._entries = [
             (ts, text) for ts, text in self._entries if ts >= cutoff
         ]
+        return pruned
 
-    def append(self, text: str, timestamp: datetime | None = None) -> None:
+    def append(self, text: str, timestamp: datetime | None = None) -> list[tuple[datetime, str]]:
         """Add a new transcript entry to the buffer.
 
         Args:
             text: The transcript text to store.
             timestamp: When this text was captured. Defaults to now.
+
+        Returns:
+            List of (timestamp, text) tuples that were pruned during this append.
         """
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
 
         with self._lock:
             self._entries.append((timestamp, text))
-            self._prune()
+            return self._prune()
 
     def get_recent(self, minutes: int = 5) -> str:
         """Retrieve the most recent transcript text.

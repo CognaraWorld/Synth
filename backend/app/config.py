@@ -16,8 +16,11 @@ class Settings(BaseSettings):
 
     # Recall.ai
     recall_api_key: str = ""
+    recall_region: str = "us-west-2"
+    webhook_base_url: str = ""
 
-    # SearXNG
+    # Web Search
+    serper_api_key: str = ""
     searxng_url: str = "http://localhost:8080"
 
     # File storage

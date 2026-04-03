@@ -90,7 +90,7 @@ export default function DashboardPage() {
             Overview of your meetings and agents.
           </p>
         </div>
-        <Button render={<Link href="/dashboard/agents/new" />}>
+        <Button nativeButton={false} render={<Link href="/dashboard/agents/new" />}>
           <Plus className="size-4" data-icon="inline-start" />
           New Agent
         </Button>

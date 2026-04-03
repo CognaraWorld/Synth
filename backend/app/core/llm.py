@@ -132,6 +132,51 @@ class LLMClient:
 
         return response.content[0].text
 
+    async def async_query_stream(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ):
+        """Stream a response from Claude, yielding complete sentences.
+
+        Yields:
+            Complete sentences as they are generated.
+        """
+        if self._async_client is None:
+            raise RuntimeError("Anthropic SDK or API key is not configured.")
+
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+
+        buffer = ""
+        async with self._async_client.messages.stream(
+            model=self.model,
+            max_tokens=1024,
+            system=prompt,
+            messages=[{"role": "user", "content": user_content}],
+        ) as stream:
+            async for text in stream.text_stream:
+                buffer += text
+                # Yield on sentence boundaries
+                while True:
+                    # Find end of sentence
+                    best = -1
+                    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                        idx = buffer.find(sep)
+                        if idx != -1 and (best == -1 or idx < best):
+                            best = idx + len(sep)
+                    if best == -1:
+                        break
+                    sentence = buffer[:best].strip()
+                    buffer = buffer[best:]
+                    if sentence:
+                        yield sentence
+
+        # Yield remaining text
+        if buffer.strip():
+            yield buffer.strip()
+
     def generate_system_prompt(self, description: str) -> str:
         """Generate a system prompt from an agent description.
 

@@ -13,6 +13,7 @@ import {
   Loader2,
   Plus,
   Trash2,
+  Square,
   Upload,
   Video,
 } from "lucide-react";
@@ -56,11 +57,13 @@ interface Document {
 
 interface Meeting {
   id: string;
-  title: string;
   platform: string;
-  date: string;
-  duration: string;
-  status: "completed" | "processing" | "failed";
+  meeting_link: string;
+  status: string;
+  created_at: string;
+  started_at?: string;
+  ended_at?: string;
+  duration_minutes?: number;
 }
 
 export default function AgentDetailPage({
@@ -82,6 +85,7 @@ export default function AgentDetailPage({
   const [deleting, setDeleting] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [stoppingMeetingId, setStoppingMeetingId] = useState<string | null>(null);
 
   const fetchAgent = useCallback(async () => {
     try {
@@ -151,15 +155,9 @@ export default function AgentDetailPage({
     setJoiningMeeting(true);
     try {
       const { createMeeting } = await import("@/lib/api");
-      // TODO: Detect platform from URL
-      let platform = "other";
-      if (meetingLink.includes("zoom")) platform = "zoom";
-      else if (meetingLink.includes("meet.google")) platform = "google_meet";
-      else if (meetingLink.includes("teams.microsoft")) platform = "teams";
 
       await createMeeting({
-        platform,
-        meeting_url: meetingLink,
+        meeting_link: meetingLink,
         agent_id: id,
       });
       setMeetingLink("");
@@ -171,6 +169,20 @@ export default function AgentDetailPage({
       // TODO: Show join error toast
     } finally {
       setJoiningMeeting(false);
+    }
+  }
+
+  async function handleStopMeeting(meetingId: string) {
+    setStoppingMeetingId(meetingId);
+    try {
+      const { stopMeeting, getMeetings } = await import("@/lib/api");
+      await stopMeeting(meetingId);
+      const meetingsData = await getMeetings();
+      setMeetings(meetingsData);
+    } catch {
+      // Meeting may already be stopped
+    } finally {
+      setStoppingMeetingId(null);
     }
   }
 
@@ -207,7 +219,7 @@ export default function AgentDetailPage({
           variant="ghost"
           size="sm"
           className="gap-1.5"
-          render={<Link href="/dashboard/agents" />}
+          nativeButton={false} render={<Link href="/dashboard/agents" />}
         >
           <ArrowLeft className="size-3.5" />
           Back to Agents
@@ -227,7 +239,7 @@ export default function AgentDetailPage({
         variant="ghost"
         size="sm"
         className="gap-1.5"
-        render={<Link href="/dashboard/agents" />}
+        nativeButton={false} render={<Link href="/dashboard/agents" />}
       >
         <ArrowLeft className="size-3.5" />
         Back to Agents
@@ -253,7 +265,7 @@ export default function AgentDetailPage({
             variant="outline"
             size="sm"
             className="gap-1.5"
-            render={<Link href={`/dashboard/agents/${id}/edit`} />}
+            nativeButton={false} render={<Link href={`/dashboard/agents/${id}/edit`} />}
           >
             <Edit className="size-3.5" />
             Edit
@@ -471,30 +483,53 @@ export default function AgentDetailPage({
         {meetings.length > 0 ? (
           <div className="space-y-2">
             {meetings.map((meeting) => (
-              <Link
+              <div
                 key={meeting.id}
-                href={`/dashboard/meetings/${meeting.id}`}
-                className="flex items-center justify-between rounded-lg border border-border p-3 transition-colors hover:bg-muted/50"
+                className="flex items-center justify-between rounded-lg border border-border p-3"
               >
-                <div className="flex flex-col gap-1">
-                  <p className="text-sm font-medium">{meeting.title}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {meeting.platform} &middot; {meeting.date}
+                <Link
+                  href={`/dashboard/meetings/${meeting.id}`}
+                  className="flex flex-col gap-1 flex-1 hover:opacity-80"
+                >
+                  <p className="text-sm font-medium">
+                    {meeting.platform.charAt(0).toUpperCase() + meeting.platform.slice(1)} Meeting
                   </p>
-                </div>
+                  <p className="text-xs text-muted-foreground">
+                    {new Date(meeting.created_at).toLocaleString()}
+                  </p>
+                </Link>
                 <div className="flex items-center gap-3">
-                  <span className="text-xs text-muted-foreground">
-                    {meeting.duration}
-                  </span>
                   <Badge
                     variant={
-                      meeting.status === "completed" ? "secondary" : "outline"
+                      meeting.status === "active"
+                        ? "default"
+                        : meeting.status === "ended"
+                        ? "secondary"
+                        : "outline"
                     }
+                    className={meeting.status === "active" ? "bg-green-600" : ""}
                   >
-                    {meeting.status}
+                    {meeting.status === "active" ? "Live" : meeting.status}
                   </Badge>
+                  {meeting.status === "active" && (
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => handleStopMeeting(meeting.id)}
+                      disabled={stoppingMeetingId === meeting.id}
+                    >
+                      {stoppingMeetingId === meeting.id ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <>
+                          <Square className="size-3 mr-1" />
+                          Stop Bot
+                        </>
+                      )}
+                    </Button>
+                  )}
                 </div>
-              </Link>
+              </div>
             ))}
           </div>
         ) : (
