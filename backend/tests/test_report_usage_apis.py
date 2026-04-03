@@ -13,7 +13,7 @@ from fastapi import BackgroundTasks
 
 
 class TestReportFinalization:
-    @pytest.mark.anyio
+    @pytest.mark.asyncio
     async def test_finalize_meeting_artifacts_persists_report_and_usage(
         self, tmp_path: Path
     ) -> None:
@@ -113,7 +113,7 @@ class TestReportsApi:
         assert "pdf_path" not in response.model_dump()
         assert "docx_path" not in response.model_dump()
 
-    @pytest.mark.anyio
+    @pytest.mark.asyncio
     async def test_list_reports_returns_dashboard_friendly_payload(self) -> None:
         from app.api.routes.reports import list_reports
 
@@ -165,7 +165,7 @@ class TestReportsApi:
 
 
 class TestUsageApi:
-    @pytest.mark.anyio
+    @pytest.mark.asyncio
     async def test_stop_meeting_defers_report_finalization(self) -> None:
         from app.api.routes.meetings import stop_meeting
         from app.meeting.reporting import finalize_meeting_artifacts_for_meeting_id
@@ -203,7 +203,7 @@ class TestUsageApi:
         assert scheduled_task.args[0] == meeting.id
         assert scheduled_task.args[1] == current_user.email
 
-    @pytest.mark.anyio
+    @pytest.mark.asyncio
     async def test_get_usage_summary_returns_month_totals(self) -> None:
         from app.api.routes.usage import get_usage_summary
 

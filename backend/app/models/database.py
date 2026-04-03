@@ -169,7 +169,3 @@ async def get_db():
             yield session
         finally:
             await session.close()
-
-
-# Register late-bound models that reference this declarative base.
-from app.models.credit_transaction import CreditTransaction  # noqa: E402,F401
