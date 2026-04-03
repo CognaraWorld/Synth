@@ -2,7 +2,9 @@ from datetime import datetime
 from typing import Annotated, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, StringConstraints, model_validator
+from pydantic import BaseModel, EmailStr, Field, StringConstraints, field_validator, model_validator
+
+from app.utils.report_data import build_embedded_summary_payload, deserialize_summary_items
 
 
 NameField = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
@@ -140,12 +142,28 @@ class MeetingDetailResponse(MeetingResponse):
 class MeetingSummaryResponse(BaseModel):
     id: UUID
     content: str
-    key_points: Optional[str] = None
-    action_items: Optional[str] = None
-    decisions: Optional[str] = None
-    pdf_path: Optional[str] = None
-    docx_path: Optional[str] = None
+    key_points: list[str] = Field(default_factory=list)
+    action_items: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    email_delivery_status: str = "pending"
+    email_delivered_at: Optional[datetime] = None
+    has_pdf: bool = False
+    has_docx: bool = False
+    pdf_download_path: Optional[str] = None
+    docx_download_path: Optional[str] = None
     created_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize_embedded_exports(cls, value: object) -> object:
+        if value is None or isinstance(value, dict):
+            return value
+        return build_embedded_summary_payload(value)
+
+    @field_validator("key_points", "action_items", "decisions", mode="before")
+    @classmethod
+    def _parse_list_fields(cls, value: object) -> list[str]:
+        return deserialize_summary_items(value)
 
     model_config = {"from_attributes": True}
 
@@ -225,6 +243,79 @@ class CreditTransactionListResponse(BaseModel):
     total: int
     page: int
     per_page: int
+
+
+class ReportListItemResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    platform: str
+    meeting_link: str
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    duration_minutes: Optional[float] = None
+    content_preview: str
+    action_items: list[str] = Field(default_factory=list)
+    email_delivery_status: str
+    email_delivered_at: Optional[datetime] = None
+    has_pdf: bool
+    has_docx: bool
+    created_at: datetime
+
+
+class ReportListResponse(BaseModel):
+    reports: list[ReportListItemResponse]
+    total: int
+    page: int
+    per_page: int
+
+
+class ReportDetailResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    platform: str
+    meeting_link: str
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    duration_minutes: Optional[float] = None
+    content: str
+    key_points: list[str] = Field(default_factory=list)
+    action_items: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    email_delivery_status: str
+    email_delivered_at: Optional[datetime] = None
+    has_pdf: bool
+    has_docx: bool
+    pdf_download_path: Optional[str] = None
+    docx_download_path: Optional[str] = None
+    created_at: datetime
+
+
+class UsageRecordResponse(BaseModel):
+    id: UUID
+    meeting_id: UUID
+    platform: str
+    meeting_link: str
+    minutes_used: float
+    recorded_at: datetime
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+
+
+class UsageRecordListResponse(BaseModel):
+    records: list[UsageRecordResponse]
+    total: int
+    page: int
+    per_page: int
+
+
+class UsageSummaryResponse(BaseModel):
+    year: int
+    month: int
+    period_start: datetime
+    period_end: datetime
+    meeting_count: int
+    total_minutes: float
+    average_minutes: float
 
 
 # Live sessions
