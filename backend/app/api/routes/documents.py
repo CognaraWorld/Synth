@@ -1,4 +1,5 @@
 import logging
+import importlib
 from pathlib import Path
 from uuid import UUID
 
@@ -26,6 +27,18 @@ def get_file_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 
+def _multipart_support_available() -> bool:
+    """Return whether FastAPI file upload dependencies are installed correctly."""
+    try:
+        multipart_module = importlib.import_module("multipart")
+        if not getattr(multipart_module, "__version__", None):
+            return False
+        multipart_helpers = importlib.import_module("multipart.multipart")
+        return hasattr(multipart_helpers, "parse_options_header")
+    except Exception:
+        return False
+
+
 # Shared RAG pipelines keyed by agent_id — persists across requests
 _rag_pipelines: dict[str, object | None] = {}
 
@@ -45,7 +58,7 @@ def _get_rag_pipeline(agent_id: str) -> object | None:
             _rag_pipelines[agent_id] = None
         except Exception as exc:
             logger.warning("RAG pipeline init failed for agent %s: %s", agent_id, exc)
-            _rag_pipelines[agent_id] = None
+            return None
     return _rag_pipelines[agent_id]
 
 
@@ -91,66 +104,84 @@ async def _process_document_background(document_id: UUID, file_path: str, ext: s
             logger.warning("Background document processing failed for %s: %s", document_id, exc)
 
 
-@router.post(
-    "/upload/{agent_id}",
-    response_model=DocumentResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def upload_document(
-    agent_id: UUID,
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        result = await db.execute(
-            select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
-        )
-        agent = result.scalar_one_or_none()
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+if _multipart_support_available():
 
-        original_filename = Path(file.filename or "").name
-        ext = get_file_extension(original_filename)
-        if ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File type '.{ext}' not supported. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+    @router.post(
+        "/upload/{agent_id}",
+        response_model=DocumentResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def upload_document(
+        agent_id: UUID,
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ):
+        try:
+            result = await db.execute(
+                select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
+            )
+            agent = result.scalar_one_or_none()
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+
+            original_filename = Path(file.filename or "").name
+            ext = get_file_extension(original_filename)
+            if ext not in ALLOWED_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File type '.{ext}' not supported. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+                )
+
+            content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
+
+            display_name, file_path = build_agent_upload_path(
+                Path(settings.upload_dir),
+                str(agent_id),
+                original_filename,
+            )
+            file_path.write_bytes(content)
+
+            document = Document(
+                agent_id=agent_id,
+                filename=display_name,
+                file_path=str(file_path),
+                file_type=ext,
+                file_size=len(content),
+            )
+            db.add(document)
+            await db.commit()
+            await db.refresh(document)
+
+            # Process document in background — doesn't block the upload response
+            background_tasks.add_task(
+                _process_document_background, document.id, str(file_path), ext, str(agent_id)
             )
 
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
+            return document
+        finally:
+            await file.close()
 
-        display_name, file_path = build_agent_upload_path(
-            Path(settings.upload_dir),
-            str(agent_id),
-            original_filename,
+else:
+
+    @router.post(
+        "/upload/{agent_id}",
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
+    async def upload_document(
+        agent_id: UUID,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Document uploads require "python-multipart" to be installed',
         )
-        file_path.write_bytes(content)
-
-        document = Document(
-            agent_id=agent_id,
-            filename=display_name,
-            file_path=str(file_path),
-            file_type=ext,
-            file_size=len(content),
-        )
-        db.add(document)
-        await db.commit()
-        await db.refresh(document)
-
-        # Process document in background — doesn't block the upload response
-        background_tasks.add_task(
-            _process_document_background, document.id, str(file_path), ext, str(agent_id)
-        )
-
-        return document
-    finally:
-        await file.close()
 
 
 @router.get("/{agent_id}", response_model=list[DocumentResponse])

@@ -16,7 +16,7 @@ PromptField = Annotated[
 ]
 MeetingLinkField = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=2048),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1024),
 ]
 
 

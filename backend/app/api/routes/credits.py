@@ -4,7 +4,7 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -100,8 +100,11 @@ async def refund_meeting_credit(
     existing_refund = await db.execute(
         select(CreditTransaction).where(
             CreditTransaction.user_id == current_user.id,
-            CreditTransaction.meeting_id == meeting_id,
             CreditTransaction.transaction_type == "refund",
+            or_(
+                CreditTransaction.meeting_id == meeting_id,
+                CreditTransaction.description.contains(str(meeting_id)),
+            ),
         )
     )
     if existing_refund.scalar_one_or_none():

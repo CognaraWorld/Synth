@@ -14,6 +14,7 @@ import importlib
 import logging
 import os
 from pathlib import Path
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,11 @@ _SUMMARY_PROMPT = (
     "clear sections if the document covers multiple topics.\n\n"
     "Document:\n{text}"
 )
+
+
+class ChunkEmbeddingPipeline(Protocol):
+    def add_chunks_batch(self, chunks: list[dict[str, object]]) -> None:
+        """Persist a batch of embedded document chunks."""
 
 
 class DocumentProcessor:
@@ -43,7 +49,7 @@ class DocumentProcessor:
     def __init__(
         self,
         default_chunk_size: int = 200,
-        rag_pipeline: object | None = None,
+        rag_pipeline: ChunkEmbeddingPipeline | None = None,
         llm_client: object | None = None,
     ) -> None:
         """Initialize the document processor.
@@ -83,6 +89,7 @@ class DocumentProcessor:
         Raises:
             FileNotFoundError: If the file does not exist.
             ValueError: If the file is not a valid PDF.
+            RuntimeError: If the optional PDF dependency is not installed.
         """
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"PDF file not found: {file_path}")
@@ -113,6 +120,7 @@ class DocumentProcessor:
         Raises:
             FileNotFoundError: If the file does not exist.
             ValueError: If the file is not a valid DOCX.
+            RuntimeError: If the optional DOCX dependency is not installed.
         """
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"DOCX file not found: {file_path}")
