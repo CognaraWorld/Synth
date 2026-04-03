@@ -61,6 +61,9 @@ class Agent(Base):
     description = Column(Text, nullable=False)
     system_prompt = Column(Text, nullable=False)
     mode = Column(Enum("general", "custom", name="agent_mode"), default="general")
+    voice = Column(String(32), nullable=False, default="female")
+    response_mode = Column(String(32), nullable=False, default="name_only")
+    is_primary = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -120,6 +123,7 @@ class Meeting(Base):
         back_populates="meeting",
         cascade="all, delete-orphan",
     )
+    override = relationship("MeetingOverride", back_populates="meeting", uselist=False)
 
 
 class MeetingSummary(Base):
@@ -179,6 +183,20 @@ class OperatorInstruction(Base):
     user = relationship("User", back_populates="operator_instructions")
     meeting = relationship("Meeting", back_populates="operator_instructions")
     live_session = relationship("LiveSession", back_populates="instructions")
+class MeetingOverride(Base):
+    __tablename__ = "meeting_overrides"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), unique=True, nullable=False)
+    description = Column(Text, nullable=True)
+    mode = Column(String(32), nullable=True)
+    system_prompt = Column(Text, nullable=True)
+    voice = Column(String(32), nullable=True)
+    response_mode = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    meeting = relationship("Meeting", back_populates="override")
 
 
 # Database engine setup

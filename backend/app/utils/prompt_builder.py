@@ -80,3 +80,10 @@ def build_custom_prompt(description: str) -> str:
         "\n"
         "Stay in character as described above for the entire meeting."
     )
+
+
+def build_prompt_for_mode(mode: str, description: str) -> str:
+    """Build the appropriate system prompt for the requested mode."""
+    if mode == "custom":
+        return build_custom_prompt(description)
+    return build_general_prompt()
