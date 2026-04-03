@@ -75,6 +75,7 @@ class Document(Base):
     file_size = Column(Integer, default=0)
     parsed = Column(Boolean, default=False)
     chunk_count = Column(Integer, default=0)
+    doc_summary = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
     agent = relationship("Agent", back_populates="documents")

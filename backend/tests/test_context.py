@@ -244,7 +244,7 @@ class TestContextManagerAssembleContext:
         result = cm.assemble_context(question="What was discussed?", session_id="s1")
         assert "=== MEETING SUMMARY ===" in result
         assert "=== RECENT CONVERSATION (last 5 minutes) ===" in result
-        assert "=== RELEVANT DOCUMENTS ===" in result
+        assert "=== RELEVANT DOCUMENT PASSAGES ===" in result
 
     def test_assemble_context_with_buffer(self) -> None:
         cm = ContextManager()
@@ -263,7 +263,7 @@ class TestContextManagerAssembleContext:
         result = cm.assemble_context(question="How to set up API?", session_id="s1")
         assert "FastAPI docs excerpt" in result
         assert "[api.pdf]" in result
-        mock_rag.search.assert_called_once_with(query="How to set up API?", top_k=3)
+        mock_rag.search.assert_called_once_with(query="How to set up API?", top_k=5)
 
     def test_assemble_context_rag_failure_graceful(self) -> None:
         """A failing RAG pipeline should not crash assembly."""
@@ -296,7 +296,7 @@ class TestContextManagerAssembleContext:
         result = cm.assemble_context(question="test", session_id="s1")
         # The RELEVANT DOCUMENTS section exists but is blank after the header.
         lines = result.split("\n")
-        doc_idx = next(i for i, l in enumerate(lines) if "RELEVANT DOCUMENTS" in l)
+        doc_idx = next(i for i, l in enumerate(lines) if "RELEVANT DOCUMENT PASSAGES" in l)
         # The line after the header should be empty (no doc content).
         assert lines[doc_idx + 1].strip() == ""
 
