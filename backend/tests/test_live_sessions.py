@@ -210,6 +210,37 @@ class TestLiveSessionService:
         assert response["provider_status"] == "engine_stop"
 
     @pytest.mark.asyncio
+    async def test_leave_meeting_keeps_session_active_when_provider_leave_is_not_configured(self) -> None:
+        user, _, meeting, live_session = _build_owned_meeting()
+        meeting.bot_id = "bot-123"
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = meeting
+        db.execute.return_value = result
+        db.commit = AsyncMock()
+
+        engine = MagicMock()
+        engine.sessions = {}
+        engine.find_session_for_meeting.return_value = None
+
+        provider = MagicMock()
+        provider.leave = AsyncMock(
+            return_value=ProviderActionResult(
+                provider_status="not_configured",
+                detail="Recall.ai credentials are not configured yet.",
+            )
+        )
+
+        service = LiveSessionService(db=db, engine=engine, provider=provider)
+        response = await service.leave_meeting(meeting.id, user)
+
+        provider.leave.assert_awaited_once_with("bot-123")
+        assert meeting.status == "active"
+        assert live_session.session_status == "listening"
+        assert live_session.ended_at is None
+        assert response["provider_status"] == "not_configured"
+
+    @pytest.mark.asyncio
     async def test_get_transcript_snapshot_prefers_live_buffer(self) -> None:
         user, _, meeting, _ = _build_owned_meeting()
         db = AsyncMock()
