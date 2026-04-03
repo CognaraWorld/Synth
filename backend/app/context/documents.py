@@ -225,12 +225,12 @@ class DocumentProcessor:
             excerpt_words = words[:500]
             return " ".join(excerpt_words) + "\n\n[Summary generation failed — showing excerpt]"
 
-    async def process_and_embed(
+    def process_and_embed_sync(
         self, file_path: str, file_type: str
     ) -> dict[str, int | str]:
-        """Parse a file, chunk it, embed into vector store, and generate summary.
+        """Synchronous version of process_and_embed.
 
-        End-to-end pipeline: parse -> chunk -> embed -> summarize.
+        Suitable for running in a thread via anyio.to_thread.run_sync.
 
         Args:
             file_path: Absolute path to the uploaded file.
@@ -238,10 +238,13 @@ class DocumentProcessor:
 
         Returns:
             A dict with ``chunk_count`` (int) and ``summary`` (str).
-
-        Raises:
-            ValueError: If file_type is not supported.
         """
+        return self._process_and_embed_impl(file_path, file_type)
+
+    def _process_and_embed_impl(
+        self, file_path: str, file_type: str
+    ) -> dict[str, int | str]:
+        """Shared implementation for sync and async process_and_embed."""
         parsers = {
             "pdf": self.parse_pdf,
             "docx": self.parse_docx,
@@ -276,3 +279,22 @@ class DocumentProcessor:
         summary = self.generate_summary(text)
 
         return {"chunk_count": len(chunks), "summary": summary}
+
+    async def process_and_embed(
+        self, file_path: str, file_type: str
+    ) -> dict[str, int | str]:
+        """Parse a file, chunk it, embed into vector store, and generate summary.
+
+        End-to-end pipeline: parse -> chunk -> embed -> summarize.
+
+        Args:
+            file_path: Absolute path to the uploaded file.
+            file_type: File format identifier ("pdf", "docx", "txt").
+
+        Returns:
+            A dict with ``chunk_count`` (int) and ``summary`` (str).
+
+        Raises:
+            ValueError: If file_type is not supported.
+        """
+        return self._process_and_embed_impl(file_path, file_type)

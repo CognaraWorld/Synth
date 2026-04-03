@@ -2,15 +2,15 @@ import logging
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+import anyio
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
 from app.config import get_settings
 from app.context.documents import DocumentProcessor
-from app.context.rag import RAGPipeline
-from app.models.database import Agent, Document, User, get_db
+from app.models.database import Agent, Document, User, get_db, AsyncSessionLocal
 from app.models.schemas import DocumentResponse
 from app.utils.storage import build_agent_upload_path, is_managed_path
 
@@ -19,12 +19,64 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
 
-ALLOWED_EXTENSIONS = {"pdf", "docx", "doc", "txt"}
+ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
 def get_file_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+# Shared RAG pipelines keyed by agent_id — persists across requests
+_rag_pipelines: dict[str, object] = {}
+
+
+def _get_rag_pipeline(agent_id: str):
+    """Get or create a persistent RAG pipeline for an agent."""
+    if agent_id not in _rag_pipelines:
+        from app.context.rag import RAGPipeline
+        _rag_pipelines[agent_id] = RAGPipeline(collection_name=f"agent_{agent_id}")
+    return _rag_pipelines[agent_id]
+
+
+async def _process_document_background(document_id: UUID, file_path: str, ext: str, agent_id: str):
+    """Background task: parse, chunk, embed, and summarize a document."""
+    async with AsyncSessionLocal() as db:
+        try:
+            rag = _get_rag_pipeline(agent_id)
+
+            llm_client = None
+            try:
+                from app.core.llm import LLMClient
+                llm_client = LLMClient()
+            except ModuleNotFoundError:
+                logger.info("Anthropic SDK not installed — document summary will use excerpt fallback")
+            except Exception as exc:
+                logger.warning("LLM client init failed: %s", exc)
+
+            processor = DocumentProcessor(
+                rag_pipeline=rag,
+                llm_client=llm_client,
+            )
+
+            # Run sync processing in a thread to avoid blocking the event loop
+            result = await anyio.to_thread.run_sync(
+                lambda: processor.process_and_embed_sync(file_path, ext)
+            )
+
+            document = await db.get(Document, document_id)
+            if document:
+                document.parsed = True
+                document.chunk_count = result["chunk_count"]
+                document.doc_summary = result["summary"]
+                await db.commit()
+
+            logger.info(
+                "Document %s processed: %d chunks, summary %d chars",
+                document_id, result["chunk_count"], len(result.get("summary", "")),
+            )
+        except Exception as exc:
+            logger.warning("Background document processing failed for %s: %s", document_id, exc)
 
 
 @router.post(
@@ -34,6 +86,7 @@ def get_file_extension(filename: str) -> str:
 )
 async def upload_document(
     agent_id: UUID,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -78,29 +131,10 @@ async def upload_document(
         await db.commit()
         await db.refresh(document)
 
-        # Parse, chunk, embed, and generate summary in background
-        try:
-            rag = RAGPipeline(collection_name=f"agent_{agent_id}")
-            llm_client = None
-            try:
-                from app.core.llm import LLMClient
-                llm_client = LLMClient()
-            except Exception:
-                pass
-
-            processor = DocumentProcessor(
-                rag_pipeline=rag,
-                llm_client=llm_client,
-            )
-            result = await processor.process_and_embed(str(file_path), ext)
-
-            document.parsed = True
-            document.chunk_count = result["chunk_count"]
-            document.doc_summary = result["summary"]
-            await db.commit()
-            await db.refresh(document)
-        except Exception as exc:
-            logger.warning("Document processing failed for %s: %s", display_name, exc)
+        # Process document in background — doesn't block the upload response
+        background_tasks.add_task(
+            _process_document_background, document.id, str(file_path), ext, str(agent_id)
+        )
 
         return document
     finally:
@@ -113,7 +147,6 @@ async def list_documents(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify agent belongs to user
     result = await db.execute(
         select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
     )
@@ -141,7 +174,6 @@ async def delete_document(
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete file from disk
     if is_managed_path(Path(settings.upload_dir), document.file_path):
         file_path = Path(document.file_path)
         if file_path.exists():
