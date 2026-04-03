@@ -2,58 +2,46 @@
 
 from __future__ import annotations
 
-import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import anyio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.meeting.email_sender import EmailSender
 from app.meeting.summary import SummaryGenerator
-from app.models.database import Meeting, MeetingSummary, UsageRecord
+from app.models.database import AsyncSessionLocal, Meeting, MeetingSummary, UsageRecord
+from app.utils.report_data import serialize_summary_items
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def serialize_summary_items(items: list[str] | tuple[str, ...] | None) -> str:
-    """Store structured summary lists as JSON text."""
-    return json.dumps([str(item) for item in (items or [])], ensure_ascii=True)
+def _export_report_artifacts(
+    generator: SummaryGenerator,
+    summary_payload: dict[str, Any],
+    meeting_info: dict[str, str],
+    summary_dir: Path,
+    meeting_id,
+) -> tuple[Path, Path, bytes, bytes]:
+    """Generate and write report exports in a worker thread."""
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = summary_dir / f"{meeting_id}.pdf"
+    docx_path = summary_dir / f"{meeting_id}.docx"
 
-
-def deserialize_summary_items(raw_value: str | list[str] | None) -> list[str]:
-    """Decode summary list fields stored as JSON text."""
-    if raw_value is None:
-        return []
-    if isinstance(raw_value, list):
-        return [str(item) for item in raw_value if str(item).strip()]
-
-    stripped = str(raw_value).strip()
-    if not stripped:
-        return []
-
-    try:
-        decoded = json.loads(stripped)
-    except json.JSONDecodeError:
-        lines = [line.lstrip("- ").strip() for line in stripped.splitlines() if line.strip()]
-        return lines or [stripped]
-
-    if isinstance(decoded, list):
-        return [str(item) for item in decoded if str(item).strip()]
-    if isinstance(decoded, str) and decoded.strip():
-        return [decoded.strip()]
-    return []
-
-
-def build_report_preview(content: str, limit: int = 180) -> str:
-    """Collapse summary content into a short preview string."""
-    normalized = " ".join((content or "").split())
-    if len(normalized) <= limit:
-        return normalized
-    return f"{normalized[: limit - 1].rstrip()}..."
+    pdf_bytes = generator.export_pdf(summary_payload, meeting_info=meeting_info)
+    docx_bytes = generator.export_docx(summary_payload, meeting_info=meeting_info)
+    pdf_path.write_bytes(pdf_bytes)
+    docx_path.write_bytes(docx_bytes)
+    return pdf_path, docx_path, pdf_bytes, docx_bytes
 
 
 def calculate_minutes_used(meeting: Meeting) -> float:
@@ -132,14 +120,14 @@ async def finalize_meeting_artifacts(
     summary_payload = await generator.generate(meeting.transcript or "")
 
     summary_dir = Path(settings.summary_dir).resolve()
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = summary_dir / f"{meeting.id}.pdf"
-    docx_path = summary_dir / f"{meeting.id}.docx"
-
-    pdf_bytes = generator.export_pdf(summary_payload, meeting_info=meeting_info)
-    docx_bytes = generator.export_docx(summary_payload, meeting_info=meeting_info)
-    pdf_path.write_bytes(pdf_bytes)
-    docx_path.write_bytes(docx_bytes)
+    pdf_path, docx_path, pdf_bytes, docx_bytes = await anyio.to_thread.run_sync(
+        _export_report_artifacts,
+        generator,
+        summary_payload,
+        meeting_info,
+        summary_dir,
+        meeting.id,
+    )
 
     report = meeting.summary
     if report is None:
@@ -177,3 +165,33 @@ async def finalize_meeting_artifacts(
     usage_record = await upsert_usage_record(db=db, meeting=meeting)
     await db.flush()
     return report, usage_record
+
+
+async def finalize_meeting_artifacts_for_meeting_id(
+    meeting_id,
+    user_email: str,
+    settings: Any,
+) -> None:
+    """Run report finalization after the stop response using a fresh DB session."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Meeting)
+            .options(joinedload(Meeting.summary), joinedload(Meeting.usage_record))
+            .where(Meeting.id == meeting_id)
+            .with_for_update()
+        )
+        meeting = result.scalar_one_or_none()
+        if meeting is None:
+            return
+
+        try:
+            await finalize_meeting_artifacts(
+                db=db,
+                meeting=meeting,
+                current_user=SimpleNamespace(email=user_email),
+                settings=settings,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Report finalization failed for meeting %s", meeting_id)

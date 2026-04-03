@@ -121,16 +121,25 @@ class MeetingSummaryResponse(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     action_items: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
-    pdf_path: Optional[str] = None
-    docx_path: Optional[str] = None
     email_delivery_status: str = "pending"
     email_delivered_at: Optional[datetime] = None
+    has_pdf: bool = False
+    has_docx: bool = False
+    pdf_download_path: Optional[str] = None
+    docx_download_path: Optional[str] = None
     created_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize_embedded_exports(cls, value: object) -> object:
+        if value is None or isinstance(value, dict):
+            return value
+        return build_embedded_summary_payload(value)
 
     @field_validator("key_points", "action_items", "decisions", mode="before")
     @classmethod
     def _parse_list_fields(cls, value: object) -> list[str]:
-        return _decode_text_list(value)
+        return deserialize_summary_items(value)
 
     model_config = {"from_attributes": True}
 
