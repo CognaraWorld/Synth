@@ -15,6 +15,7 @@ class CreditTransaction(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=True)
     amount = Column(Integer, nullable=False)  # positive = added, negative = used
     balance_after = Column(Integer, nullable=False)
     transaction_type = Column(
@@ -25,3 +26,4 @@ class CreditTransaction(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="credit_transactions")
+    meeting = relationship("Meeting")

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.api.routes.auth import get_current_user
+from app.models.credit_transaction import CreditTransaction
 from app.models.database import Agent, Meeting, MeetingSummary, User, get_db
 from app.models.schemas import MeetingCreate, MeetingDetailResponse, MeetingResponse
 from app.utils.meeting_links import detect_meeting_platform
@@ -47,11 +48,23 @@ async def create_meeting(
         platform=platform,
         meeting_link=meeting_data.meeting_link,
         status="pending",
+        credits_used=1,
     )
     db.add(meeting)
+    await db.flush()
 
     # Deduct credit
-    current_user.credits -= 1
+    current_user.credits -= meeting.credits_used
+    db.add(
+        CreditTransaction(
+            user_id=current_user.id,
+            meeting_id=meeting.id,
+            amount=-meeting.credits_used,
+            balance_after=current_user.credits,
+            transaction_type="meeting_used",
+            description=f"Started {platform} meeting",
+        )
+    )
 
     await db.commit()
     await db.refresh(meeting)
