@@ -10,14 +10,10 @@ Phase 4 implementation.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from pathlib import Path
-
-import docx
-import pdfplumber
-
-from app.context.rag import RAGPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +43,7 @@ class DocumentProcessor:
     def __init__(
         self,
         default_chunk_size: int = 200,
-        rag_pipeline: RAGPipeline | None = None,
+        rag_pipeline: object | None = None,
         llm_client: object | None = None,
     ) -> None:
         """Initialize the document processor.
@@ -65,6 +61,16 @@ class DocumentProcessor:
         self.rag_pipeline = rag_pipeline
         self.llm_client = llm_client
 
+    @staticmethod
+    def _import_optional_dependency(module_name: str, feature_name: str) -> object:
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"{feature_name} processing is unavailable because the optional "
+                f"dependency '{module_name}' is not installed."
+            ) from exc
+
     def parse_pdf(self, file_path: str) -> str:
         """Extract text content from a PDF file.
 
@@ -81,6 +87,7 @@ class DocumentProcessor:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"PDF file not found: {file_path}")
 
+        pdfplumber = self._import_optional_dependency("pdfplumber", "PDF")
         pages_text: list[str] = []
         try:
             with pdfplumber.open(file_path) as pdf:
@@ -110,6 +117,7 @@ class DocumentProcessor:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"DOCX file not found: {file_path}")
 
+        docx = self._import_optional_dependency("docx", "DOCX")
         try:
             doc = docx.Document(file_path)
         except Exception as exc:

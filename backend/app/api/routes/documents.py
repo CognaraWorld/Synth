@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
 from app.config import get_settings
-from app.context.documents import DocumentProcessor
 from app.models.database import Agent, Document, User, get_db, AsyncSessionLocal
 from app.models.schemas import DocumentResponse
 from app.utils.storage import build_agent_upload_path, is_managed_path
@@ -28,14 +27,25 @@ def get_file_extension(filename: str) -> str:
 
 
 # Shared RAG pipelines keyed by agent_id — persists across requests
-_rag_pipelines: dict[str, object] = {}
+_rag_pipelines: dict[str, object | None] = {}
 
 
-def _get_rag_pipeline(agent_id: str):
+def _get_rag_pipeline(agent_id: str) -> object | None:
     """Get or create a persistent RAG pipeline for an agent."""
     if agent_id not in _rag_pipelines:
-        from app.context.rag import RAGPipeline
-        _rag_pipelines[agent_id] = RAGPipeline(collection_name=f"agent_{agent_id}")
+        try:
+            from app.context.rag import RAGPipeline
+
+            _rag_pipelines[agent_id] = RAGPipeline(collection_name=f"agent_{agent_id}")
+        except ModuleNotFoundError:
+            logger.info(
+                "RAG dependencies not installed — document uploads will skip embeddings for agent %s",
+                agent_id,
+            )
+            _rag_pipelines[agent_id] = None
+        except Exception as exc:
+            logger.warning("RAG pipeline init failed for agent %s: %s", agent_id, exc)
+            _rag_pipelines[agent_id] = None
     return _rag_pipelines[agent_id]
 
 
@@ -43,6 +53,8 @@ async def _process_document_background(document_id: UUID, file_path: str, ext: s
     """Background task: parse, chunk, embed, and summarize a document."""
     async with AsyncSessionLocal() as db:
         try:
+            from app.context.documents import DocumentProcessor
+
             rag = _get_rag_pipeline(agent_id)
 
             llm_client = None

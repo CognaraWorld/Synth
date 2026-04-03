@@ -3,7 +3,7 @@
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,8 +34,8 @@ async def get_balance(
 
 @router.get("/transactions", response_model=CreditTransactionListResponse)
 async def list_transactions(
-    page: int = 1,
-    per_page: int = 20,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -100,8 +100,8 @@ async def refund_meeting_credit(
     existing_refund = await db.execute(
         select(CreditTransaction).where(
             CreditTransaction.user_id == current_user.id,
+            CreditTransaction.meeting_id == meeting_id,
             CreditTransaction.transaction_type == "refund",
-            CreditTransaction.description.contains(str(meeting_id)),
         )
     )
     if existing_refund.scalar_one_or_none():
@@ -116,6 +116,7 @@ async def refund_meeting_credit(
 
     transaction = CreditTransaction(
         user_id=current_user.id,
+        meeting_id=meeting.id,
         amount=credits_to_refund,
         balance_after=new_balance,
         transaction_type="refund",
