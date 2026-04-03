@@ -12,6 +12,7 @@ Synth joins your meetings and participates like a real team member:
 - **Document-aware** — Reads uploaded PDFs, Word files, and watches screen shares
 - **Web-grounded** — Searches the web live for up-to-date answers
 - **Custom personas** — Configure the bot's role and expertise per session
+- **Live operator controls** — Activate sessions, inspect transcript state, mute or unmute, and send typed steering instructions from the dashboard
 - **Post-meeting summaries** — Generates PDF/Word reports with key points and action items
 
 ## Tech Stack
