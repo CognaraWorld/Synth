@@ -44,6 +44,10 @@ class EmailSender:
         self.smtp_password: str = settings.smtp_password
         self.from_email: str = settings.from_email
 
+    def is_configured(self) -> bool:
+        """Return whether any outbound email transport is configured."""
+        return bool(self.resend_api_key or self.smtp_host)
+
     async def send_summary_email(
         self,
         to_email: str,

@@ -8,7 +8,7 @@ from sqlalchemy import inspect, text
 from app.config import get_settings
 from app.models.database import engine, Base
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
-from app.api.routes import auth, agents, bot, meetings, documents, payments, credits, live
+from app.api.routes import auth, agents, bot, meetings, documents, payments, credits, reports, usage, live
 from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,25 @@ def _run_migrations(connection):
         if "meeting_id" not in columns:
             connection.execute(text("ALTER TABLE credit_transactions ADD COLUMN meeting_id UUID"))
             logger.info("Migration: added meeting_id column to credit_transactions table")
+    if inspector.has_table("meeting_summaries"):
+        columns = [c["name"] for c in inspector.get_columns("meeting_summaries")]
+        if "email_delivery_status" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE meeting_summaries "
+                    "ADD COLUMN email_delivery_status VARCHAR(50) NOT NULL DEFAULT 'pending'"
+                )
+            )
+            logger.info(
+                "Migration: added email_delivery_status column to meeting_summaries table"
+            )
+        if "email_delivered_at" not in columns:
+            connection.execute(
+                text("ALTER TABLE meeting_summaries ADD COLUMN email_delivered_at TIMESTAMPTZ")
+            )
+            logger.info(
+                "Migration: added email_delivered_at column to meeting_summaries table"
+            )
     if inspector.has_table("agents"):
         columns = [c["name"] for c in inspector.get_columns("agents")]
         if "voice" not in columns:
@@ -96,6 +115,8 @@ app.include_router(meetings.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(credits.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
+app.include_router(usage.router, prefix="/api")
 app.include_router(live.router, prefix="/api")
 app.include_router(ws_router, prefix="/api")
 
