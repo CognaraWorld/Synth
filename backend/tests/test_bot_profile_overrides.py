@@ -19,7 +19,7 @@ class TestAgentPrimaryBehavior:
 
         current_user = MagicMock(id=uuid4())
         primary_result = MagicMock()
-        primary_result.scalar_one_or_none.return_value = None
+        primary_result.scalars.return_value.all.return_value = []
 
         db = AsyncMock()
         db.execute.return_value = primary_result
@@ -45,6 +45,40 @@ class TestAgentPrimaryBehavior:
         assert created_agent.response_mode == "name_only"
 
     @pytest.mark.asyncio
+    async def test_create_agent_repairs_duplicate_primaries_before_inserting(self) -> None:
+        from app.api.routes.agents import create_agent
+
+        current_user = MagicMock(id=uuid4())
+        primary_a = MagicMock(id=uuid4(), is_primary=True)
+        primary_b = MagicMock(id=uuid4(), is_primary=True)
+
+        primary_result = MagicMock()
+        primary_result.scalars.return_value.all.return_value = [primary_a, primary_b]
+
+        db = AsyncMock()
+        db.execute.return_value = primary_result
+        db.add = MagicMock()
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        await create_agent(
+            agent_data=MagicMock(
+                name="Synth",
+                description="Helpful meeting assistant",
+                mode="general",
+                voice="female",
+                response_mode="name_only",
+            ),
+            current_user=current_user,
+            db=db,
+        )
+
+        created_agent = db.add.call_args.args[0]
+        assert primary_a.is_primary is True
+        assert primary_b.is_primary is False
+        assert created_agent.is_primary is False
+
+    @pytest.mark.asyncio
     async def test_delete_primary_agent_reassigns_new_primary(self) -> None:
         from app.api.routes.agents import delete_agent
 
@@ -56,9 +90,11 @@ class TestAgentPrimaryBehavior:
         first_result.scalar_one_or_none.return_value = deleted_agent
         second_result = MagicMock()
         second_result.scalars.return_value.first.return_value = replacement_agent
+        third_result = MagicMock()
+        third_result.scalars.return_value.all.return_value = [replacement_agent]
 
         db = AsyncMock()
-        db.execute.side_effect = [first_result, second_result]
+        db.execute.side_effect = [first_result, second_result, third_result]
         db.delete = AsyncMock()
         db.flush = AsyncMock()
         db.commit = AsyncMock()
@@ -71,6 +107,38 @@ class TestAgentPrimaryBehavior:
 
         assert replacement_agent.is_primary is True
 
+    @pytest.mark.asyncio
+    async def test_update_agent_drops_none_fields_from_payload(self) -> None:
+        from app.api.routes.agents import update_agent
+        from app.models.schemas import AgentUpdate
+
+        current_user = MagicMock(id=uuid4())
+        agent = MagicMock(
+            id=uuid4(),
+            name="Synth",
+            description="Existing description",
+            mode="general",
+            voice="female",
+            response_mode="name_only",
+        )
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = agent
+
+        db = AsyncMock()
+        db.execute.return_value = result
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        await update_agent(
+            agent_id=agent.id,
+            update_data=AgentUpdate(voice=None, description="Updated"),
+            current_user=current_user,
+            db=db,
+        )
+
+        assert agent.voice == "female"
+        assert agent.description == "Updated"
+
 
 class TestBotProfileRoutes:
     @pytest.mark.asyncio
@@ -81,12 +149,10 @@ class TestBotProfileRoutes:
         fallback_agent = MagicMock(id=uuid4(), is_primary=False, name="Fallback")
 
         primary_result = MagicMock()
-        primary_result.scalars.return_value.first.return_value = None
-        fallback_result = MagicMock()
-        fallback_result.scalars.return_value.first.return_value = fallback_agent
+        primary_result.scalars.return_value.all.return_value = [fallback_agent]
 
         db = AsyncMock()
-        db.execute.side_effect = [primary_result, fallback_result]
+        db.execute.return_value = primary_result
 
         result = await get_bot_profile(current_user=current_user, db=db)
         assert result is fallback_agent
@@ -97,14 +163,12 @@ class TestBotProfileRoutes:
 
         current_user = MagicMock(id=uuid4())
         primary_result = MagicMock()
-        primary_result.scalars.return_value.first.return_value = None
-        fallback_result = MagicMock()
-        fallback_result.scalars.return_value.first.return_value = None
+        primary_result.scalars.return_value.all.return_value = []
         mark_result = MagicMock()
         mark_result.scalars.return_value.all.return_value = []
 
         db = AsyncMock()
-        db.execute.side_effect = [primary_result, fallback_result, mark_result]
+        db.execute.side_effect = [primary_result, mark_result]
         db.add = MagicMock()
         db.flush = AsyncMock()
         db.commit = AsyncMock()
@@ -147,7 +211,7 @@ class TestMeetingOverrides:
         primary_agent = MagicMock(id=uuid4())
 
         agent_result = MagicMock()
-        agent_result.scalars.return_value.first.return_value = primary_agent
+        agent_result.scalars.return_value.all.return_value = [primary_agent]
 
         db = AsyncMock()
         db.execute.return_value = agent_result
@@ -165,6 +229,27 @@ class TestMeetingOverrides:
         assert created_meeting.agent_id == primary_agent.id
         assert meeting is created_meeting
         assert current_user.credits == 2
+
+    @pytest.mark.asyncio
+    async def test_create_meeting_with_unknown_explicit_agent_keeps_agent_not_found_message(self) -> None:
+        from app.api.routes.meetings import create_meeting
+
+        current_user = MagicMock(id=uuid4(), credits=3)
+        query_result = MagicMock()
+        query_result.scalar_one_or_none.return_value = None
+
+        db = AsyncMock()
+        db.execute.return_value = query_result
+
+        with pytest.raises(HTTPException, match="Agent not found"):
+            await create_meeting(
+                meeting_data=MeetingCreate(
+                    agent_id=uuid4(),
+                    meeting_link="https://zoom.us/j/123456789",
+                ),
+                current_user=current_user,
+                db=db,
+            )
 
     @pytest.mark.asyncio
     async def test_upsert_meeting_override_rejects_active_meeting(self) -> None:

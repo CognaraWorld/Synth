@@ -15,8 +15,7 @@ from app.models.schemas import (
     MeetingOverrideUpsert,
     MeetingResponse,
 )
-from app.utils.bot_profiles import build_system_prompt
-from app.utils.bot_profiles import get_effective_primary_agent
+from app.utils.bot_profiles import build_system_prompt, get_effective_primary_agent
 from app.utils.meeting_links import detect_meeting_platform
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
@@ -45,13 +44,10 @@ async def create_meeting(
             select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
         )
         agent = result.scalar_one_or_none()
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
     else:
-        result = await db.execute(
-            select(Agent)
-            .where(Agent.user_id == current_user.id)
-            .order_by(Agent.is_primary.desc(), Agent.created_at.desc())
-        )
-        agent = result.scalars().first()
+        agent = await get_effective_primary_agent(db, current_user.id)
     if not agent:
         raise HTTPException(status_code=404, detail="No bot profile found for this user")
 

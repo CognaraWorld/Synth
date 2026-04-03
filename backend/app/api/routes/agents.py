@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.auth import get_current_user
 from app.models.database import Agent, User, get_db
 from app.models.schemas import AgentCreate, AgentResponse, AgentUpdate
-from app.utils.bot_profiles import build_system_prompt
+from app.utils.bot_profiles import build_system_prompt, get_effective_primary_agent, mark_primary_agent
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -18,10 +18,7 @@ async def create_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Agent).where(Agent.user_id == current_user.id, Agent.is_primary.is_(True))
-    )
-    has_primary = result.scalar_one_or_none() is not None
+    has_primary = await get_effective_primary_agent(db, current_user.id) is not None
 
     agent = Agent(
         user_id=current_user.id,
@@ -79,7 +76,7 @@ async def update_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    payload = update_data.model_dump(exclude_unset=True)
+    payload = update_data.model_dump(exclude_unset=True, exclude_none=True)
     if "system_prompt" not in payload and ("description" in payload or "mode" in payload):
         next_description = payload.get("description", agent.description)
         next_mode = payload.get("mode", agent.mode)
@@ -118,6 +115,6 @@ async def delete_agent(
         )
         replacement = replacement_result.scalars().first()
         if replacement:
-            replacement.is_primary = True
+            await mark_primary_agent(db, current_user.id, replacement)
 
     await db.commit()
