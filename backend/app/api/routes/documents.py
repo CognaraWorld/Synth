@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from uuid import UUID
 
@@ -7,9 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
 from app.config import get_settings
+from app.context.documents import DocumentProcessor
+from app.context.rag import RAGPipeline
 from app.models.database import Agent, Document, User, get_db
 from app.models.schemas import DocumentResponse
 from app.utils.storage import build_agent_upload_path, is_managed_path
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -72,6 +77,30 @@ async def upload_document(
         db.add(document)
         await db.commit()
         await db.refresh(document)
+
+        # Parse, chunk, embed, and generate summary in background
+        try:
+            rag = RAGPipeline(collection_name=f"agent_{agent_id}")
+            llm_client = None
+            try:
+                from app.core.llm import LLMClient
+                llm_client = LLMClient()
+            except Exception:
+                pass
+
+            processor = DocumentProcessor(
+                rag_pipeline=rag,
+                llm_client=llm_client,
+            )
+            result = await processor.process_and_embed(str(file_path), ext)
+
+            document.parsed = True
+            document.chunk_count = result["chunk_count"]
+            document.doc_summary = result["summary"]
+            await db.commit()
+            await db.refresh(document)
+        except Exception as exc:
+            logger.warning("Document processing failed for %s: %s", display_name, exc)
 
         return document
     finally:
