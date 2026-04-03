@@ -152,6 +152,39 @@ class BotEngine:
         # Wire up the rolling summary with the LLM client
         session.context_manager.rolling_summary.set_llm_client(self._llm_client)
 
+        # Wire up the RAG pipeline and load document summaries for this agent
+        agent_id = agent_config.get("agent_id")
+        if agent_id:
+            from app.api.routes.documents import _get_rag_pipeline
+            rag = _get_rag_pipeline(str(agent_id))
+            session.context_manager.set_rag_pipeline(rag)
+
+            # Load document summaries directly from database
+            try:
+                from app.models.database import Document, AsyncSessionLocal
+                from sqlalchemy import select
+
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(Document).where(
+                            Document.agent_id == agent_id,
+                            Document.parsed.is_(True),
+                            Document.doc_summary.isnot(None),
+                        )
+                    )
+                    documents = result.scalars().all()
+                    for doc in documents:
+                        session.context_manager.add_document_summary(
+                            doc.filename, doc.doc_summary
+                        )
+                    if documents:
+                        logger.info(
+                            "Loaded %d document summaries for agent %s",
+                            len(documents), agent_id,
+                        )
+            except Exception as exc:
+                logger.warning("Failed to load document summaries: %s", exc)
+
         try:
             # Transition: PENDING -> JOINING
             session.transition(SessionState.JOINING)
