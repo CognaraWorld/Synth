@@ -13,7 +13,7 @@ from sqlalchemy.orm import joinedload
 
 from app.api.websocket import get_engine
 from app.config import get_settings
-from app.core.bot_engine import BotEngine, SessionNotFoundError
+from app.core.bot_engine import BotEngine
 from app.meeting.recall_client import RecallClient
 from app.models.database import Agent, LiveSession, Meeting, OperatorInstruction, User
 
@@ -173,12 +173,14 @@ class LiveSessionService:
             .order_by(LiveSession.updated_at.desc())
         )
         sessions = result.scalars().all()
-        payloads: list[dict] = []
+        synced_sessions: list[LiveSession] = []
         for live_session in sessions:
-            synced = self._sync_live_session_record(live_session.meeting, live_session)
-            payloads.append(self._serialize_live_session(synced))
+            synced_sessions.append(
+                self._sync_live_session_record(live_session.meeting, live_session)
+            )
+        await self.db.flush()
         await self.db.commit()
-        return payloads
+        return [self._serialize_live_session(live_session) for live_session in synced_sessions]
 
     async def activate_for_meeting(self, meeting_id: UUID, current_user: User) -> dict:
         meeting = await self._get_owned_meeting(
@@ -419,7 +421,8 @@ class LiveSessionService:
             )
             provider_status = provider_result.provider_status
             detail = provider_result.detail
-            if provider_status in {"applied", "not_configured"}:
+            live_session.provider_last_error = detail
+            if provider_status == "applied":
                 meeting.status = "ended"
                 meeting.ended_at = ended_at
                 live_session.session_status = "ended"
