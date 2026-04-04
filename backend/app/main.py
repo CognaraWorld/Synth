@@ -15,14 +15,179 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def _add_column_if_missing(
+    connection,
+    table_name: str,
+    columns: dict[str, dict],
+    column_name: str,
+    ddl: str,
+) -> None:
+    if column_name in columns:
+        return
+    connection.execute(text(ddl))
+    logger.info("Migration: added %s column to %s table", column_name, table_name)
+
+
+def _get_columns(inspector, table_name: str) -> dict[str, dict]:
+    return {column["name"]: column for column in inspector.get_columns(table_name)}
+
+
 def _run_migrations(connection):
     """Add missing columns to existing tables for backwards compatibility."""
     inspector = inspect(connection)
+    dialect_name = connection.dialect.name
+
     if inspector.has_table("documents"):
-        columns = [c["name"] for c in inspector.get_columns("documents")]
-        if "doc_summary" not in columns:
-            connection.execute(text("ALTER TABLE documents ADD COLUMN doc_summary TEXT"))
-            logger.info("Migration: added doc_summary column to documents table")
+        document_columns = _get_columns(inspector, "documents")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="documents",
+            columns=document_columns,
+            column_name="doc_summary",
+            ddl="ALTER TABLE documents ADD COLUMN doc_summary TEXT",
+        )
+
+    if inspector.has_table("users"):
+        user_columns = _get_columns(inspector, "users")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="users",
+            columns=user_columns,
+            column_name="provider",
+            ddl="ALTER TABLE users ADD COLUMN provider VARCHAR(50)",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="users",
+            columns=user_columns,
+            column_name="credits",
+            ddl="ALTER TABLE users ADD COLUMN credits INTEGER",
+        )
+        connection.execute(text("UPDATE users SET provider = 'email' WHERE provider IS NULL"))
+        logger.info("Migration: backfilled users.provider to 'email' for NULL rows")
+        connection.execute(text("UPDATE users SET credits = 3 WHERE credits IS NULL"))
+        logger.info("Migration: backfilled users.credits to 3 for NULL rows")
+        if dialect_name == "postgresql":
+            connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET DEFAULT 'email'"))
+            connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET DEFAULT 3"))
+            connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET NOT NULL"))
+            connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET NOT NULL"))
+            logger.info("Migration: enforced users.provider/users.credits defaults and NOT NULL")
+
+    if inspector.has_table("credit_transactions"):
+        credit_columns = _get_columns(inspector, "credit_transactions")
+        had_balance_after_column = "balance_after" in credit_columns
+        balance_after_was_nullable = credit_columns.get("balance_after", {}).get("nullable", True)
+        meeting_id_type = "UUID" if dialect_name == "postgresql" else "VARCHAR(36)"
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="meeting_id",
+            ddl=f"ALTER TABLE credit_transactions ADD COLUMN meeting_id {meeting_id_type}",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="amount",
+            ddl="ALTER TABLE credit_transactions ADD COLUMN amount INTEGER DEFAULT 0",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="transaction_type",
+            ddl="ALTER TABLE credit_transactions ADD COLUMN transaction_type VARCHAR(50) DEFAULT 'legacy'",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="description",
+            ddl="ALTER TABLE credit_transactions ADD COLUMN description VARCHAR(500) DEFAULT 'Legacy credit transaction'",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="balance_after",
+            ddl="ALTER TABLE credit_transactions ADD COLUMN balance_after INTEGER",
+        )
+        _add_column_if_missing(
+            connection=connection,
+            table_name="credit_transactions",
+            columns=credit_columns,
+            column_name="stripe_session_id",
+            ddl="ALTER TABLE credit_transactions ADD COLUMN stripe_session_id VARCHAR(255)",
+        )
+        connection.execute(
+            text("UPDATE credit_transactions SET amount = 0 WHERE amount IS NULL")
+        )
+        connection.execute(
+            text(
+                "UPDATE credit_transactions "
+                "SET transaction_type = 'legacy' "
+                "WHERE transaction_type IS NULL OR transaction_type = ''"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE credit_transactions "
+                "SET description = 'Legacy credit transaction' "
+                "WHERE description IS NULL OR description = ''"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE credit_transactions "
+                "SET balance_after = COALESCE(balance_after, amount, 0) "
+                "WHERE balance_after IS NULL"
+            )
+        )
+        if dialect_name == "postgresql" and (not had_balance_after_column or balance_after_was_nullable):
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN balance_after SET NOT NULL")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN amount SET NOT NULL")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET NOT NULL")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN description SET NOT NULL")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN amount SET DEFAULT 0")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN balance_after SET DEFAULT 0")
+            )
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET DEFAULT 'legacy'")
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE credit_transactions "
+                    "ALTER COLUMN description SET DEFAULT 'Legacy credit transaction'"
+                )
+            )
+            logger.info(
+                "Migration: normalized credit_transactions defaults and NOT NULL constraints"
+            )
+
+        if (
+            dialect_name == "postgresql"
+            and "meeting_id" in credit_columns
+            and not credit_columns["meeting_id"].get("nullable", True)
+        ):
+            connection.execute(
+                text("ALTER TABLE credit_transactions ALTER COLUMN meeting_id DROP NOT NULL")
+            )
+            logger.info(
+                "Migration: dropped NOT NULL on meeting_id for credit_transactions table"
+            )
 
     if inspector.has_table("credit_transactions"):
         columns = [c["name"] for c in inspector.get_columns("credit_transactions")]

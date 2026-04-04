@@ -121,6 +121,107 @@ class TestAuthRegistrationHardening:
         assert result.credits == 3
 
 
+class TestStartupMigrations:
+    def test_run_migrations_backfills_registration_columns_for_legacy_schema(self) -> None:
+        from app.main import _run_migrations
+
+        inspector = MagicMock()
+        inspector.has_table.side_effect = (
+            lambda table_name: table_name in {"documents", "users", "credit_transactions"}
+        )
+
+        def get_columns(table_name: str) -> list[dict[str, object]]:
+            if table_name == "documents":
+                return [{"name": "id"}]
+            if table_name == "users":
+                return [{"name": "id"}, {"name": "email"}, {"name": "hashed_password"}]
+            if table_name == "credit_transactions":
+                return [
+                    {"name": "id", "nullable": False},
+                    {"name": "user_id", "nullable": False},
+                    {"name": "meeting_id", "nullable": False},
+                    {"name": "amount", "nullable": False},
+                    {"name": "transaction_type", "nullable": False},
+                    {"name": "description", "nullable": False},
+                    {"name": "created_at", "nullable": True},
+                ]
+            raise AssertionError(f"Unexpected table lookup: {table_name}")
+
+        inspector.get_columns.side_effect = get_columns
+
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+
+        with patch("app.main.inspect", return_value=inspector):
+            _run_migrations(connection)
+
+        executed_sql = [str(call.args[0]).strip() for call in connection.execute.call_args_list]
+        assert "ALTER TABLE users ADD COLUMN provider VARCHAR(50)" in executed_sql
+        assert "ALTER TABLE users ADD COLUMN credits INTEGER" in executed_sql
+        assert "UPDATE users SET provider = 'email' WHERE provider IS NULL" in executed_sql
+        assert "UPDATE users SET credits = 3 WHERE credits IS NULL" in executed_sql
+        assert "ALTER TABLE users ALTER COLUMN provider SET DEFAULT 'email'" in executed_sql
+        assert "ALTER TABLE users ALTER COLUMN credits SET DEFAULT 3" in executed_sql
+        assert "ALTER TABLE users ALTER COLUMN provider SET NOT NULL" in executed_sql
+        assert "ALTER TABLE users ALTER COLUMN credits SET NOT NULL" in executed_sql
+        assert "ALTER TABLE credit_transactions ADD COLUMN balance_after INTEGER" in executed_sql
+        assert (
+            "ALTER TABLE credit_transactions ADD COLUMN stripe_session_id VARCHAR(255)"
+            in executed_sql
+        )
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN meeting_id DROP NOT NULL" in executed_sql
+        )
+        assert (
+            "UPDATE credit_transactions SET amount = 0 WHERE amount IS NULL"
+            in executed_sql
+        )
+        assert (
+            "UPDATE credit_transactions "
+            "SET transaction_type = 'legacy' "
+            "WHERE transaction_type IS NULL OR transaction_type = ''"
+            in executed_sql
+        )
+        assert (
+            "UPDATE credit_transactions "
+            "SET description = 'Legacy credit transaction' "
+            "WHERE description IS NULL OR description = ''"
+            in executed_sql
+        )
+        assert (
+            "UPDATE credit_transactions "
+            "SET balance_after = COALESCE(balance_after, amount, 0) "
+            "WHERE balance_after IS NULL"
+            in executed_sql
+        )
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN balance_after SET NOT NULL" in executed_sql
+        )
+        assert "ALTER TABLE credit_transactions ALTER COLUMN amount SET NOT NULL" in executed_sql
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET NOT NULL"
+            in executed_sql
+        )
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN description SET NOT NULL"
+            in executed_sql
+        )
+        assert "ALTER TABLE credit_transactions ALTER COLUMN amount SET DEFAULT 0" in executed_sql
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN balance_after SET DEFAULT 0"
+            in executed_sql
+        )
+        assert (
+            "ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET DEFAULT 'legacy'"
+            in executed_sql
+        )
+        assert (
+            "ALTER TABLE credit_transactions "
+            "ALTER COLUMN description SET DEFAULT 'Legacy credit transaction'"
+            in executed_sql
+        )
+
+
 class TestMeetingCreditAuditTrail:
     @pytest.mark.asyncio
     async def test_create_meeting_records_credit_transaction(self) -> None:
