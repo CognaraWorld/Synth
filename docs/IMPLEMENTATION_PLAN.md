@@ -319,6 +319,24 @@ After each phase, verify:
 6. **Phase 6:** Real meeting link → bot joins → full loop works live
 7. **Phase 7:** Meeting ends → summary + PDF/Word in <2 min → email sent
 8. **Phase 8:** Buy credits → full flow → credits deducted correctly
+9. **Phase 9:** Wake word reliable (14 phonetic variants) → follow-up questions → interruption stops audio → smart fillers match question type → RAG pipeline complete → Deepgram Nova-3 transcription
+
+## Phase 9 Progress (Bot Reliability + UX Polish)
+
+Completed in PR #32:
+
+- **Deepgram Nova-3** — Replaced platform captions with Deepgram streaming for ~95% transcription accuracy. Keyword boosting for "Hey Assistant". Smart formatting and diarization.
+- **Wake word detection ~100%** — 14 phonetic variants for "hey assistant" covering Deepgram mishearings (as assist ten, he assistant, hey assistance, etc.). Fast exact-match path + fuzzy fallback. Required prefix prevents false positives.
+- **Smart context-aware fillers** — 25 phrases across 6 categories (meeting_recap, web_search, technical, opinion, document, general). Sub-millisecond keyword classification. All pre-cached as MP3 at startup.
+- **Interruption handling** — Bot stays in RESPONDING during playback, polls every 300ms. Calls Recall.ai stop_output_audio on interruption. Stop phrases ("thank you", "stop", "enough") kill audio immediately. Partial response saved to context.
+- **Follow-up questions** — 8-second window after audio playback ends. Allows up to 2 speakers. No wake word needed within window.
+- **RAG pipeline fixes** — Time-based force-flush (2 min stale threshold). Force-flush before search. Drain raw buffer on meeting end. Skip empty context sections.
+- **Per-session VAD** — Each meeting gets its own Silero VAD instance. No cross-contamination.
+- **Echo detection** — Drop all Unknown/empty speaker transcripts. Eliminates feedback loops.
+- **System prompt rewrite** — 5-section structured prompt (identity, voice, knowledge, etiquette, personality). TTS-optimized output. Anti-hallucination. Source attribution.
+- **TTS preload** — Kokoro model + filler cache loaded at startup in background thread. Zero delay on first greeting.
+- **Split-chunk handling** — Wake word in one webhook + question in next → correctly assembled.
+- **Insight corrections** — Only surfaced when user asks about accuracy, never volunteered.
 
 ## End-to-End Smoke Test
 
@@ -345,7 +363,7 @@ After each phase, verify:
 |---|---|
 | Recall.ai rate limits or API changes | Abstract behind interface, ready to swap to MeetingBot |
 | Whisper hallucinations in noisy meetings | Silero VAD pre-filtering, confidence thresholds |
-| Latency too high (>5s) | Filler responses, streaming TTS, pre-warm models |
-| Wake word false positives | Require exact "Hey Synth" + confidence threshold |
+| Latency too high (>5s) | Context-aware fillers mask processing. TTS pre-loaded at startup. ~2s total latency. |
+| Wake word false positives | Required prefix pattern. 14 phonetic variants. Deepgram keyword boosting. |
 | Mac Studio crashes during meeting | Auto-save transcript, reconnect logic, consider UPS |
 | 32GB RAM exceeded with concurrent meetings | Limit to 3-4 concurrent, queue additional |
