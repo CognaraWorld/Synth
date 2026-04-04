@@ -43,9 +43,22 @@ interface Agent {
   id: string;
   name: string;
   description: string;
-  mode: "general" | "custom";
+  mode: "general";
+  persona_id?: "general" | "strategist" | "analyst" | "challenger" | "facilitator";
   system_prompt?: string;
   created_at?: string;
+}
+
+function personaLabel(persona?: Agent["persona_id"]) {
+  const resolved = persona || "general";
+  const labels: Record<NonNullable<Agent["persona_id"]>, string> = {
+    general: "General",
+    strategist: "Strategist",
+    analyst: "Analyst",
+    challenger: "Challenger",
+    facilitator: "Facilitator",
+  };
+  return labels[resolved as NonNullable<Agent["persona_id"]>] || "General";
 }
 
 interface Document {
@@ -250,8 +263,8 @@ export default function AgentDetailPage({
         <div className="space-y-1">
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-bold tracking-tight">{agent.name}</h1>
-            <Badge variant={agent.mode === "custom" ? "default" : "secondary"}>
-              {agent.mode === "custom" ? "Custom" : "General"}
+            <Badge variant={(agent.persona_id || agent.mode) === "general" ? "secondary" : "default"}>
+              {personaLabel(agent.persona_id)}
             </Badge>
           </div>
           {agent.description && (

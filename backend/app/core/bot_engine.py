@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -23,9 +24,9 @@ from app.core.search import SearchClient
 from app.core.vision import VisionProcessor
 from app.meeting.recall_client import RecallClient, RecallClientError
 from app.meeting.session import MeetingSession, SessionState
+from app.utils.bot_profiles import get_persona_tts_voice
 from app.utils.filler import FillerManager
-from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-from app.utils.query_router import classify_query
+from app.utils.prompt_builder import build_prompt_for_mode, resolve_persona_id
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
 from app.utils.wake_word import detect as detect_wake_word
 
@@ -94,6 +95,7 @@ class BotEngine:
         self._followup_window: float = 8.0  # seconds after audio finishes playing to accept follow-ups
         self._cooldown_seconds: float = 0.0  # no cooldown
         self._processing_lock: dict[str, asyncio.Lock] = {}  # session_id -> lock
+        self._tts_lock: asyncio.Lock = asyncio.Lock()  # serializes TTS voice switch + synthesis across sessions
 
         # Lightweight services — safe to initialize at startup
         self._settings = get_settings()
@@ -161,7 +163,11 @@ class BotEngine:
             from app.core.tts import TextToSpeech
 
             self._stt = SpeechToText(model_size="large-v3", language="en", device="cpu")
-            self._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
+            self._tts = TextToSpeech(
+                voice=get_persona_tts_voice("general"),
+                sample_rate=24000,
+                speed=1.1,
+            )
 
             # Pre-synthesize filler phrases now that TTS is available
             self._filler_manager.preload(self._tts)
@@ -203,12 +209,18 @@ class BotEngine:
         meeting_id = meeting_link  # Use the link as the meeting identifier
         session = MeetingSession(meeting_id=meeting_id, agent_config=agent_config)
 
-        # Build the system prompt based on agent mode
+        # Build the system prompt (prefer persisted prompt; fallback for legacy records)
         mode = agent_config.get("mode", "general")
-        if mode == "custom" and "description" in agent_config:
-            system_prompt = build_custom_prompt(agent_config["description"])
+        persona_id = resolve_persona_id(mode, agent_config.get("persona_id"))
+        description = agent_config.get("description", "")
+        persisted_prompt = (agent_config.get("system_prompt") or "").strip()
+        if persisted_prompt:
+            system_prompt = persisted_prompt
         else:
-            system_prompt = build_general_prompt()
+            system_prompt = build_prompt_for_mode(mode, description, persona_id)
+        session.agent_config["mode"] = "general"
+        session.agent_config["persona_id"] = persona_id
+        session.agent_config["voice"] = agent_config.get("voice")
         session.agent_config["system_prompt"] = system_prompt
 
         # Wire up the rolling summary with the LLM client
@@ -402,6 +414,50 @@ class BotEngine:
             if session.is_active
         ]
 
+    def find_session_for_meeting(self, meeting_id: str) -> MeetingSession | None:
+        """Return active session matching a meeting id."""
+        for session in self.sessions.values():
+            if session.meeting_id == meeting_id:
+                return session
+        return None
+
+    def get_transcript_text(self, session_id: str) -> str:
+        """Return full transcript text for a session when available."""
+        session = self.sessions.get(session_id)
+        if session is None:
+            return ""
+        return session.context_manager.raw_buffer.get_full_text()
+
+    def submit_operator_instruction(self, session_id: str, instruction_text: str) -> None:
+        """Store an operator instruction to steer upcoming responses."""
+        session = self._get_session(session_id)
+        cleaned = instruction_text.strip()
+        if not cleaned:
+            return
+        session.operator_instructions.append(cleaned)
+        session.last_instruction_at = datetime.now(timezone.utc)
+
+    def set_session_muted(self, session_id: str, muted: bool) -> None:
+        """Enable/disable operator mute for a session."""
+        session = self._get_session(session_id)
+        session.operator_muted = muted
+
+    def request_stop_speaking(self, session_id: str) -> None:
+        """Request immediate interruption of current/next spoken output."""
+        session = self._get_session(session_id)
+        session.output_stop_requested = True
+        self._interrupted[session_id] = True
+
+    def _ensure_tts_voice_for_persona(self, persona_id: str | None) -> None:
+        """Switch TTS voice to the persona preset when needed."""
+        if self._tts is None:
+            return
+        target_voice = get_persona_tts_voice(persona_id)
+        if self._tts.voice == target_voice:
+            return
+        self._tts.voice = target_voice
+        self._filler_manager.preload(self._tts)
+
     # ------------------------------------------------------------------
     # Audio processing pipeline
     # ------------------------------------------------------------------
@@ -500,6 +556,13 @@ class BotEngine:
         if not wake_detected or not question:
             return None
 
+        if session.operator_muted:
+            logger.info(
+                "Wake word ignored due to operator mute for session %s",
+                session.session_id[:8],
+            )
+            return None
+
         logger.warning("WAKE WORD DETECTED session=%s question=%s", session_id, question)
 
         # Step 5: Process the question
@@ -529,7 +592,10 @@ class BotEngine:
                     "agent_id": str(meeting.agent_id),
                     "agent_name": agent.name if agent else "Synth",
                     "mode": agent.mode if agent else "general",
+                    "persona_id": getattr(agent, "persona_id", "general") if agent else "general",
                     "description": agent.description if agent else "",
+                    "voice": agent.voice if agent else "female",
+                    "system_prompt": agent.system_prompt if agent else "",
                 }
 
                 session = MeetingSession(
@@ -538,11 +604,22 @@ class BotEngine:
                 )
                 session.bot_id = bot_id
 
-                from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-                if agent_config["mode"] == "custom" and agent_config["description"]:
-                    session.agent_config["system_prompt"] = build_custom_prompt(agent_config["description"])
+                persona_id = resolve_persona_id(
+                    agent_config.get("mode", "general"),
+                    agent_config.get("persona_id"),
+                )
+                persisted_prompt = (agent_config.get("system_prompt") or "").strip()
+                if persisted_prompt:
+                    session.agent_config["system_prompt"] = persisted_prompt
                 else:
-                    session.agent_config["system_prompt"] = build_general_prompt()
+                    session.agent_config["system_prompt"] = build_prompt_for_mode(
+                        agent_config.get("mode", "general"),
+                        agent_config.get("description", ""),
+                        persona_id,
+                    )
+                session.agent_config["mode"] = "general"
+                session.agent_config["persona_id"] = persona_id
+                session.agent_config["voice"] = agent_config.get("voice")
 
                 session.context_manager.rolling_summary.set_llm_client(self._llm_client)
 
@@ -917,6 +994,14 @@ class BotEngine:
 
             context = await context_task
 
+            if session.operator_instructions:
+                recent_instructions = session.operator_instructions[-3:]
+                instruction_block = "\n".join(f"- {item}" for item in recent_instructions)
+                context = (
+                    f"{context}\n\n=== OPERATOR INSTRUCTIONS (HIGHEST PRIORITY) ===\n"
+                    f"{instruction_block}\n"
+                    "Follow these instructions as long as they do not conflict with safety constraints."
+                )
             # Include stored insights/corrections ONLY when the user asks about them.
             if session.insights:
                 q_lower = question.lower()
@@ -981,8 +1066,10 @@ class BotEngine:
                     response_text[:100],
                 )
 
-                # Synthesize and send as single audio
-                response_audio = self._tts.synthesize(response_text)
+                # Synthesize — hold TTS lock to prevent voice switch races across sessions
+                async with self._tts_lock:
+                    self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
+                    response_audio = self._tts.synthesize(response_text)
                 if session.bot_id and response_audio:
                     # Wait for filler to finish playing
                     elapsed = time.time() - filler_sent_at
@@ -1025,6 +1112,7 @@ class BotEngine:
             # Reset follow-up speaker tracking for new window
             self._followup_speakers.pop(session.session_id, None)
             was_interrupted = self._interrupted.pop(session.session_id, False)
+            session.output_stop_requested = False
 
             # Transition back to LISTENING
             try:
