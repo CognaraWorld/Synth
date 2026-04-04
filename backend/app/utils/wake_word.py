@@ -46,12 +46,13 @@ def _build_pattern(wake_word: str) -> re.Pattern:
         # "hey assistant" — include phonetic variants that meeting STT
         # commonly produces. Prefix is REQUIRED to prevent false positives
         # on bare "assistant" or "assist" in normal speech.
-        prefix = r"(?:hey|he|hay|a|they|hi|both|but)[,.\s]+"
+        prefix = r"(?:hey|he|hay|a|as|they|hi|both|but)[,.\s]+"
         name = (
             r"(?:assistant|assistance|assisted|assistent|"
             r"a\s*sistant|a\s*system|a\s*distance|"
-            r"assists|assess|assessing|assisting|"
-            r"insisted|instant|persistent|assist)"
+            r"assists?|assess|assessing|assisting|"
+            r"assist\s*ten|assist\s*and|assist\s*in|"
+            r"insisted|instant|persistent)"
         )
         return re.compile(
             rf"\b{prefix}{name}\b",
@@ -94,6 +95,16 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
+    # Fast path: exact case-insensitive match (Deepgram sends clean text)
+    ww_lower = wake_word.strip().lower()
+    text_lower = transcript_text.lower()
+    exact_pos = text_lower.find(ww_lower)
+    if exact_pos != -1:
+        after = transcript_text[exact_pos + len(ww_lower):]
+        question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+        return (True, question)
+
+    # Fuzzy path: phonetic variants for STT mishearings
     pattern = _build_pattern(wake_word)
     match = pattern.search(transcript_text)
     if match is None:
@@ -102,7 +113,8 @@ def detect(
     # Extract everything after the wake word match
     after = transcript_text[match.end():]
 
-    # Strip leading punctuation (commas, colons, etc.) and whitespace
-    question = re.sub(r"^[\s,;:!?\-]+", "", after).strip()
+    # Strip leading punctuation and STT artifact words (e.g. "ten" from "assist ten")
+    question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+    question = re.sub(r"^(?:ten|and|in|the)\b[\s,;:!?.\-]*", "", question, flags=re.IGNORECASE).strip()
 
     return (True, question)

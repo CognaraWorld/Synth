@@ -92,11 +92,26 @@ class RecallClient:
         }
 
         if webhook_url:
+            settings = get_settings()
+            transcript_provider: dict = {"meeting_captions": {}}
+            if settings.deepgram_api_key:
+                transcript_provider = {
+                    "deepgram_streaming": {
+                        "api_key": settings.deepgram_api_key,
+                        "extra_params": {
+                            "model": "nova-3",
+                            "smart_format": "true",
+                            "punctuate": "true",
+                            "diarize": "true",
+                            "keywords": "Hey Assistant:2",
+                            "utterances": "true",
+                            "utterance_end_ms": "1200",
+                        },
+                    },
+                }
             payload["recording_config"] = {
                 "transcript": {
-                    "provider": {
-                        "meeting_captions": {},
-                    },
+                    "provider": transcript_provider,
                 },
                 "realtime_endpoints": [
                     {

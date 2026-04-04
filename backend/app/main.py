@@ -32,8 +32,33 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         # Backfill missing columns on existing tables
         await conn.run_sync(_run_migrations)
+
+    # Pre-load TTS + filler cache in background thread so first meeting
+    # doesn't block for ~3s while Kokoro loads
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _preload_tts)
+
     yield
     await engine.dispose()
+
+
+def _preload_tts():
+    """Load TTS model and pre-synthesize filler phrases at startup."""
+    try:
+        from app.core.tts import TextToSpeech
+        from app.utils.filler import FillerManager
+        from app.api.routes.webhook import get_bot_engine
+
+        engine = get_bot_engine()
+        if not engine._tts:
+            logger.info("Pre-loading TTS model at startup...")
+            engine._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
+            engine._filler_manager.preload(engine._tts)
+            engine._models_loaded = True
+            logger.info("TTS model and filler cache ready")
+    except Exception as exc:
+        logger.warning("TTS preload failed (will retry on first use): %s", exc)
 
 
 app = FastAPI(

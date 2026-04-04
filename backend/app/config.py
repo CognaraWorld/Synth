@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     recall_region: str = "us-west-2"
     webhook_base_url: str = ""
 
+    # Deepgram (transcription via Recall.ai)
+    deepgram_api_key: str = ""
+
     # Web Search
     serper_api_key: str = ""
     searxng_url: str = "http://localhost:8080"

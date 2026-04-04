@@ -94,19 +94,37 @@ async def _handle_transcription(data: dict) -> None:
         inner_data = data.get("data", {})
         speaker = ""
         text = ""
+        is_final = True
+        sentiment = ""
 
         if isinstance(inner_data, dict):
+            # Skip interim (partial) results — only process final transcripts
+            # Interim results are useful for UI but cause duplicate processing
+            is_final = inner_data.get("is_final", True)
+            if not is_final:
+                return
+
             # Speaker from participant
             participant = inner_data.get("participant", {})
             if isinstance(participant, dict):
                 speaker = participant.get("name", "")
 
-            # Text from words array
-            words = inner_data.get("words", [])
-            if words and isinstance(words, list):
-                text = " ".join(
-                    w.get("text", "") for w in words if isinstance(w, dict)
-                )
+            # Prefer utterance text (complete sentence) over raw words
+            utterance_text = inner_data.get("transcript", "")
+            if utterance_text:
+                text = utterance_text
+            else:
+                # Fallback to words array
+                words = inner_data.get("words", [])
+                if words and isinstance(words, list):
+                    text = " ".join(
+                        w.get("text", "") for w in words if isinstance(w, dict)
+                    )
+
+            # Extract sentiment if available (from Deepgram)
+            sentiment = inner_data.get("sentiment", "")
+            if isinstance(sentiment, dict):
+                sentiment = sentiment.get("average", "")
 
         # Fallback: check top-level fields
         if not text:
@@ -142,7 +160,7 @@ async def _handle_transcription(data: dict) -> None:
             _greeted_bots.add(bot_id)
             await _send_greeting(bot_id)
 
-        await engine.process_webhook_transcript(bot_id, speaker, text)
+        await engine.process_webhook_transcript(bot_id, speaker, text, sentiment=sentiment)
 
     except Exception as exc:
         logger.error("Error processing transcription webhook: %s", exc, exc_info=True)

@@ -537,6 +537,7 @@ class BotEngine:
         bot_id: str,
         speaker: str,
         text: str,
+        sentiment: str = "",
     ) -> None:
         """Process a transcript chunk received via Recall.ai webhook.
 
@@ -548,6 +549,7 @@ class BotEngine:
             bot_id: The Recall.ai bot ID from the webhook payload.
             speaker: Name of the meeting participant who spoke.
             text: The transcribed text.
+            sentiment: Speaker sentiment from Deepgram (positive/negative/neutral).
         """
         session_id = self._sessions_by_bot_id.get(bot_id)
         session = self.sessions.get(session_id) if session_id else None
@@ -618,6 +620,8 @@ class BotEngine:
         if wake_detected:
             clean = question.strip(" .,!?;:-") if question else ""
             self._last_speaker[sid] = speaker
+            self._last_sentiment: dict[str, str] = getattr(self, '_last_sentiment', {})
+            self._last_sentiment[sid] = sentiment
             if clean:
                 is_question = True
                 question = clean
@@ -837,6 +841,12 @@ class BotEngine:
                     )
                     context = f"{context}\n\n=== CORRECTIONS NOTED DURING MEETING ===\n{insights_text}\n(Share these corrections since the user asked about accuracy.)"
 
+            # Add sentiment hint if available (helps LLM match tone)
+            _sentiments = getattr(self, '_last_sentiment', {})
+            mood = _sentiments.get(session.session_id, "")
+            if mood and mood in ("positive", "negative", "neutral"):
+                context = f"{context}\n\n(Speaker mood: {mood}. Match your tone accordingly.)"
+
             # Query LLM → TTS full response → send as one chunk
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
@@ -886,6 +896,24 @@ class BotEngine:
                     await self._recall_client.send_audio(session.bot_id, response_audio)
                     logger.warning("Audio sent to bot %s", session.bot_id[:8])
 
+                    # Stay in RESPONDING during playback so interruptions work.
+                    # Estimate playback: ~15 chars/sec of spoken audio.
+                    playback_duration = len(response_text) / 15
+                    playback_start = time.time()
+
+                    # Poll for interruption during playback
+                    while time.time() - playback_start < playback_duration:
+                        if self._interrupted.get(session.session_id, False):
+                            logger.info("Interrupted during playback — stopping audio for session %s", session.session_id[:8])
+                            await self._recall_client.stop_audio(session.bot_id)
+                            partial = (
+                                f"[Assistant was answering \"{question}\" and said: "
+                                f"\"{response_text.strip()}\" before being interrupted]"
+                            )
+                            session.context_manager.add_transcript(partial)
+                            break
+                        await asyncio.sleep(0.3)  # check every 300ms
+
             # Track response text for echo detection
             if response_text:
                 from app.api.routes.webhook import _recent_bot_output
@@ -904,10 +932,9 @@ class BotEngine:
             except ValueError:
                 pass
 
-            # Follow-up window starts AFTER audio finishes playing, not when sent.
-            # Estimate playback: ~15 chars/sec of spoken audio.
+            # Follow-up window starts now
             playback_duration = len(response_text) / 15 if response_text else 0.0
-            self._last_response_time[session.session_id] = time.time() + playback_duration
+            self._last_response_time[session.session_id] = time.time()
 
             # Process queued question only if it contains a wake word
             # (if the person just interrupted to talk normally, don't respond)
