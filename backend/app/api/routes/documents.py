@@ -22,6 +22,15 @@ settings = get_settings()
 ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
+# Magic byte signatures for content-type verification.
+# Prevents attackers from uploading executables disguised with safe extensions
+# (OWASP A04:2021 - Insecure Design).
+_MAGIC_BYTES: dict[str, bytes | None] = {
+    ".pdf": b"%PDF",
+    ".docx": b"PK",     # ZIP/OOXML format
+    ".txt": None,        # plain text has no magic bytes
+}
+
 
 def get_file_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -139,6 +148,14 @@ if _multipart_support_available():
                 raise HTTPException(status_code=400, detail="Uploaded file is empty.")
             if len(content) > MAX_FILE_SIZE:
                 raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
+
+            # Verify file content matches claimed extension via magic bytes
+            expected_magic = _MAGIC_BYTES.get(f".{ext}")
+            if expected_magic and not content[:8].startswith(expected_magic):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File content does not match .{ext} format",
+                )
 
             display_name, file_path = build_agent_upload_path(
                 Path(settings.upload_dir),

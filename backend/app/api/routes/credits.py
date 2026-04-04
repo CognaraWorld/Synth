@@ -4,7 +4,7 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -114,8 +114,17 @@ async def refund_meeting_credit(
         )
 
     credits_to_refund = meeting.credits_used
-    current_user.credits += credits_to_refund
-    new_balance = current_user.credits
+
+    # Atomic credit update: use SQL-level arithmetic to prevent race
+    # conditions from concurrent requests (OWASP A04:2021 - Insecure Design).
+    # The UPDATE happens in a single SQL statement, so no read-modify-write gap.
+    result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id)
+        .values(credits=User.credits + credits_to_refund)
+        .returning(User.credits)
+    )
+    new_balance = result.scalar_one()
 
     transaction = CreditTransaction(
         user_id=current_user.id,

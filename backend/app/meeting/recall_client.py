@@ -9,10 +9,13 @@ Phase 6 implementation.
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from typing import Any, AsyncIterator
 
 import httpx
+from pydub import AudioSegment
 
 from app.config import get_settings
 
@@ -92,11 +95,26 @@ class RecallClient:
         }
 
         if webhook_url:
+            settings = get_settings()
+            transcript_provider: dict = {"meeting_captions": {}}
+            if settings.deepgram_api_key:
+                transcript_provider = {
+                    "deepgram_streaming": {
+                        "api_key": settings.deepgram_api_key,
+                        "extra_params": {
+                            "model": "nova-3",
+                            "smart_format": "true",
+                            "punctuate": "true",
+                            "diarize": "true",
+                            "keywords": "Nova:5,Hey Nova:5,nova:5",
+                            "utterances": "true",
+                            "utterance_end_ms": "700",
+                        },
+                    },
+                }
             payload["recording_config"] = {
                 "transcript": {
-                    "provider": {
-                        "meeting_captions": {},
-                    },
+                    "provider": transcript_provider,
                 },
                 "realtime_endpoints": [
                     {
@@ -247,10 +265,6 @@ class RecallClient:
     @staticmethod
     def pcm_to_mp3_b64(audio_bytes: bytes) -> str:
         """Convert raw PCM audio to base64-encoded MP3."""
-        import base64
-        import io
-        from pydub import AudioSegment
-
         audio_seg = AudioSegment(
             data=audio_bytes,
             sample_width=2,
