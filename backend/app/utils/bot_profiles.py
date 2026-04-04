@@ -6,17 +6,34 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Agent
-from app.utils.prompt_builder import build_prompt_for_mode
+from app.utils.prompt_builder import (
+    build_prompt_for_mode,
+    resolve_persona_id,
+    resolve_persona_voice,
+    resolve_persona_tts_voice,
+)
 
 
 DEFAULT_BOT_NAME = "Synth"
 DEFAULT_BOT_VOICE = "female"
 DEFAULT_RESPONSE_MODE = "name_only"
+DEFAULT_PERSONA_ID = "general"
 
 
-def build_system_prompt(mode: str, description: str) -> str:
+def build_system_prompt(mode: str, description: str, persona_id: str | None = None) -> str:
     """Build the effective system prompt for a profile or override."""
-    return build_prompt_for_mode(mode, description)
+    resolved_persona_id = resolve_persona_id(mode, persona_id)
+    return build_prompt_for_mode(mode, description, resolved_persona_id)
+
+
+def get_persona_voice_label(persona_id: str | None) -> str:
+    """Return fixed API-facing voice label for persona."""
+    return resolve_persona_voice(persona_id)
+
+
+def get_persona_tts_voice(persona_id: str | None) -> str:
+    """Return fixed Kokoro voice id for persona."""
+    return resolve_persona_tts_voice(persona_id)
 
 
 async def get_effective_primary_agent(db: AsyncSession, user_id) -> Agent | None:

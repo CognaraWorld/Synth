@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.auth import get_current_user
 from app.models.database import Agent, User, get_db
 from app.models.schemas import AgentCreate, AgentResponse, AgentUpdate
-from app.utils.bot_profiles import build_system_prompt, get_effective_primary_agent, mark_primary_agent
+from app.utils.bot_profiles import (
+    build_system_prompt,
+    get_effective_primary_agent,
+    get_persona_voice_label,
+    mark_primary_agent,
+)
+from app.utils.prompt_builder import resolve_persona_id
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -19,14 +25,17 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ):
     has_primary = await get_effective_primary_agent(db, current_user.id) is not None
+    persona_id = resolve_persona_id(agent_data.mode, agent_data.persona_id)
+    mode = "general"
 
     agent = Agent(
         user_id=current_user.id,
         name=agent_data.name,
         description=agent_data.description,
-        system_prompt=build_system_prompt(agent_data.mode, agent_data.description),
-        mode=agent_data.mode,
-        voice=agent_data.voice,
+        system_prompt=build_system_prompt(mode, agent_data.description, persona_id),
+        mode=mode,
+        persona_id=persona_id,
+        voice=get_persona_voice_label(persona_id),
         response_mode=agent_data.response_mode,
         is_primary=not has_primary,
     )
@@ -77,10 +86,21 @@ async def update_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     payload = update_data.model_dump(exclude_unset=True, exclude_none=True)
-    if "system_prompt" not in payload and ("description" in payload or "mode" in payload):
+    persona_inputs_changed = "mode" in payload or "persona_id" in payload
+    if persona_inputs_changed:
+        candidate_mode = payload.get("mode", agent.mode)
+        candidate_persona = payload.get("persona_id", agent.persona_id)
+        resolved_persona = resolve_persona_id(candidate_mode, candidate_persona)
+        payload["mode"] = "general"
+        payload["persona_id"] = resolved_persona
+
+    next_persona = payload.get("persona_id", agent.persona_id)
+    payload["voice"] = get_persona_voice_label(next_persona)
+
+    if "system_prompt" not in payload and ("description" in payload or persona_inputs_changed):
         next_description = payload.get("description", agent.description)
         next_mode = payload.get("mode", agent.mode)
-        payload["system_prompt"] = build_system_prompt(next_mode, next_description)
+        payload["system_prompt"] = build_system_prompt(next_mode, next_description, next_persona)
 
     for field, value in payload.items():
         setattr(agent, field, value)

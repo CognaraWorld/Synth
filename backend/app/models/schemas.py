@@ -22,6 +22,7 @@ MeetingLinkField = Annotated[
 ]
 VoiceField = Literal["female", "male"]
 ResponseModeField = Literal["name_only", "proactive"]
+PersonaField = Literal["general", "strategist", "analyst", "challenger", "facilitator"]
 
 
 # Auth
@@ -56,8 +57,8 @@ class LoginRequest(BaseModel):
 class AgentCreate(BaseModel):
     name: NameField = "Synth"
     description: LongTextField
-    mode: Literal["general", "custom"] = "general"
-    voice: VoiceField = "female"
+    mode: Literal["general"] = "general"
+    persona_id: PersonaField = "general"
     response_mode: ResponseModeField = "name_only"
 
 
@@ -65,8 +66,8 @@ class AgentUpdate(BaseModel):
     name: Optional[NameField] = None
     description: Optional[LongTextField] = None
     system_prompt: Optional[PromptField] = None
-    mode: Optional[Literal["general", "custom"]] = None
-    voice: Optional[VoiceField] = None
+    mode: Optional[Literal["general"]] = None
+    persona_id: Optional[PersonaField] = None
     response_mode: Optional[ResponseModeField] = None
 
 
@@ -76,6 +77,7 @@ class AgentResponse(BaseModel):
     description: str
     system_prompt: str
     mode: str
+    persona_id: str
     voice: str
     response_mode: str
     is_primary: bool
@@ -88,8 +90,8 @@ class AgentResponse(BaseModel):
 class BotProfileUpsert(BaseModel):
     name: NameField = "Synth"
     description: LongTextField
-    mode: Literal["general", "custom"] = "general"
-    voice: VoiceField = "female"
+    mode: Literal["general"] = "general"
+    persona_id: PersonaField = "general"
     response_mode: ResponseModeField = "name_only"
     system_prompt: Optional[PromptField] = None
 
@@ -170,9 +172,9 @@ class MeetingSummaryResponse(BaseModel):
 
 class MeetingOverrideUpsert(BaseModel):
     description: Optional[LongTextField] = None
-    mode: Optional[Literal["general", "custom"]] = None
+    mode: Optional[Literal["general"]] = None
+    persona_id: Optional[PersonaField] = None
     system_prompt: Optional[PromptField] = None
-    voice: Optional[VoiceField] = None
     response_mode: Optional[ResponseModeField] = None
 
     @model_validator(mode="after")
@@ -182,8 +184,8 @@ class MeetingOverrideUpsert(BaseModel):
             for value in (
                 self.description,
                 self.mode,
+                self.persona_id,
                 self.system_prompt,
-                self.voice,
                 self.response_mode,
             )
         ):
@@ -196,6 +198,7 @@ class MeetingOverrideResponse(BaseModel):
     meeting_id: UUID
     description: Optional[str] = None
     mode: Optional[str] = None
+    persona_id: Optional[str] = None
     system_prompt: Optional[str] = None
     voice: Optional[str] = None
     response_mode: Optional[str] = None
