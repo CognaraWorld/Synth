@@ -95,6 +95,7 @@ class BotEngine:
         self._followup_window: float = 8.0  # seconds after audio finishes playing to accept follow-ups
         self._cooldown_seconds: float = 0.0  # no cooldown
         self._processing_lock: dict[str, asyncio.Lock] = {}  # session_id -> lock
+        self._tts_lock: asyncio.Lock = asyncio.Lock()  # serializes TTS voice switch + synthesis across sessions
 
         # Lightweight services — safe to initialize at startup
         self._settings = get_settings()
@@ -962,7 +963,6 @@ class BotEngine:
             return None
 
         try:
-            self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
             # Classify question and send context-aware filler immediately
             from app.utils.query_router import classify_query
             category = classify_query(question)
@@ -1066,8 +1066,10 @@ class BotEngine:
                     response_text[:100],
                 )
 
-                # Synthesize and send as single audio
-                response_audio = self._tts.synthesize(response_text)
+                # Synthesize — hold TTS lock to prevent voice switch races across sessions
+                async with self._tts_lock:
+                    self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
+                    response_audio = self._tts.synthesize(response_text)
                 if session.bot_id and response_audio:
                     # Wait for filler to finish playing
                     elapsed = time.time() - filler_sent_at

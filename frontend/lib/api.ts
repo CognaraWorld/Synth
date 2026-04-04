@@ -17,7 +17,23 @@ function resolveApiBaseUrl(): string {
           : `${normalizedPath}/api`;
     return `${parsed.origin}${pathWithApi}`;
   } catch {
-    return withoutTrailingSlash;
+    // Bare host:port (e.g. "localhost:8000") — URL() requires a scheme
+    if (!withoutTrailingSlash.includes("://")) {
+      try {
+        const parsed = new URL(`http://${withoutTrailingSlash}`);
+        const normalizedPath = (parsed.pathname || "/").replace(/\/+$/, "");
+        const pathWithApi =
+          normalizedPath === "" || normalizedPath === "/"
+            ? "/api"
+            : normalizedPath.endsWith("/api")
+              ? normalizedPath
+              : `${normalizedPath}/api`;
+        return `${parsed.origin}${pathWithApi}`;
+      } catch {
+        // fall through to fallback
+      }
+    }
+    return fallbackUrl;
   }
 }
 

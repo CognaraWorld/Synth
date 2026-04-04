@@ -144,28 +144,34 @@ export default function NewAgentPage() {
               />
             </div>
 
-            <div className="space-y-3">
-              <Label>Persona</Label>
+            <fieldset className="space-y-3" disabled={submitting}>
+              <legend className="text-sm font-medium">Persona</legend>
               <div className="grid gap-3 sm:grid-cols-2">
                 {PERSONA_OPTIONS.map((option) => (
-                  <button
+                  <label
                     key={option.id}
-                    type="button"
-                    onClick={() => setPersonaId(option.id)}
-                    disabled={submitting}
-                    className={`flex flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
+                    className={`flex cursor-pointer flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
                       personaId === option.id
                         ? "border-primary bg-primary/5"
                         : "border-border hover:border-muted-foreground/25"
-                    }`}
+                    } ${submitting ? "cursor-not-allowed opacity-50" : ""}`}
                   >
+                    <input
+                      type="radio"
+                      name="persona"
+                      value={option.id}
+                      checked={personaId === option.id}
+                      onChange={() => setPersonaId(option.id)}
+                      disabled={submitting}
+                      className="sr-only"
+                    />
                     <span className="text-sm font-medium">{option.title}</span>
                     <span className="text-xs text-muted-foreground">{option.description}</span>
                     <span className="pt-1 text-xs text-muted-foreground">Voice: {option.voice}</span>
-                  </button>
+                  </label>
                 ))}
               </div>
-            </div>
+            </fieldset>
 
             <div className="space-y-2">
               <Label htmlFor="meeting-context">Optional Context</Label>

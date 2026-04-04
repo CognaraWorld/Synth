@@ -306,7 +306,7 @@ class TestMeetingOverrides:
         with pytest.raises(HTTPException, match="before the meeting is active"):
             await upsert_meeting_override(
                 meeting_id=uuid4(),
-                override_data=MeetingOverrideUpsert(voice="male"),
+                override_data=MeetingOverrideUpsert(description="Test override"),
                 current_user=MagicMock(id=uuid4()),
                 db=db,
             )
@@ -341,7 +341,6 @@ class TestMeetingOverrides:
             meeting_id=meeting.id,
             override_data=MeetingOverrideUpsert(
                 description="Answer like a concise finance analyst",
-                voice="female",
             ),
             current_user=MagicMock(id=uuid4()),
             db=db,

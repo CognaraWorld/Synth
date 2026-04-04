@@ -59,7 +59,6 @@ class AgentCreate(BaseModel):
     description: LongTextField
     mode: Literal["general"] = "general"
     persona_id: PersonaField = "general"
-    voice: VoiceField = "female"
     response_mode: ResponseModeField = "name_only"
 
 
@@ -69,7 +68,6 @@ class AgentUpdate(BaseModel):
     system_prompt: Optional[PromptField] = None
     mode: Optional[Literal["general"]] = None
     persona_id: Optional[PersonaField] = None
-    voice: Optional[VoiceField] = None
     response_mode: Optional[ResponseModeField] = None
 
 
@@ -94,7 +92,6 @@ class BotProfileUpsert(BaseModel):
     description: LongTextField
     mode: Literal["general"] = "general"
     persona_id: PersonaField = "general"
-    voice: VoiceField = "female"
     response_mode: ResponseModeField = "name_only"
     system_prompt: Optional[PromptField] = None
 
@@ -178,7 +175,6 @@ class MeetingOverrideUpsert(BaseModel):
     mode: Optional[Literal["general"]] = None
     persona_id: Optional[PersonaField] = None
     system_prompt: Optional[PromptField] = None
-    voice: Optional[VoiceField] = None
     response_mode: Optional[ResponseModeField] = None
 
     @model_validator(mode="after")
@@ -190,7 +186,6 @@ class MeetingOverrideUpsert(BaseModel):
                 self.mode,
                 self.persona_id,
                 self.system_prompt,
-                self.voice,
                 self.response_mode,
             )
         ):
