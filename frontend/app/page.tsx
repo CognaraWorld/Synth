@@ -5,7 +5,7 @@ export default function LandingPage() {
   return (
     <div className="relative flex min-h-screen flex-col items-center justify-center px-4">
       <div className="absolute top-0 right-0 p-4">
-        <Button variant="ghost" size="sm" render={<Link href="/login" />}>
+        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/login" />}>
           Sign In
         </Button>
       </div>
@@ -20,10 +20,10 @@ export default function LandingPage() {
           </p>
         </div>
         <div className="flex gap-4">
-          <Button size="lg" render={<Link href="/login" />}>
+          <Button size="lg" nativeButton={false} render={<Link href="/login" />}>
             Get Started
           </Button>
-          <Button variant="outline" size="lg" render={<Link href="#features" />}>
+          <Button variant="outline" size="lg" nativeButton={false} render={<Link href="#features" />}>
             Learn More
           </Button>
         </div>

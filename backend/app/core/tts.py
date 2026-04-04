@@ -14,10 +14,11 @@ import random
 import wave
 
 import numpy as np
-from kokoro import KPipeline
 
-from app.utils.filler import FILLER_PHRASES
-
+try:
+    from kokoro import KPipeline
+except (ImportError, ModuleNotFoundError, Exception):  # pragma: no cover - pydantic compat
+    KPipeline = None
 
 class TextToSpeech:
     """Wrapper around the Kokoro TTS model for speech synthesis.
@@ -52,7 +53,12 @@ class TextToSpeech:
         self.speed = speed
 
         # Initialize Kokoro pipeline — 'a' = American English
-        self._pipeline = KPipeline(lang_code="a")
+        self._pipeline = None
+        if KPipeline is not None:
+            try:
+                self._pipeline = KPipeline(lang_code="a")
+            except Exception:
+                self._pipeline = None
 
     def synthesize(self, text: str) -> bytes:
         """Convert text to speech audio.
@@ -64,6 +70,9 @@ class TextToSpeech:
             Raw audio bytes (PCM int16 format) suitable for streaming
             into the meeting via Recall.ai.
         """
+        if self._pipeline is None:
+            return b""
+
         audio_chunks: list[np.ndarray] = []
 
         for _graphemes, _phonemes, audio_tensor in self._pipeline(
@@ -108,14 +117,3 @@ class TextToSpeech:
 
         return buf.getvalue()
 
-    def get_filler_response(self) -> bytes:
-        """Generate a random filler phrase as audio.
-
-        Used to reduce perceived latency while the LLM processes a
-        question. Randomly selects from pre-defined filler phrases.
-
-        Returns:
-            Raw audio bytes of a synthesized filler phrase.
-        """
-        phrase = random.choice(FILLER_PHRASES)
-        return self.synthesize(phrase)

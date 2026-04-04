@@ -47,7 +47,7 @@ function EmptyState() {
           Create your first agent to get started.
         </p>
       </div>
-      <Button render={<Link href="/dashboard/agents/new" />}>
+      <Button nativeButton={false} render={<Link href="/dashboard/agents/new" />}>
         <Plus className="size-4" data-icon="inline-start" />
         Create Agent
       </Button>
@@ -129,7 +129,7 @@ export default function AgentsPage() {
           </p>
         </div>
         {hasAgents && (
-          <Button render={<Link href="/dashboard/agents/new" />}>
+          <Button nativeButton={false} render={<Link href="/dashboard/agents/new" />}>
             <Plus className="size-4" data-icon="inline-start" />
             Create New Agent
           </Button>

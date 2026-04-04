@@ -74,13 +74,18 @@ class RollingSummary:
                 "decisions, action items, and important topics discussed."
             )
 
-            # Support both sync and async LLM clients gracefully.
-            result = self._llm_client.query(context="", question=prompt)
-            if asyncio.iscoroutine(result):
-                result = await result
+            try:
+                # Support both sync and async LLM clients gracefully.
+                result = self._llm_client.query(context="", question=prompt)
+                if asyncio.iscoroutine(result):
+                    result = await result
 
-            self.summary = result
-            self._pending_text = ""
+                if result and result.strip():
+                    self.summary = result
+                self._pending_text = ""
+            except Exception:
+                # LLM failed — keep pending text for next attempt
+                pass
 
     def get_summary(self) -> str:
         """Return the current rolling summary.

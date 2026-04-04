@@ -96,11 +96,8 @@ class MeetingSession:
         # Bot ID assigned by Recall.ai after deployment
         self.bot_id: str | None = None
 
-        # Dashboard-driven runtime controls
-        self.operator_muted: bool = False
-        self.output_stop_requested: bool = False
-        self.operator_instructions: list[dict[str, str]] = []
-        self.last_instruction_at: datetime | None = None
+        # AI insights: corrections detected during passive listening
+        self.insights: list[dict[str, str]] = []
 
         # Timestamps
         now = datetime.now(timezone.utc)
@@ -163,37 +160,6 @@ class MeetingSession:
         """
         return self.state.value
 
-    def set_operator_muted(self, muted: bool) -> None:
-        """Enable or disable dashboard mute for wake-word responses."""
-        self.operator_muted = muted
-
-    def request_output_stop(self) -> None:
-        """Request that any in-flight response should be interrupted if possible."""
-        self.output_stop_requested = True
-
-    def clear_output_stop(self) -> None:
-        """Clear the pending output-stop request."""
-        self.output_stop_requested = False
-
-    def add_operator_instruction(self, instruction_text: str) -> None:
-        """Persist a typed dashboard instruction in the live session context."""
-        now = datetime.now(timezone.utc)
-        self.operator_instructions.append(
-            {
-                "timestamp": now.isoformat(),
-                "instruction": instruction_text,
-            }
-        )
-        self.last_instruction_at = now
-
-    def get_operator_instruction_context(self, limit: int = 10) -> str:
-        """Return recent operator instructions formatted for LLM context."""
-        recent = self.operator_instructions[-limit:]
-        return "\n".join(
-            f"- {item['timestamp']}: {item['instruction']}"
-            for item in recent
-        )
-
     # ------------------------------------------------------------------
     # Computed properties
     # ------------------------------------------------------------------
@@ -228,12 +194,6 @@ class MeetingSession:
             "meeting_id": self.meeting_id,
             "state": self.state.value,
             "bot_id": self.bot_id,
-            "is_muted": self.operator_muted,
-            "stop_requested": self.output_stop_requested,
-            "last_instruction_at": (
-                self.last_instruction_at.isoformat() if self.last_instruction_at else None
-            ),
-            "operator_instruction_count": len(self.operator_instructions),
             "agent_config": self.agent_config,
             "created_at": self.created_at.isoformat(),
             "duration_seconds": round(self.get_duration(), 2),

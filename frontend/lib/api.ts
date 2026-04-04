@@ -85,11 +85,15 @@ export async function getMeeting(id: string) {
 }
 
 export async function createMeeting(meeting: {
-  platform: string;
-  meeting_url: string;
+  meeting_link: string;
   agent_id: string;
 }) {
   const { data } = await api.post("/meetings", meeting);
+  return data;
+}
+
+export async function stopMeeting(id: string) {
+  const { data } = await api.post(`/meetings/${id}/stop`);
   return data;
 }
 

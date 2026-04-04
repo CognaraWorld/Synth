@@ -1,28 +1,23 @@
-from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+import logging
+
 from app.api.routes.auth import get_current_user
-from app.models.credit_transaction import CreditTransaction
+from app.api.routes.webhook import get_bot_engine, set_bot_engine
 from app.config import get_settings
-from app.meeting.reporting import calculate_minutes_used, finalize_meeting_artifacts_for_meeting_id
-from app.models.database import Agent, Meeting, MeetingOverride, MeetingSummary, User, get_db
-from app.models.schemas import (
-    MeetingCreate,
-    MeetingDetailResponse,
-    MeetingOverrideResponse,
-    MeetingOverrideUpsert,
-    MeetingResponse,
-)
-from app.utils.bot_profiles import build_system_prompt, get_effective_primary_agent
+from app.meeting.recall_client import RecallClient, RecallClientError
+from app.models.database import Agent, Meeting, MeetingSummary, User, get_db
+from app.models.schemas import MeetingCreate, MeetingDetailResponse, MeetingResponse
 from app.utils.meeting_links import detect_meeting_platform
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/meetings", tags=["meetings"])
-settings = get_settings()
 
 
 def detect_platform(meeting_link: str) -> str:
@@ -43,49 +38,120 @@ async def create_meeting(
     if current_user.credits < 1:
         raise HTTPException(status_code=402, detail="Insufficient credits")
 
-    if meeting_data.agent_id is not None:
-        result = await db.execute(
-            select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
-        )
-        agent = result.scalar_one_or_none()
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-    else:
-        agent = await get_effective_primary_agent(db, current_user.id)
+    # Verify agent belongs to user
+    result = await db.execute(
+        select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
+    )
+    agent = result.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=404, detail="No bot profile found for this user")
+        raise HTTPException(status_code=404, detail="Agent not found")
 
     platform = detect_platform(meeting_data.meeting_link)
 
     meeting = Meeting(
         user_id=current_user.id,
-        agent_id=agent.id,
+        agent_id=meeting_data.agent_id,
         platform=platform,
         meeting_link=meeting_data.meeting_link,
         status="pending",
-        credits_used=1,
     )
     db.add(meeting)
-    await db.flush()
 
     # Deduct credit
-    current_user.credits -= meeting.credits_used
-    db.add(
-        CreditTransaction(
-            user_id=current_user.id,
-            meeting_id=meeting.id,
-            amount=-meeting.credits_used,
-            balance_after=current_user.credits,
-            transaction_type="meeting_used",
-            description=f"Started {platform} meeting",
-        )
-    )
+    current_user.credits -= 1
 
     await db.commit()
     await db.refresh(meeting)
 
-    # TODO Phase 6: Trigger bot join via Recall.ai here
-    # await bot_engine.join_meeting(meeting)
+    # Build webhook URL for real-time transcription
+    settings = get_settings()
+    webhook_url = None
+    if settings.webhook_base_url:
+        webhook_url = f"{settings.webhook_base_url.rstrip('/')}/api/webhook/recall"
+        logger.info("Webhook URL: %s", webhook_url)
+
+    # Deploy Recall.ai bot into the meeting
+    recall = RecallClient()
+    try:
+        bot_id = await recall.create_bot(
+            meeting_url=meeting_data.meeting_link,
+            bot_name=agent.name or "Synth",
+            webhook_url=webhook_url,
+        )
+        meeting.bot_id = bot_id
+        meeting.status = "active"
+        await db.commit()
+        await db.refresh(meeting)
+        logger.info("Bot %s joined meeting %s", bot_id, meeting.id)
+
+        # Initialize BotEngine session so webhook has a target
+        engine = get_bot_engine()
+        agent_config = {
+            "agent_id": str(agent.id),
+            "agent_name": agent.name or "Synth",
+            "mode": agent.mode or "general",
+            "description": agent.description or "",
+        }
+
+        # Register session directly (bot already deployed via RecallClient above)
+        from app.context.manager import ContextManager
+        from app.meeting.session import MeetingSession, SessionState
+
+        session = MeetingSession(
+            meeting_id=meeting_data.meeting_link,
+            agent_config=agent_config,
+        )
+        session.bot_id = bot_id
+
+        # Build system prompt
+        from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
+        if agent_config["mode"] == "custom" and agent_config["description"]:
+            session.agent_config["system_prompt"] = build_custom_prompt(agent_config["description"])
+        else:
+            session.agent_config["system_prompt"] = build_general_prompt()
+
+        # Wire up rolling summary with LLM
+        session.context_manager.rolling_summary.set_llm_client(engine._llm_client)
+
+        # Wire up RAG pipeline for document search
+        from app.api.routes.documents import _get_rag_pipeline
+        rag = _get_rag_pipeline(str(agent.id))
+        session.context_manager.set_rag_pipeline(rag)
+
+        # Load document summaries for the agent
+        try:
+            from app.models.database import Document
+            doc_result = await db.execute(
+                select(Document).where(
+                    Document.agent_id == agent.id,
+                    Document.parsed.is_(True),
+                    Document.doc_summary.isnot(None),
+                )
+            )
+            documents = doc_result.scalars().all()
+            for doc in documents:
+                session.context_manager.add_document_summary(doc.filename, doc.doc_summary)
+            if documents:
+                logger.info("Loaded %d doc summaries for agent %s", len(documents), agent.id)
+        except Exception as exc:
+            logger.warning("Failed to load doc summaries: %s", exc)
+
+        # Set session states and register
+        session.transition(SessionState.JOINING)
+        session.transition(SessionState.LISTENING)
+        engine.sessions[session.session_id] = session
+        engine._sessions_by_bot_id[bot_id] = session.session_id
+
+        logger.info("BotEngine session %s ready for bot %s", session.session_id, bot_id)
+
+    except RecallClientError as exc:
+        logger.error("Failed to deploy bot for meeting %s: %s", meeting.id, exc)
+        meeting.status = "failed"
+        current_user.credits += 1  # refund credit
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Failed to deploy meeting bot. Credit refunded.")
+    finally:
+        await recall.close()
 
     return meeting
 
@@ -111,7 +177,7 @@ async def get_meeting(
 ):
     result = await db.execute(
         select(Meeting)
-        .options(joinedload(Meeting.summary), joinedload(Meeting.override))
+        .options(joinedload(Meeting.summary))
         .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
     )
     meeting = result.scalar_one_or_none()
@@ -123,7 +189,6 @@ async def get_meeting(
 @router.post("/{meeting_id}/stop", response_model=MeetingResponse)
 async def stop_meeting(
     meeting_id: UUID,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -137,109 +202,26 @@ async def stop_meeting(
     if meeting.status != "active":
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
-    meeting.status = "ended"
-    meeting.ended_at = datetime.now(timezone.utc)
-    if meeting.duration_minutes is None:
-        meeting.duration_minutes = calculate_minutes_used(meeting)
+    # Stop via BotEngine (flushes RAG, cleans up session, stops Recall bot)
+    engine = get_bot_engine()
+    session_id = engine._sessions_by_bot_id.get(meeting.bot_id) if meeting.bot_id else None
+    if session_id:
+        try:
+            await engine.stop_meeting(session_id)
+        except Exception as exc:
+            logger.warning("BotEngine stop failed: %s", exc)
+    elif meeting.bot_id:
+        # No session — stop bot directly
+        recall = RecallClient()
+        try:
+            await recall.stop_bot(meeting.bot_id)
+        except RecallClientError as exc:
+            logger.warning("Failed to stop bot %s: %s", meeting.bot_id, exc)
+        finally:
+            await recall.close()
 
-    # TODO Phase 6: Stop bot via Recall.ai
+    meeting.status = "ended"
+
     await db.commit()
     await db.refresh(meeting)
-
-    background_tasks.add_task(
-        finalize_meeting_artifacts_for_meeting_id,
-        meeting.id,
-        current_user.email,
-        settings,
-    )
-
     return meeting
-
-
-@router.get("/{meeting_id}/override", response_model=MeetingOverrideResponse)
-async def get_meeting_override(
-    meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Meeting)
-        .options(joinedload(Meeting.override))
-        .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
-    )
-    meeting = result.scalar_one_or_none()
-    if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found")
-    if not meeting.override:
-        raise HTTPException(status_code=404, detail="Meeting override not found")
-    return meeting.override
-
-
-@router.put("/{meeting_id}/override", response_model=MeetingOverrideResponse)
-async def upsert_meeting_override(
-    meeting_id: UUID,
-    override_data: MeetingOverrideUpsert,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Meeting)
-        .options(joinedload(Meeting.override), joinedload(Meeting.agent))
-        .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
-    )
-    meeting = result.scalar_one_or_none()
-    if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found")
-    if meeting.status not in {"pending", "joining"}:
-        raise HTTPException(
-            status_code=409,
-            detail="Meeting overrides can only be changed before the meeting is active.",
-        )
-
-    override = meeting.override
-    if override is None:
-        override = MeetingOverride(meeting_id=meeting.id)
-        db.add(override)
-
-    payload = override_data.model_dump(exclude_unset=True)
-    for field in ("description", "mode", "system_prompt", "voice", "response_mode"):
-        if field in payload:
-            setattr(override, field, payload[field])
-
-    if "system_prompt" not in payload and ("description" in payload or "mode" in payload):
-        if "description" in payload and "mode" not in payload:
-            override.mode = "custom"
-
-        effective_mode = override.mode or meeting.agent.mode
-        effective_description = override.description or meeting.agent.description
-        override.system_prompt = build_system_prompt(effective_mode, effective_description)
-
-    await db.commit()
-    await db.refresh(override)
-    return override
-
-
-@router.delete("/{meeting_id}/override", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_meeting_override(
-    meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Meeting)
-        .options(joinedload(Meeting.override))
-        .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
-    )
-    meeting = result.scalar_one_or_none()
-    if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found")
-    if not meeting.override:
-        raise HTTPException(status_code=404, detail="Meeting override not found")
-    if meeting.status not in {"pending", "joining"}:
-        raise HTTPException(
-            status_code=409,
-            detail="Meeting overrides can only be changed before the meeting is active.",
-        )
-
-    await db.delete(meeting.override)
-    await db.commit()

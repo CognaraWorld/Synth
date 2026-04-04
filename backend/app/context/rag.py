@@ -31,7 +31,7 @@ class RAGPipeline:
     def __init__(
         self,
         collection_name: str = "synth_documents",
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "BAAI/bge-large-en-v1.5",
     ) -> None:
         """Initialize the RAG pipeline.
 
@@ -42,7 +42,13 @@ class RAGPipeline:
         """
         self.collection_name = collection_name
         self.embedding_model = embedding_model
-        self._client = chromadb.EphemeralClient()
+
+        # Persist embeddings to disk so they survive restarts
+        from pathlib import Path
+        persist_dir = Path("./chroma_data")
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=str(persist_dir))
+
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
         )

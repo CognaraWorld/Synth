@@ -89,7 +89,7 @@ export default function MeetingDetailPage({
           variant="ghost"
           size="sm"
           className="gap-1.5"
-          render={<Link href="/dashboard/meetings" />}
+          nativeButton={false} render={<Link href="/dashboard/meetings" />}
         >
           <ArrowLeft className="size-3.5" />
           Back to Meetings
@@ -109,7 +109,7 @@ export default function MeetingDetailPage({
         variant="ghost"
         size="sm"
         className="gap-1.5"
-        render={<Link href="/dashboard/meetings" />}
+        nativeButton={false} render={<Link href="/dashboard/meetings" />}
       >
         <ArrowLeft className="size-3.5" />
         Back to Meetings

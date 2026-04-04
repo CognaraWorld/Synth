@@ -51,7 +51,7 @@ export default function NewAgentPage() {
           variant="ghost"
           size="sm"
           className="mb-4 gap-1.5"
-          render={<Link href="/dashboard/agents" />}
+          nativeButton={false} render={<Link href="/dashboard/agents" />}
         >
           <ArrowLeft className="size-3.5" />
           Back to Agents
@@ -152,7 +152,7 @@ export default function NewAgentPage() {
                 type="button"
                 variant="outline"
                 disabled={submitting}
-                render={<Link href="/dashboard/agents" />}
+                nativeButton={false} render={<Link href="/dashboard/agents" />}
               >
                 Cancel
               </Button>
