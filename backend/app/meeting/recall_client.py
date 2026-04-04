@@ -9,10 +9,13 @@ Phase 6 implementation.
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from typing import Any, AsyncIterator
 
 import httpx
+from pydub import AudioSegment
 
 from app.config import get_settings
 
@@ -105,7 +108,7 @@ class RecallClient:
                             "diarize": "true",
                             "keywords": "Hey Assistant:2",
                             "utterances": "true",
-                            "utterance_end_ms": "1200",
+                            "utterance_end_ms": "700",
                         },
                     },
                 }
@@ -262,10 +265,6 @@ class RecallClient:
     @staticmethod
     def pcm_to_mp3_b64(audio_bytes: bytes) -> str:
         """Convert raw PCM audio to base64-encoded MP3."""
-        import base64
-        import io
-        from pydub import AudioSegment
-
         audio_seg = AudioSegment(
             data=audio_bytes,
             sample_width=2,

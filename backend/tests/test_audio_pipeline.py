@@ -183,9 +183,11 @@ class TestRawTranscriptBuffer:
         def writer(thread_id: int) -> None:
             barrier.wait()  # synchronize start for maximum contention
             for i in range(entries_per_thread):
+                # Use unique speaker per thread to prevent grouping
                 buf.append(
-                    f"Thread-{thread_id} entry-{i}",
+                    f"entry-{thread_id}-{i}",
                     timestamp=datetime.now(timezone.utc),
+                    speaker=f"Thread-{thread_id}",
                 )
 
         threads = [
@@ -199,7 +201,7 @@ class TestRawTranscriptBuffer:
 
         recent = buf.get_recent(minutes=10)
         expected_total = num_threads * entries_per_thread
-        # Each entry is a separate line/segment -- count occurrences of "entry-"
+        # Each entry-X-Y string should appear in the grouped output
         actual_count = recent.count("entry-")
         assert actual_count == expected_total, (
             f"Expected {expected_total} entries but found {actual_count}. "

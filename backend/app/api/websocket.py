@@ -15,7 +15,9 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from jose import jwt, JWTError
 
+from app.config import get_settings
 from app.core.bot_engine import BotEngine, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,9 @@ def set_engine(engine: BotEngine) -> None:
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """Stream live meeting status and transcript over WebSocket.
 
+    Authenticates via a JWT token passed as a ``token`` query parameter
+    before accepting the connection (OWASP A01:2021 - Broken Access Control).
+
     After accepting the connection, this endpoint enters a polling
     loop that sends periodic status and transcript updates to the
     connected client as JSON messages.
@@ -79,8 +84,54 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         websocket: The incoming WebSocket connection.
         session_id: The meeting session ID to stream updates for.
     """
+    # Authenticate via JWT token in query params before accepting.
+    # WebSocket connections cannot use standard Authorization headers,
+    # so the token is passed as a query parameter instead.
+    settings = get_settings()
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+
+    # Reject tokens signed with the default insecure key
+    if settings.secret_key == "change-me-in-production":
+        await websocket.close(code=4001, reason="Authentication not configured")
+        return
+
+    try:
+        payload = jwt.decode(
+            token, settings.secret_key, algorithms=[settings.algorithm]
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    except (JWTError, Exception):
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    # Verify the authenticated user owns this session (prevent IDOR)
+    engine = get_engine()
+    session_obj = engine.sessions.get(session_id)
+    if session_obj and session_obj.bot_id:
+        try:
+            from sqlalchemy import select
+            from app.models.database import Meeting, AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(Meeting).where(
+                        Meeting.bot_id == session_obj.bot_id,
+                        Meeting.user_id == user_id,
+                    )
+                )
+                if not result.scalar_one_or_none():
+                    await websocket.close(code=4003, reason="Access denied")
+                    return
+        except Exception as exc:
+            logger.warning("WebSocket ownership check failed: %s", exc)
+
     await websocket.accept()
-    logger.info("WebSocket connected for session %s", session_id)
+    logger.info("WebSocket connected for session %s (user %s)", session_id, user_id)
 
     engine = get_engine()
 

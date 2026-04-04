@@ -11,11 +11,15 @@ Phase 3 implementation.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from app.context.raw_buffer import RawTranscriptBuffer
 from app.context.rolling_summary import RollingSummary
+
+logger = logging.getLogger(__name__)
 
 
 class ContextManager:
@@ -47,7 +51,7 @@ class ContextManager:
         self._transcript_embed_buffer: list[tuple[datetime, str]] = []
         self._embed_chunk_target: int = 200  # words per RAG chunk
         self._embed_stale_seconds: float = 120.0  # force-flush if oldest entry > 2 min
-        self._embed_lock = __import__('threading').Lock()
+        self._embed_lock = threading.Lock()
 
     def set_rag_pipeline(self, rag: Any) -> None:
         """Inject the RAG retrieval pipeline.
@@ -77,8 +81,9 @@ class ContextManager:
     def get_token_count(self, text: str) -> int:
         """Estimate the token count for a text string.
 
-        Uses a fast word-based approximation (words x 1.3) rather than
+        Uses a fast word-based approximation (words x 1.5) rather than
         a full tokenizer, trading perfect accuracy for zero dependencies.
+        The 1.5 multiplier is conservative to avoid overrunning budgets.
 
         Args:
             text: The text to count tokens for.
@@ -86,7 +91,7 @@ class ContextManager:
         Returns:
             Estimated token count.
         """
-        return int(len(text.split()) * 1.3)
+        return int(len(text.split()) * 1.5)
 
     # ------------------------------------------------------------------
     # Transcript ingestion
@@ -95,31 +100,35 @@ class ContextManager:
     def add_transcript(self, text: str, timestamp: datetime | None = None) -> None:
         """Append new transcript text to the raw buffer and rolling summary.
 
-        Before adding new text, collects entries about to be pruned from
-        the raw buffer and embeds them into the RAG pipeline so old
-        conversation chunks remain searchable.
+        Collects entries evicted from the raw buffer (both deque overflow
+        and time-based pruning) and routes them to the embed buffer so
+        they end up in ChromaDB rather than being silently lost.
 
         Args:
             text: Transcript text segment.
             timestamp: When the segment was captured. Defaults to now.
         """
-        # Append to buffer — returns entries that just aged out
-        pruned = self.raw_buffer.append(text, timestamp=timestamp)
+        # Append to buffer — returns entries evicted by overflow or age
+        evicted = self.raw_buffer.append(text, timestamp=timestamp)
 
-        # Batch pruned entries into ~200-word chunks for RAG embedding
-        if pruned and self.rag_pipeline is not None:
+        # Route evicted entries into the embed buffer for RAG embedding
+        if evicted and self.rag_pipeline is not None:
             with self._embed_lock:
-                self._transcript_embed_buffer.extend(pruned)
-                self._flush_embed_buffer()
+                self._transcript_embed_buffer.extend(evicted)
+            self._flush_embed_buffer()
 
         # RollingSummary.update is async. We schedule it on the running
         # loop when one exists; otherwise the pending text simply
         # accumulates and will be summarized on the next async call.
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.rolling_summary.update(text))
+            task = loop.create_task(self.rolling_summary.update(text))
+            task.add_done_callback(
+                lambda t: logger.error("Summary update failed: %s", t.exception())
+                if not t.cancelled() and t.exception() else None
+            )
         except RuntimeError:
-            self.rolling_summary._pending_text += text
+            self.rolling_summary.add_pending(text)
 
     # ------------------------------------------------------------------
     # Context assembly
@@ -132,57 +141,84 @@ class ContextManager:
         chunk size, then embeds the combined text into RAG as a single
         paragraph-length chunk for better retrieval quality.
 
+        Extracts data under the embed lock, then releases it before the
+        actual encoding call (which is slow) to avoid blocking other
+        callers.
+
         Args:
             force: If True, embed whatever is buffered regardless of size.
         """
-        if not self._transcript_embed_buffer or self.rag_pipeline is None:
-            return
+        # Extract buffer contents under lock, then release before encoding
+        with self._embed_lock:
+            if not self._transcript_embed_buffer or self.rag_pipeline is None:
+                return
 
-        # Combine all buffered lines
-        combined = " ".join(text for _, text in self._transcript_embed_buffer)
-        word_count = len(combined.split())
+            # Check whether we should flush yet
+            combined = " ".join(text for _, text in self._transcript_embed_buffer)
+            word_count = len(combined.split())
 
-        # Force-flush if oldest entry has been sitting too long (> 2 min),
-        # even if we haven't hit the 200-word target. Prevents transcript
-        # from going invisible between the raw buffer and RAG.
-        if not force and word_count < self._embed_chunk_target:
-            oldest_ts = self._transcript_embed_buffer[0][0]
-            age = (datetime.now(timezone.utc) - oldest_ts).total_seconds()
-            if age < self._embed_stale_seconds:
-                return  # wait for more lines
-            force = True  # stale — flush what we have
+            if not force and word_count < self._embed_chunk_target:
+                oldest_ts = self._transcript_embed_buffer[0][0]
+                age = (datetime.now(timezone.utc) - oldest_ts).total_seconds()
+                if age < self._embed_stale_seconds:
+                    return  # wait for more lines
+                force = True  # stale — flush what we have
 
-        # Embed in ~200-word chunks with 10% overlap
-        words = combined.split()
+            # Copy the buffer and clear it while still under lock
+            buffer_copy = list(self._transcript_embed_buffer)
+            self._transcript_embed_buffer.clear()
+
+        # Build a word-to-entry index for accurate per-chunk timestamps.
+        # Each word maps back to the entry it came from, so chunks get
+        # the timestamp of their first and last contributing entry.
+        entry_words: list[tuple[str, int]] = []  # (word, entry_index)
+        for idx, (_, text) in enumerate(buffer_copy):
+            for w in text.split():
+                entry_words.append((w, idx))
+
+        # Embed in ~200-word chunks with 10% overlap (outside the lock)
         overlap = self._embed_chunk_target // 10
         start = 0
 
-        while start < len(words):
-            end = min(start + self._embed_chunk_target, len(words))
-            chunk_text = " ".join(words[start:end])
+        while start < len(entry_words):
+            end = min(start + self._embed_chunk_target, len(entry_words))
+            chunk_words = entry_words[start:end]
+            chunk_text = " ".join(w for w, _ in chunk_words)
 
             min_words = 5 if force else 20
-            if len(chunk_text.split()) >= min_words:
-                first_ts = self._transcript_embed_buffer[0][0]
-                last_ts = self._transcript_embed_buffer[-1][0]
+            if len(chunk_words) >= min_words:
+                first_entry_idx = chunk_words[0][1]
+                last_entry_idx = chunk_words[-1][1]
+                first_ts = buffer_copy[first_entry_idx][0]
+                last_ts = buffer_copy[last_entry_idx][0]
+                # Extract unique speakers from the chunk entries
+                chunk_entry_indices = set(idx for _, idx in chunk_words)
+                speakers_in_chunk = set()
+                for ei in chunk_entry_indices:
+                    entry_text = buffer_copy[ei][1]
+                    # Speaker is the part before first ": "
+                    if ": " in entry_text:
+                        spk = entry_text.split(": ", 1)[0].strip()
+                        if spk:
+                            speakers_in_chunk.add(spk)
+
                 try:
                     self.rag_pipeline.add_chunk(
                         text=chunk_text,
                         metadata={
                             "source": "meeting_transcript",
+                            "type": "transcript",
+                            "speakers": ", ".join(sorted(speakers_in_chunk)) or "unknown",
                             "start_time": first_ts.isoformat(),
                             "end_time": last_ts.isoformat(),
                         },
                     )
                 except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).warning("Failed to embed transcript chunk: %s", exc)
+                    logger.warning("Failed to embed transcript chunk: %s", exc)
 
-            if end >= len(words):
+            if end >= len(entry_words):
                 break
             start = end - overlap
-
-        self._transcript_embed_buffer.clear()
 
     def _truncate_from_beginning(self, text: str, max_tokens: int) -> str:
         """Truncate *text* from the beginning to fit within *max_tokens*.
@@ -198,8 +234,8 @@ class ContextManager:
             The (possibly truncated) text.
         """
         words = text.split()
-        # Reverse the approximation: max_tokens / 1.3 ~ max_words
-        max_words = int(max_tokens / 1.3)
+        # Reverse the approximation: max_tokens / 1.5 ~ max_words
+        max_words = int(max_tokens / 1.5)
         if len(words) <= max_words:
             return text
         return " ".join(words[-max_words:])
@@ -255,8 +291,7 @@ class ContextManager:
         # Flush any pending transcript into RAG before searching,
         # so recently-pruned content is findable immediately.
         if self.rag_pipeline is not None:
-            with self._embed_lock:
-                self._flush_embed_buffer(force=True)
+            self._flush_embed_buffer(force=True)
 
         rag_text = ""
         if self.rag_pipeline is not None:
@@ -316,23 +351,33 @@ class ContextManager:
         Called at meeting end. Drains the raw buffer so that the final
         ~5 minutes of conversation are also embedded, not just the
         entries that had already aged out of the buffer window.
+
+        Acquires locks sequentially (raw_buffer lock first, then embed
+        lock) and releases each before the slow encoding step.
         """
-        with self._embed_lock:
-            # Drain everything still in the raw buffer into the embed buffer
-            with self.raw_buffer._lock:
-                remaining = list(self.raw_buffer._entries)
-            if remaining and self.rag_pipeline is not None:
+        # Copy raw buffer entries under its own lock, then release
+        with self.raw_buffer._lock:
+            remaining = [
+                (e["timestamp"], f"{e['speaker']}: {e['text']}")
+                for e in self.raw_buffer._entries
+            ]
+
+        # Add to embed buffer under embed lock, then release
+        if remaining and self.rag_pipeline is not None:
+            with self._embed_lock:
                 self._transcript_embed_buffer.extend(remaining)
-            self._flush_embed_buffer(force=True)
+
+        # Flush calls encoding outside the embed lock internally
+        self._flush_embed_buffer(force=True)
 
     def reset(self) -> None:
         """Clear all context layers.
 
         Used when resetting between sessions or when the meeting ends.
-        Flushes any remaining transcript lines into RAG before clearing.
+        Flushes everything (raw buffer + embed buffer) into RAG first,
+        then clears all state.
         """
-        with self._embed_lock:
-            self._flush_embed_buffer(force=True)
+        self.flush_remaining_embeddings()  # drain everything first
         self.rolling_summary.reset()
         self.raw_buffer.clear()
         self.rag_pipeline = None

@@ -8,15 +8,22 @@ to avoid webhook timeouts.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.database import Meeting, AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
+
+# Bounded concurrency: limit parallel webhook processing to prevent
+# resource exhaustion under burst traffic (OWASP A05:2021 - Security Misconfiguration)
+_webhook_semaphore = asyncio.Semaphore(20)
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
@@ -41,42 +48,83 @@ def set_bot_engine(engine):
     _bot_engine = engine
 
 
+def cleanup_bot_tracking(bot_id: str) -> None:
+    """Remove per-bot tracking data when a meeting ends.
+
+    Prevents unbounded growth of in-memory sets/dicts over time.
+    Called from _handle_status_change on terminal bot states.
+    """
+    _greeted_bots.discard(bot_id)
+    _recent_bot_output.pop(bot_id, None)
+
+
 @router.post("/recall")
 async def recall_webhook(request: Request):
     """Receive events from Recall.ai.
 
     Returns 200 immediately. Processing happens in a background task
     to keep webhook response time under Recall.ai's timeout.
+
+    Security: validates X-Webhook-Secret header when webhook_secret is
+    configured (OWASP A01:2021 - Broken Access Control).
     """
+    # Authenticate webhook requests via shared secret header
+    settings = get_settings()
+    if settings.webhook_secret:
+        token = request.headers.get("X-Webhook-Secret", "")
+        import hmac
+        if not hmac.compare_digest(token, settings.webhook_secret):
+            return JSONResponse(
+                status_code=401, content={"error": "unauthorized"}
+            )
+
     try:
         payload = await request.json()
     except Exception:
         logger.warning("Invalid JSON in webhook payload")
-        return {"status": "error", "message": "invalid json"}
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "invalid payload"},
+        )
 
-    # Log raw payload at debug level
-    import json
+    # Log raw payload at debug level only
     logger.debug("WEBHOOK RAW: %s", json.dumps(payload, default=str)[:2000])
 
     event = payload.get("event", "")
     data = payload.get("data", {})
 
-    # Route to the correct handler — only one task per webhook
+    # Route to the correct handler — only one task per webhook.
+    # Uses bounded concurrency to prevent resource exhaustion.
     handled = False
     if event:
         if "transcript" in event.lower():
-            asyncio.create_task(_handle_transcription(data))
+            _task = asyncio.create_task(_bounded_handle_transcription(data))
+            _task.add_done_callback(lambda t: logger.error("Webhook transcript task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
             handled = True
         elif "status" in event.lower():
-            asyncio.create_task(_handle_status_change(data))
+            _task = asyncio.create_task(_bounded_handle_status_change(data))
+            _task.add_done_callback(lambda t: logger.error("Webhook status task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
             handled = True
 
     if not handled and not event:
         # No event field — direct transcript webhook
         if "bot_id" in payload or "words" in payload or "text" in payload:
-            asyncio.create_task(_handle_transcription(payload))
+            _task = asyncio.create_task(_bounded_handle_transcription(payload))
+            _task.add_done_callback(lambda t: logger.error("Webhook task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
 
     return {"status": "ok"}
+
+
+async def _bounded_handle_transcription(data: dict) -> None:
+    """Wrap _handle_transcription with concurrency limit."""
+    async with _webhook_semaphore:
+        await _handle_transcription(data)
+
+
+async def _bounded_handle_status_change(data: dict) -> None:
+    """Wrap _handle_status_change with concurrency limit."""
+    async with _webhook_semaphore:
+        await _handle_status_change(data)
 
 
 async def _handle_transcription(data: dict) -> None:
@@ -153,7 +201,38 @@ async def _handle_transcription(data: dict) -> None:
             logger.debug("Ignoring bot's own transcript: %s", text[:80])
             return
 
-        logger.warning("TRANSCRIPT [%s] %s: %s", bot_id[:8] if bot_id else "?", speaker, text[:120])
+        # Text-based echo detection: check if this transcript matches recent bot output
+        # (Deepgram sometimes attributes bot speech to a real participant)
+        if bot_id and bot_id in _recent_bot_output:
+            recent_outputs = _recent_bot_output[bot_id]
+            text_lower = text.lower().strip()
+            for bot_text in recent_outputs:
+                bot_lower = bot_text.lower().strip()
+                # Check if the transcript is a substring of bot output or vice versa
+                if len(text_lower) > 10 and (text_lower in bot_lower or bot_lower in text_lower):
+                    logger.debug("Echo detected (text match): %s", text[:80])
+                    return
+                # Check word overlap — if >60% of words match, it's likely echo
+                if len(text_lower.split()) >= 3:
+                    text_words = set(text_lower.split())
+                    bot_words = set(bot_lower.split())
+                    overlap = len(text_words & bot_words)
+                    if overlap / len(text_words) > 0.6:
+                        logger.debug("Echo detected (word overlap %.0f%%): %s",
+                                    overlap / len(text_words) * 100, text[:80])
+                        return
+
+        # Quality filter: reject very short fragments that are likely noise
+        words = text.split()
+        if len(words) < 3:
+            # Allow short phrases only if they're common speech ("yes", "no", "okay")
+            common_short = {"yes", "no", "yeah", "okay", "ok", "sure", "right",
+                           "thanks", "thank you", "stop", "enough", "got it"}
+            if text.lower().strip(" .,!?") not in common_short:
+                logger.debug("Dropping short fragment: %s: %s", speaker, text)
+                return
+
+        logger.info("TRANSCRIPT [%s] %s: %s", bot_id[:8] if bot_id else "?", speaker, text[:120])
 
         # Fallback greeting: if status webhook didn't fire, greet on first transcript
         if bot_id and bot_id not in _greeted_bots:
@@ -201,6 +280,11 @@ async def _handle_status_change(data: dict) -> None:
         if not new_status:
             return
 
+        # Clean up in-memory tracking for terminal states to prevent
+        # unbounded memory growth over long-running server lifetimes
+        if new_status in ("ended", "failed") and bot_id:
+            cleanup_bot_tracking(bot_id)
+
         # Update meeting status in database
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -223,11 +307,8 @@ async def _send_greeting(bot_id: str) -> None:
     """Send an intro greeting immediately when the bot joins the call."""
     try:
         engine = get_bot_engine()
-        if not engine._tts:
-            from app.core.tts import TextToSpeech
-            engine._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
-            engine._filler_manager.preload(engine._tts)
-            engine._models_loaded = True
+        # Use centralized model initialization (thread-safe, double-checked)
+        await engine._lazy_load_models()
 
         # Pull agent name and wake word from the session config
         session_id = engine._sessions_by_bot_id.get(bot_id)
@@ -251,6 +332,6 @@ async def _send_greeting(bot_id: str) -> None:
             await engine._recall_client.send_audio(bot_id, audio)
             # Track greeting text for echo detection
             _recent_bot_output.setdefault(bot_id, []).append(greeting.lower())
-            logger.warning("Greeting sent for bot %s", bot_id[:8])
+            logger.info("Greeting sent for bot %s", bot_id[:8])
     except Exception as exc:
         logger.warning("Failed to send greeting: %s", exc)
