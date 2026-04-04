@@ -6,9 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
 from app.config import get_settings
-from app.models.database import engine, Base
+from app.models.database import engine, Base, DEFAULT_STARTER_CREDITS
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
-from app.api.routes import auth, agents, meetings, documents, payments, credits, webhook
+from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook
 from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,9 @@ def _add_column_if_missing(
 ) -> None:
     if column_name in columns:
         return
+    # Inject IF NOT EXISTS for PostgreSQL so concurrent startup workers don't race
+    if connection.dialect.name == "postgresql" and "ADD COLUMN" in ddl:
+        ddl = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS", 1)
     connection.execute(text(ddl))
     logger.info("Migration: added %s column to %s table", column_name, table_name)
 
@@ -65,19 +68,85 @@ def _run_migrations(connection):
         )
         connection.execute(text("UPDATE users SET provider = 'email' WHERE provider IS NULL"))
         logger.info("Migration: backfilled users.provider to 'email' for NULL rows")
-        connection.execute(text("UPDATE users SET credits = 3 WHERE credits IS NULL"))
-        logger.info("Migration: backfilled users.credits to 3 for NULL rows")
+        connection.execute(
+            text(f"UPDATE users SET credits = {DEFAULT_STARTER_CREDITS} WHERE credits IS NULL")
+        )
+        logger.info("Migration: backfilled users.credits to %d for NULL rows", DEFAULT_STARTER_CREDITS)
         if dialect_name == "postgresql":
             connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET DEFAULT 'email'"))
-            connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET DEFAULT 3"))
+            connection.execute(
+                text(f"ALTER TABLE users ALTER COLUMN credits SET DEFAULT {DEFAULT_STARTER_CREDITS}")
+            )
             connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET NOT NULL"))
             connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET NOT NULL"))
             logger.info("Migration: enforced users.provider/users.credits defaults and NOT NULL")
 
+    if inspector.has_table("agents"):
+        agent_columns = _get_columns(inspector, "agents")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="agents",
+            columns=agent_columns,
+            column_name="persona_id",
+            ddl="ALTER TABLE agents ADD COLUMN persona_id VARCHAR(64)",
+        )
+        connection.execute(
+            text(
+                "UPDATE agents SET persona_id = 'general' "
+                "WHERE persona_id IS NULL OR persona_id = '' "
+                "OR persona_id NOT IN ('general','strategist','analyst','challenger','facilitator')"
+            )
+        )
+        logger.info("Migration: backfilled agents.persona_id to 'general' where missing")
+        connection.execute(text("UPDATE agents SET mode = 'general' WHERE mode IS NULL OR mode != 'general'"))
+        connection.execute(
+            text(
+                "UPDATE agents SET voice = CASE persona_id "
+                "WHEN 'strategist' THEN 'male' "
+                "WHEN 'challenger' THEN 'male' "
+                "ELSE 'female' END"
+            )
+        )
+        logger.info("Migration: normalized agent mode and fixed persona voice mapping")
+        if dialect_name == "postgresql":
+            connection.execute(text("ALTER TABLE agents ALTER COLUMN persona_id SET DEFAULT 'general'"))
+            connection.execute(text("ALTER TABLE agents ALTER COLUMN persona_id SET NOT NULL"))
+            logger.info("Migration: enforced agents.persona_id default and NOT NULL")
+
+    if inspector.has_table("meeting_overrides"):
+        override_columns = _get_columns(inspector, "meeting_overrides")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="meeting_overrides",
+            columns=override_columns,
+            column_name="persona_id",
+            ddl="ALTER TABLE meeting_overrides ADD COLUMN persona_id VARCHAR(64)",
+        )
+        connection.execute(
+            text(
+                "UPDATE meeting_overrides SET persona_id = 'general' "
+                "WHERE persona_id IS NOT NULL "
+                "AND persona_id NOT IN ('general','strategist','analyst','challenger','facilitator')"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE meeting_overrides SET mode = 'general' "
+                "WHERE mode IS NOT NULL AND mode != 'general'"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE meeting_overrides SET voice = CASE persona_id "
+                "WHEN 'strategist' THEN 'male' "
+                "WHEN 'challenger' THEN 'male' "
+                "ELSE 'female' END "
+                "WHERE persona_id IS NOT NULL"
+            )
+        )
+
     if inspector.has_table("credit_transactions"):
         credit_columns = _get_columns(inspector, "credit_transactions")
-        had_balance_after_column = "balance_after" in credit_columns
-        balance_after_was_nullable = credit_columns.get("balance_after", {}).get("nullable", True)
         meeting_id_type = "UUID" if dialect_name == "postgresql" else "VARCHAR(36)"
         _add_column_if_missing(
             connection=connection,
@@ -145,19 +214,8 @@ def _run_migrations(connection):
                 "WHERE balance_after IS NULL"
             )
         )
-        if dialect_name == "postgresql" and (not had_balance_after_column or balance_after_was_nullable):
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN balance_after SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN amount SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN description SET NOT NULL")
-            )
+        if dialect_name == "postgresql":
+            # Always ensure defaults (idempotent)
             connection.execute(
                 text("ALTER TABLE credit_transactions ALTER COLUMN amount SET DEFAULT 0")
             )
@@ -173,6 +231,13 @@ def _run_migrations(connection):
                     "ALTER COLUMN description SET DEFAULT 'Legacy credit transaction'"
                 )
             )
+            # Per-column NOT NULL: check each independently so partial drift is always corrected
+            # credit_columns reflects pre-migration state; missing columns default to nullable=True
+            for _col in ("balance_after", "amount", "transaction_type", "description"):
+                if credit_columns.get(_col, {}).get("nullable", True):
+                    connection.execute(
+                        text(f"ALTER TABLE credit_transactions ALTER COLUMN {_col} SET NOT NULL")
+                    )
             logger.info(
                 "Migration: normalized credit_transactions defaults and NOT NULL constraints"
             )
@@ -300,7 +365,9 @@ async def add_security_headers(request: Request, call_next):
 # Routes
 app.include_router(auth.router, prefix="/api")
 app.include_router(agents.router, prefix="/api")
+app.include_router(bot.router, prefix="/api")
 app.include_router(meetings.router, prefix="/api")
+app.include_router(live.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(credits.router, prefix="/api")

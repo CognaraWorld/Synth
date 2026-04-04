@@ -28,6 +28,9 @@ class Base(DeclarativeBase):
     pass
 
 
+DEFAULT_STARTER_CREDITS = 3
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -36,7 +39,7 @@ class User(Base):
     name = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=True)  # null if OAuth only
     provider = Column(String(50), default="email")  # email, google
-    credits = Column(Integer, default=3)  # start with 3 free credits
+    credits = Column(Integer, default=DEFAULT_STARTER_CREDITS)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -66,6 +69,7 @@ class Agent(Base):
     description = Column(Text, nullable=False)
     system_prompt = Column(Text, nullable=False)
     mode = Column(Enum("general", "custom", name="agent_mode"), default="general")
+    persona_id = Column(String(64), nullable=False, default="general")
     voice = Column(String(32), nullable=False, default="female")
     response_mode = Column(String(32), nullable=False, default="name_only")
     is_primary = Column(Boolean, nullable=False, default=False)
@@ -224,6 +228,7 @@ class MeetingOverride(Base):
     meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), unique=True, nullable=False)
     description = Column(Text, nullable=True)
     mode = Column(String(32), nullable=True)
+    persona_id = Column(String(64), nullable=True)
     system_prompt = Column(Text, nullable=True)
     voice = Column(String(32), nullable=True)
     response_mode = Column(String(32), nullable=True)
