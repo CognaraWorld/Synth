@@ -37,7 +37,9 @@ def ensure_path_within_root(root: Path, candidate: Path) -> Path:
 def build_agent_upload_path(upload_root: Path, agent_id: str, filename: str) -> tuple[str, Path]:
     """Create a safe upload path for an agent-owned file."""
     safe_filename = sanitize_filename(filename)
-    display_name = Path(filename).name.strip() or safe_filename
+    # Strip both POSIX and Windows path separators for cross-platform safety
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    display_name = basename or safe_filename
 
     root = upload_root.expanduser().resolve()
     agent_dir = ensure_path_within_root(root, root / agent_id)

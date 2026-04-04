@@ -67,12 +67,12 @@ class TestBuildGeneralPrompt:
         assert isinstance(result, str)
         assert len(result) > 0
 
-    def test_general_prompt_contains_synth(self) -> None:
-        """The general prompt should reference the Synth product name."""
+    def test_general_prompt_contains_assistant(self) -> None:
+        """The general prompt should reference the assistant role."""
         from app.utils.prompt_builder import build_general_prompt
 
         result = build_general_prompt()
-        assert "Synth" in result
+        assert "assistant" in result.lower()
 
     def test_general_prompt_contains_guidelines(self) -> None:
         """The general prompt should include behavioral guidelines."""
@@ -169,6 +169,7 @@ class TestSearchClientResults:
                 client.max_results = 5
                 client.settings = mock_settings.return_value
                 client._client = mock_async_client
+                client._use_serper = False
 
                 async def _run() -> list:
                     return await client.search("Python documentation")
@@ -210,6 +211,7 @@ class TestSearchClientResults:
                 client.max_results = 5
                 client.settings = mock_settings.return_value
                 client._client = mock_async_client
+                client._use_serper = False
 
                 async def _run() -> list:
                     return await client.search("nonexistent topic xyz")
@@ -239,6 +241,7 @@ class TestSearchClientResults:
             client.max_results = 5
             client.settings = mock_settings.return_value
             client._client = mock_async_client
+            client._use_serper = False
 
             async def _run() -> list:
                 return await client.search("test query")
@@ -283,6 +286,7 @@ class TestSearchClientResults:
                 client.max_results = 5
                 client.settings = mock_settings.return_value
                 client._client = mock_async_client
+                client._use_serper = False
 
                 async def _run() -> list:
                     return await client.search("fastapi")

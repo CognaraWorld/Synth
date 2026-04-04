@@ -51,7 +51,8 @@ class RecallClient:
         """
         settings = get_settings()
         self.api_key = api_key or settings.recall_api_key
-        self.base_url = "https://api.recall.ai/api/v1"
+        region = settings.recall_region or "us-west-2"
+        self.base_url = f"https://{region}.recall.ai/api/v1"
 
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -66,12 +67,18 @@ class RecallClient:
     # Bot lifecycle
     # ------------------------------------------------------------------
 
-    async def create_bot(self, meeting_url: str, bot_name: str = "Synth") -> str:
+    async def create_bot(
+        self,
+        meeting_url: str,
+        bot_name: str = "Synth",
+        webhook_url: str | None = None,
+    ) -> str:
         """Deploy a new bot into a meeting.
 
         Args:
             meeting_url: The meeting URL (Zoom, Teams, or Meet).
             bot_name: Display name for the bot in the meeting.
+            webhook_url: Public URL for real-time transcription delivery.
 
         Returns:
             The unique bot ID assigned by Recall.ai.
@@ -79,11 +86,26 @@ class RecallClient:
         Raises:
             BotCreationError: If the API request fails.
         """
-        payload = {
+        payload: dict = {
             "meeting_url": meeting_url,
             "bot_name": bot_name,
-            "transcription_options": {"provider": "default"},
         }
+
+        if webhook_url:
+            payload["recording_config"] = {
+                "transcript": {
+                    "provider": {
+                        "meeting_captions": {},
+                    },
+                },
+                "realtime_endpoints": [
+                    {
+                        "type": "webhook",
+                        "url": webhook_url,
+                        "events": ["transcript.data"],
+                    },
+                ],
+            }
 
         try:
             response = await self._client.post("/bot", json=payload)
@@ -222,38 +244,48 @@ class RecallClient:
         except httpx.HTTPError as exc:
             logger.error("Audio stream fetch failed for bot %s: %s", bot_id, exc)
 
+    @staticmethod
+    def pcm_to_mp3_b64(audio_bytes: bytes) -> str:
+        """Convert raw PCM audio to base64-encoded MP3."""
+        import base64
+        import io
+        from pydub import AudioSegment
+
+        audio_seg = AudioSegment(
+            data=audio_bytes,
+            sample_width=2,
+            frame_rate=24000,
+            channels=1,
+        )
+        mp3_buf = io.BytesIO()
+        audio_seg.export(mp3_buf, format="mp3", bitrate="64k")
+        return base64.b64encode(mp3_buf.getvalue()).decode("ascii")
+
     async def send_audio(self, bot_id: str, audio_bytes: bytes) -> None:
         """Send audio into the meeting (bot speaks).
 
         Args:
             bot_id: The Recall.ai bot identifier.
-            audio_bytes: Raw audio bytes (PCM format) to play in the meeting.
-
-        Note:
-            This is a placeholder implementation. The production version
-            requires sending audio frames over the same WebSocket
-            connection used for receiving audio.
-
-            TODO: Replace with WebSocket-based implementation:
-            1. Use the existing WebSocket connection from get_audio_stream
-            2. Send binary frames with PCM audio data
-            3. Respect the connection's flow control / backpressure
-            4. Handle the case where the bot is muted
+            audio_bytes: Raw audio bytes (PCM int16, 24kHz mono).
         """
+        b64_audio = self.pcm_to_mp3_b64(audio_bytes)
+
         try:
             response = await self._client.post(
-                f"/bot/{bot_id}/send_audio",
-                content=audio_bytes,
-                headers={"Content-Type": "audio/raw"},
+                f"/bot/{bot_id}/output_audio",
+                json={
+                    "kind": "mp3",
+                    "b64_data": b64_audio,
+                },
             )
             response.raise_for_status()
-            logger.debug("Sent %d audio bytes to bot %s", len(audio_bytes), bot_id)
+            logger.info("Sent %d audio bytes to bot %s", len(audio_bytes), bot_id)
         except httpx.HTTPStatusError as exc:
             logger.error(
                 "Send audio failed for bot %s (HTTP %d): %s",
                 bot_id,
                 exc.response.status_code,
-                exc.response.text,
+                exc.response.text[:200],
             )
         except httpx.HTTPError as exc:
             logger.error("Send audio failed for bot %s (network): %s", bot_id, exc)
@@ -262,107 +294,46 @@ class RecallClient:
     # Meeting controls
     # ------------------------------------------------------------------
 
-    async def raise_hand(self, bot_id: str) -> None:
-        """Raise the bot's hand in the meeting.
-
-        Used as a visual indicator before the bot speaks. If the Recall.ai
-        ``raise_hand`` endpoint is not available, falls back to sending
-        a reaction emoji as a visual cue.
-
-        Args:
-            bot_id: The Recall.ai bot identifier.
-        """
-        try:
-            # Try the dedicated raise_hand endpoint first
-            response = await self._client.post(f"/bot/{bot_id}/raise_hand")
-            response.raise_for_status()
-            logger.debug("Raised hand for bot %s", bot_id)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                # Endpoint doesn't exist — fall back to reaction/emoji
-                logger.debug(
-                    "raise_hand endpoint not found for bot %s, "
-                    "trying reaction fallback",
-                    bot_id,
-                )
-                await self._send_reaction(bot_id, "raise_hand")
-            else:
-                logger.warning(
-                    "raise_hand failed for bot %s (HTTP %d): %s",
-                    bot_id,
-                    exc.response.status_code,
-                    exc.response.text,
-                )
-        except httpx.HTTPError as exc:
-            logger.warning("raise_hand failed for bot %s (network): %s", bot_id, exc)
-
-    async def _send_reaction(self, bot_id: str, reaction: str) -> None:
-        """Send a reaction emoji via the bot.
-
-        Fallback mechanism when a dedicated endpoint (e.g. raise_hand)
-        is not available in the Recall.ai API.
-
-        Args:
-            bot_id: The Recall.ai bot identifier.
-            reaction: Reaction type string (e.g. "raise_hand", "thumbs_up").
-        """
+    async def send_audio_b64(self, bot_id: str, b64_audio: str) -> None:
+        """Send pre-encoded base64 MP3 audio into the meeting."""
         try:
             response = await self._client.post(
-                f"/bot/{bot_id}/react",
-                json={"reaction": reaction},
+                f"/bot/{bot_id}/output_audio",
+                json={"kind": "mp3", "b64_data": b64_audio},
             )
             response.raise_for_status()
-            logger.debug("Sent reaction %r for bot %s", reaction, bot_id)
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "Reaction %r failed for bot %s: %s", reaction, bot_id, exc
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Send audio failed for bot %s (HTTP %d): %s",
+                bot_id, exc.response.status_code, exc.response.text[:200],
             )
+        except httpx.HTTPError as exc:
+            logger.error("Send audio failed for bot %s (network): %s", bot_id, exc)
+
+    async def stop_audio(self, bot_id: str) -> None:
+        """Stop any currently playing audio output immediately."""
+        try:
+            response = await self._client.post(f"/bot/{bot_id}/stop_output_audio")
+            response.raise_for_status()
+            logger.info("Stopped audio output for bot %s", bot_id)
+        except httpx.HTTPStatusError as exc:
+            # 400/404 = nothing playing or bot not found — non-fatal
+            if exc.response.status_code not in (400, 404):
+                logger.error("Stop audio failed for bot %s: %s", bot_id, exc.response.text[:200])
+        except httpx.HTTPError as exc:
+            logger.error("Stop audio failed for bot %s: %s", bot_id, exc)
+
+    async def raise_hand(self, bot_id: str) -> None:
+        """Raise the bot's hand. Skipped — not supported in all regions."""
+        logger.debug("Raise hand (skipped) for bot %s", bot_id)
 
     async def mute(self, bot_id: str) -> None:
-        """Mute the bot's microphone.
-
-        Args:
-            bot_id: The Recall.ai bot identifier.
-        """
-        try:
-            response = await self._client.post(
-                f"/bot/{bot_id}/output_audio",
-                json={"muted": True},
-            )
-            response.raise_for_status()
-            logger.debug("Muted bot %s", bot_id)
-        except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "Mute failed for bot %s (HTTP %d): %s",
-                bot_id,
-                exc.response.status_code,
-                exc.response.text,
-            )
-        except httpx.HTTPError as exc:
-            logger.warning("Mute failed for bot %s (network): %s", bot_id, exc)
+        """Mute the bot. No-op — bot only speaks via output_audio calls."""
+        logger.debug("Mute (no-op) for bot %s", bot_id)
 
     async def unmute(self, bot_id: str) -> None:
-        """Unmute the bot's microphone.
-
-        Args:
-            bot_id: The Recall.ai bot identifier.
-        """
-        try:
-            response = await self._client.post(
-                f"/bot/{bot_id}/output_audio",
-                json={"muted": False},
-            )
-            response.raise_for_status()
-            logger.debug("Unmuted bot %s", bot_id)
-        except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "Unmute failed for bot %s (HTTP %d): %s",
-                bot_id,
-                exc.response.status_code,
-                exc.response.text,
-            )
-        except httpx.HTTPError as exc:
-            logger.warning("Unmute failed for bot %s (network): %s", bot_id, exc)
+        """Unmute the bot. No-op — bot only speaks via output_audio calls."""
+        logger.debug("Unmute (no-op) for bot %s", bot_id)
 
     # ------------------------------------------------------------------
     # Cleanup

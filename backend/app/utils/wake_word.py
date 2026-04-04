@@ -18,7 +18,8 @@ def _build_pattern(wake_word: str) -> re.Pattern:
     """Build a regex pattern for the given wake word.
 
     Supports "hey <name>" and bare "<name>" patterns with optional
-    punctuation between words. Cached for performance.
+    punctuation between words. Includes common phonetic misheard
+    variants from meeting caption STT systems.
 
     Args:
         wake_word: The trigger phrase (e.g. "hey synth").
@@ -27,8 +28,36 @@ def _build_pattern(wake_word: str) -> re.Pattern:
         Compiled regex pattern.
     """
     parts = wake_word.strip().lower().split()
+    if len(parts) == 2 and parts[0] == "hey" and parts[1] == "synth":
+        # "hey synth" — include phonetic variants that caption STT produces.
+        # Prefix is REQUIRED to avoid false positives on bare words like
+        # "since", "said", "system" in normal speech.
+        prefix = r"(?:hey|he|hay|a|they|hi|both|but)[,.\s]+"
+        name = (
+            r"(?:synth|sint|sent|since|sink|sync|sins|sinth|cinth|"
+            r"synths|sense|said|sit|assist|assistant|listen|"
+            r"tasted|system|cyst|sixth|sis|says)"
+        )
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
+    if len(parts) == 2 and parts[0] == "hey" and parts[1] == "assistant":
+        # "hey assistant" — include phonetic variants that meeting STT
+        # commonly produces. Prefix is REQUIRED to prevent false positives
+        # on bare "assistant" or "assist" in normal speech.
+        prefix = r"(?:hey|he|hay|a|they|hi|both|but)[,.\s]+"
+        name = (
+            r"(?:assistant|assistance|assisted|assistent|"
+            r"a\s*sistant|a\s*system|a\s*distance|"
+            r"assists|assess|assessing|assisting|"
+            r"insisted|instant|persistent|assist)"
+        )
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
     if len(parts) == 2 and parts[0] == "hey":
-        # "hey synth" → matches "hey synth", "hey, synth", or just "synth"
         name = re.escape(parts[1])
         return re.compile(
             rf"\b(?:hey[,\s]*)?{name}\b",
@@ -41,7 +70,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
 
 def detect(
     transcript_text: str,
-    wake_word: str = "hey synth",
+    wake_word: str = "hey assistant",
 ) -> tuple[bool, str]:
     """Detect the wake word in transcript text and extract the question.
 
