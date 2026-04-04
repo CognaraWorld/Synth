@@ -35,7 +35,7 @@ class ContextManager:
         rag_pipeline: The RAG retrieval pipeline (``None`` until set).
     """
 
-    def __init__(self, max_context_tokens: int = 8000) -> None:
+    def __init__(self, max_context_tokens: int = 16000) -> None:
         """Initialize the context manager and its sub-components.
 
         Args:

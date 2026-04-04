@@ -111,24 +111,36 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         return
 
     # Verify the authenticated user owns this session (prevent IDOR)
+    # Fail-closed: reject if session not found or ownership can't be verified
     engine = get_engine()
     session_obj = engine.sessions.get(session_id)
-    if session_obj and session_obj.bot_id:
+    if not session_obj:
+        await websocket.close(code=4004, reason="Session not found")
+        return
+
+    if session_obj.bot_id:
         try:
+            from uuid import UUID as _UUID
             from sqlalchemy import select
             from app.models.database import Meeting, AsyncSessionLocal
+            parsed_uid = _UUID(user_id)
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
                     select(Meeting).where(
                         Meeting.bot_id == session_obj.bot_id,
-                        Meeting.user_id == user_id,
+                        Meeting.user_id == parsed_uid,
                     )
                 )
                 if not result.scalar_one_or_none():
                     await websocket.close(code=4003, reason="Access denied")
                     return
+        except ValueError:
+            await websocket.close(code=4001, reason="Invalid user identity")
+            return
         except Exception as exc:
             logger.warning("WebSocket ownership check failed: %s", exc)
+            await websocket.close(code=4003, reason="Access denied")
+            return
 
     await websocket.accept()
     logger.info("WebSocket connected for session %s (user %s)", session_id, user_id)

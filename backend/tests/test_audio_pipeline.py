@@ -36,10 +36,10 @@ class TestWakeWordDetection:
     """Tests for ``app.utils.wake_word.detect``."""
 
     def test_wake_word_basic(self) -> None:
-        """Standard 'Hey Assistant, <question>' pattern extracts the question."""
+        """Standard 'Nova, <question>' pattern extracts the question."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey Assistant, what is the revenue?")
+        detected, question = detect("Nova, what is the revenue?")
         assert detected is True
         assert question == "what is the revenue?"
 
@@ -47,22 +47,22 @@ class TestWakeWordDetection:
         """Detection is case-insensitive across the whole wake phrase."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("hey assistant tell me")
+        detected, question = detect("nova tell me")
         assert detected is True
         assert question == "tell me"
 
     def test_wake_word_just_name(self) -> None:
-        """Bare 'Assistant' without prefix should NOT trigger (prevents false positives)."""
+        """'innovation' should NOT trigger (prevents false positives)."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Assistant, what time is it?")
+        detected, question = detect("The innovation was great")
         assert detected is False
 
     def test_wake_word_phonetic_variant(self) -> None:
-        """STT mishearings like 'hey assistance' should still trigger."""
+        """STT mishearings like 'nora' should still trigger."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey assistance, what time is it?")
+        detected, question = detect("Nora, what time is it?")
         assert detected is True
         assert question == "what time is it?"
 
@@ -78,15 +78,15 @@ class TestWakeWordDetection:
         """Wake word at the end of input yields an empty question string."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey Assistant")
+        detected, question = detect("Nova")
         assert detected is True
         assert question == ""
 
     def test_wake_word_with_comma(self) -> None:
-        """Comma between 'Hey,' and 'Assistant,' is handled gracefully."""
+        """'Hey Nova' with prefix is handled gracefully."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey, Assistant, what's up?")
+        detected, question = detect("Hey Nova, what's up?")
         assert detected is True
         assert question == "what's up?"
 
@@ -240,13 +240,10 @@ class TestFillerManager:
                 assert len(phrase) > 0
 
     def test_filler_phrases_are_unique(self) -> None:
-        """All filler phrases across all categories are distinct."""
-        from app.utils.filler import CATEGORY_FILLERS
+        """All filler phrases within the universal set are distinct."""
+        from app.utils.filler import _UNIVERSAL_FILLERS
 
-        all_phrases = []
-        for phrases in CATEGORY_FILLERS.values():
-            all_phrases.extend(phrases)
-        assert len(all_phrases) == len(set(all_phrases))
+        assert len(_UNIVERSAL_FILLERS) == len(set(_UNIVERSAL_FILLERS))
 
     def test_filler_manager_attributes_after_init(self) -> None:
         """A FillerManager has the expected attributes after construction."""

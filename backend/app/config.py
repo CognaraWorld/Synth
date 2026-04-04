@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     webhook_secret: str = ""
 
     # CORS
-    cors_origins: str = "http://localhost:3000,http://192.168.0.12:3000,http://192.168.0.6:3000"
+    cors_origins: str = "http://localhost:3000"
 
     # Gemini (fast path LLM)
     gemini_api_key: str = ""

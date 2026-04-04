@@ -79,7 +79,13 @@ def _preload_tts():
         engine = get_bot_engine()
         if not engine._tts:
             logger.info("Pre-loading TTS model at startup...")
-            engine._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
+            default_voice = "am_michael"  # default persona voice
+            try:
+                from app.utils.bot_profiles import get_persona_tts_voice
+                default_voice = get_persona_tts_voice("general")
+            except ImportError:
+                pass
+            engine._tts = TextToSpeech(voice=default_voice, sample_rate=24000, speed=1.1)
             engine._filler_manager.preload(engine._tts)
             engine._models_loaded = True
             logger.info("TTS model and filler cache ready")

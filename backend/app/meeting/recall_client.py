@@ -106,7 +106,7 @@ class RecallClient:
                             "smart_format": "true",
                             "punctuate": "true",
                             "diarize": "true",
-                            "keywords": "Hey Assistant:2",
+                            "keywords": "Nova:5,Hey Nova:5,nova:5",
                             "utterances": "true",
                             "utterance_end_ms": "700",
                         },

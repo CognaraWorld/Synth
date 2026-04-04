@@ -19,44 +19,18 @@ if TYPE_CHECKING:
     from app.core.tts import TextToSpeech
 
 
+_UNIVERSAL_FILLERS: list[str] = [
+    "Sure.",
+    "One sec.",
+    "Hmm.",
+    "Yeah.",
+    "Okay.",
+    "Got it.",
+    "Let me check.",
+]
+
 CATEGORY_FILLERS: dict[QueryCategory, list[str]] = {
-    QueryCategory.MEETING_RECAP: [
-        "Let me review what was discussed.",
-        "One sec, pulling up the conversation.",
-        "Sure, let me look back at that.",
-        "Give me a moment to check the notes.",
-    ],
-    QueryCategory.WEB_SEARCH: [
-        "Good question, let me look that up.",
-        "One moment, checking on that.",
-        "Sure, let me find the latest on that.",
-        "Let me pull up some info on that.",
-    ],
-    QueryCategory.TECHNICAL: [
-        "Interesting, let me think through that.",
-        "Good question, give me a moment.",
-        "Let me work through that real quick.",
-        "One sec, thinking about that.",
-    ],
-    QueryCategory.OPINION: [
-        "That's a good one, let me think.",
-        "Hmm, let me consider that for a second.",
-        "Interesting question, one moment.",
-        "Let me think about the best approach.",
-    ],
-    QueryCategory.DOCUMENT: [
-        "Let me check the documents.",
-        "One sec, looking through the files.",
-        "Sure, let me reference that.",
-        "Give me a moment to pull that up.",
-    ],
-    QueryCategory.GENERAL: [
-        "Sure, one moment.",
-        "Let me look into that.",
-        "Good question, give me a sec.",
-        "Hmm, one sec.",
-        "Let me check on that.",
-    ],
+    cat: _UNIVERSAL_FILLERS for cat in QueryCategory
 }
 
 

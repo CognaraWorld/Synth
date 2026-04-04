@@ -78,8 +78,9 @@ class LLMClient:
                 start = time.time()
                 response = self.gemini_client.models.generate_content(
                     model=self._gemini_model,
-                    contents=f"{prompt}\n\n{user_content}",
+                    contents=user_content,
                     config={
+                        "system_instruction": prompt,
                         "max_output_tokens": 1024,
                         "temperature": 0.7,
                     },
@@ -112,8 +113,9 @@ class LLMClient:
                     None,
                     lambda: self.gemini_client.models.generate_content(
                         model=self._gemini_model,
-                        contents=f"{prompt}\n\n{user_content}",
+                        contents=user_content,
                         config={
+                            "system_instruction": prompt,
                             "max_output_tokens": 1024,
                             "temperature": 0.7,
                         },

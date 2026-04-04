@@ -25,7 +25,7 @@ from app.meeting.recall_client import RecallClient, RecallClientError
 from app.meeting.session import MeetingSession, SessionState
 from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-from app.utils.query_router import needs_web_search
+from app.utils.query_router import classify_query
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
 from app.utils.wake_word import detect as detect_wake_word
 
@@ -495,7 +495,7 @@ class BotEngine:
         )
 
         # Step 4: Check for wake word (configurable per agent)
-        wake_word = session.agent_config.get("wake_word", "hey assistant")
+        wake_word = session.agent_config.get("wake_word", "nova")
         wake_detected, question = detect_wake_word(transcript_text, wake_word=wake_word)
         if not wake_detected or not question:
             return None
@@ -664,7 +664,7 @@ class BotEngine:
 
         # Check for wake word OR follow-up window
         sid = session.session_id
-        wake_word = session.agent_config.get("wake_word", "hey assistant")
+        wake_word = session.agent_config.get("wake_word", "nova")
         wake_detected, question = detect_wake_word(text, wake_word=wake_word)
         is_question = False
 
@@ -904,27 +904,20 @@ class BotEngine:
                         filler_duration = len(filler_pcm) / 48000
             filler_sent_at = time.time()
 
-            # Assemble context + web search in parallel
+            # Assemble context + web search in parallel (search runs speculatively)
             context_task = asyncio.get_running_loop().run_in_executor(
                 None,
                 session.context_manager.assemble_context,
                 question,
                 session.session_id,
             )
-            search_task = None
-            if needs_web_search(question):
-                search_task = asyncio.create_task(
-                    self._search_client.search_formatted(question)
-                )
+            search_task = asyncio.create_task(
+                self._search_client.search_formatted(question)
+            )
 
             context = await context_task
 
-            if search_task:
-                search_results = await search_task
-                context = f"{context}\n\n=== WEB SEARCH RESULTS ===\n{search_results}"
-
             # Include stored insights/corrections ONLY when the user asks about them.
-            # Never volunteer corrections unprompted — only surface when relevant.
             if session.insights:
                 q_lower = question.lower()
                 if any(trigger in q_lower for trigger in _CORRECTION_TRIGGERS):
@@ -939,7 +932,18 @@ class BotEngine:
             if mood and mood in ("positive", "negative", "neutral"):
                 context = f"{context}\n\n(Speaker mood: {mood}. Match your tone accordingly.)"
 
-            # Query LLM → TTS full response → send as one chunk
+            # Attach search results if available (ran in parallel, adds no latency)
+            try:
+                search_results = await search_task
+                if search_results and search_results.strip():
+                    context = (
+                        f"{context}\n\n=== WEB SEARCH RESULTS (use only if relevant to the question) ===\n"
+                        f"{search_results}"
+                    )
+            except Exception as exc:
+                logger.debug("Speculative search failed (non-blocking): %s", exc)
+
+            # Single LLM call with full context + search results
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
 
@@ -1035,13 +1039,13 @@ class BotEngine:
             # (if the person just interrupted to talk normally, don't respond)
             queued = self._queued_question.pop(session.session_id, None)
             if queued:
-                wake_word_cfg = session.agent_config.get("wake_word", "hey assistant")
+                wake_word_cfg = session.agent_config.get("wake_word", "nova")
                 wake_detected, q = detect_wake_word(queued["question"], wake_word=wake_word_cfg)
                 if wake_detected and q:
                     logger.info("Processing queued question for session %s", session.session_id[:8])
                     # Route through _process_pending_question to acquire the processing lock
                     self._pending_question[session.session_id] = {
-                        "question": f"hey assistant {q}",  # re-add wake word for detection
+                        "question": f"nova {q}",  # re-add wake word for detection
                         "speaker": queued.get("speaker", ""),
                         "timestamp": time.time(),
                     }

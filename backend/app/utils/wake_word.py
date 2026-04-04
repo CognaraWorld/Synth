@@ -58,6 +58,14 @@ def _build_pattern(wake_word: str) -> re.Pattern:
             rf"\b{prefix}{name}\b",
             re.IGNORECASE,
         )
+    if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
+        # "nova" or "hey nova" — accepts both with phonetic variants.
+        prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
+        name = r"(?:nova|over|no\s*va|nora|noah|mova|rover)"
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
     if len(parts) == 2 and parts[0] == "hey":
         name = re.escape(parts[1])
         return re.compile(
@@ -71,7 +79,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
 
 def detect(
     transcript_text: str,
-    wake_word: str = "hey assistant",
+    wake_word: str = "nova",
 ) -> tuple[bool, str]:
     """Detect the wake word in transcript text and extract the question.
 
@@ -95,14 +103,17 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
-    # Fast path: exact case-insensitive match (Deepgram sends clean text)
+    # Fast path: exact case-insensitive match with word boundary check
     ww_lower = wake_word.strip().lower()
     text_lower = transcript_text.lower()
     exact_pos = text_lower.find(ww_lower)
     if exact_pos != -1:
-        after = transcript_text[exact_pos + len(ww_lower):]
-        question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
-        return (True, question)
+        # Verify word boundary: char after wake word must be non-alphanumeric
+        end_pos = exact_pos + len(ww_lower)
+        if end_pos >= len(text_lower) or not text_lower[end_pos].isalnum():
+            after = transcript_text[end_pos:]
+            question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+            return (True, question)
 
     # Fuzzy path: phonetic variants for STT mishearings
     pattern = _build_pattern(wake_word)

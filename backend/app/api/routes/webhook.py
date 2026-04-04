@@ -223,12 +223,14 @@ async def _handle_transcription(data: dict) -> None:
                         return
 
         # Quality filter: reject very short fragments that are likely noise
+        # But always allow wake word phrases through
         words = text.split()
         if len(words) < 3:
-            # Allow short phrases only if they're common speech ("yes", "no", "okay")
+            text_lower = text.lower().strip(" .,!?")
             common_short = {"yes", "no", "yeah", "okay", "ok", "sure", "right",
                            "thanks", "thank you", "stop", "enough", "got it"}
-            if text.lower().strip(" .,!?") not in common_short:
+            wake_words = {"nova", "hey nova", "nora", "hey nora", "noah", "hey noah"}
+            if text_lower not in common_short and text_lower not in wake_words:
                 logger.debug("Dropping short fragment: %s: %s", speaker, text)
                 return
 
@@ -314,14 +316,13 @@ async def _send_greeting(bot_id: str) -> None:
         session_id = engine._sessions_by_bot_id.get(bot_id)
         session = engine.sessions.get(session_id) if session_id else None
         agent_name = "your AI assistant"
-        wake_phrase = "Hey Assistant"
+        wake_phrase = "Hey Nova"
         if session:
             name = session.agent_config.get("agent_name", "")
             if name:
                 agent_name = name
-            ww = session.agent_config.get("wake_word", "")
-            if ww:
-                wake_phrase = ww.title()
+            ww = session.agent_config.get("wake_word", "nova")
+            wake_phrase = ww.title()
 
         greeting = (
             f"Hi everyone, I'm {agent_name} for this meeting. "
