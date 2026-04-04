@@ -1,7 +1,28 @@
 import axios from "axios";
 
+function resolveApiBaseUrl(): string {
+  const fallbackUrl = "http://localhost:8000/api";
+  const envUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (!envUrl) return fallbackUrl;
+
+  const withoutTrailingSlash = envUrl.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(withoutTrailingSlash);
+    const normalizedPath = (parsed.pathname || "/").replace(/\/+$/, "");
+    const pathWithApi =
+      normalizedPath === "" || normalizedPath === "/"
+        ? "/api"
+        : normalizedPath.endsWith("/api")
+          ? normalizedPath
+          : `${normalizedPath}/api`;
+    return `${parsed.origin}${pathWithApi}`;
+  } catch {
+    return withoutTrailingSlash;
+  }
+}
+
 const api = axios.create({
-  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api",
+  baseURL: resolveApiBaseUrl(),
   headers: {
     "Content-Type": "application/json",
   },
@@ -39,7 +60,12 @@ export async function register(
   email: string,
   password: string
 ) {
-  const { data } = await api.post("/auth/register", { name, email, password });
+  const { data } = await api.post("/auth/register", {
+    name,
+    email,
+    password,
+    provider: "email",
+  });
   return data;
 }
 
@@ -49,6 +75,13 @@ export async function getMe() {
 }
 
 // Agents
+export type PersonaId =
+  | "general"
+  | "strategist"
+  | "analyst"
+  | "challenger"
+  | "facilitator";
+
 export async function getAgents() {
   const { data } = await api.get("/agents");
   return data;
@@ -62,7 +95,9 @@ export async function getAgent(id: string) {
 export async function createAgent(agent: {
   name: string;
   description: string;
-  mode: "general" | "custom";
+  mode: "general";
+  persona_id?: PersonaId;
+  response_mode?: "name_only" | "proactive";
 }) {
   const { data } = await api.post("/agents", agent);
   return data;

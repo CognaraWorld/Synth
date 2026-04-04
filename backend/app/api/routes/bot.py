@@ -4,7 +4,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.auth import get_current_user
 from app.models.database import Agent, User, get_db
 from app.models.schemas import BotProfileResponse, BotProfileUpsert
-from app.utils.bot_profiles import build_system_prompt, get_effective_primary_agent, mark_primary_agent
+from app.utils.bot_profiles import (
+    build_system_prompt,
+    get_effective_primary_agent,
+    get_persona_voice_label,
+    mark_primary_agent,
+)
+from app.utils.prompt_builder import resolve_persona_id
 
 router = APIRouter(prefix="/bot", tags=["bot"])
 
@@ -27,9 +33,12 @@ async def upsert_bot_profile(
     db: AsyncSession = Depends(get_db),
 ):
     agent = await get_effective_primary_agent(db, current_user.id)
+    persona_id = resolve_persona_id(profile_data.mode, profile_data.persona_id)
+    mode = "general"
     system_prompt = profile_data.system_prompt or build_system_prompt(
-        profile_data.mode,
+        mode,
         profile_data.description,
+        persona_id,
     )
 
     if agent is None:
@@ -38,8 +47,9 @@ async def upsert_bot_profile(
             name=profile_data.name,
             description=profile_data.description,
             system_prompt=system_prompt,
-            mode=profile_data.mode,
-            voice=profile_data.voice,
+            mode=mode,
+            persona_id=persona_id,
+            voice=get_persona_voice_label(persona_id),
             response_mode=profile_data.response_mode,
             is_primary=True,
         )
@@ -48,8 +58,9 @@ async def upsert_bot_profile(
         agent.name = profile_data.name
         agent.description = profile_data.description
         agent.system_prompt = system_prompt
-        agent.mode = profile_data.mode
-        agent.voice = profile_data.voice
+        agent.mode = mode
+        agent.persona_id = persona_id
+        agent.voice = get_persona_voice_label(persona_id)
         agent.response_mode = profile_data.response_mode
         agent.is_primary = True
 

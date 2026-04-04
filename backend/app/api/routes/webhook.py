@@ -312,17 +312,21 @@ async def _send_greeting(bot_id: str) -> None:
         # Use centralized model initialization (thread-safe, double-checked)
         await engine._lazy_load_models()
 
-        # Pull agent name and wake word from the session config
+        # Pull agent name, wake word, and persona from the session config
         session_id = engine._sessions_by_bot_id.get(bot_id)
         session = engine.sessions.get(session_id) if session_id else None
         agent_name = "your AI assistant"
         wake_phrase = "Hey Nova"
+        persona_id = "general"
         if session:
             name = session.agent_config.get("agent_name", "")
             if name:
                 agent_name = name
             ww = session.agent_config.get("wake_word", "nova")
             wake_phrase = ww.title()
+            persona_id = session.agent_config.get("persona_id", "general")
+
+        engine._ensure_tts_voice_for_persona(persona_id)
 
         greeting = (
             f"Hi everyone, I'm {agent_name} for this meeting. "
