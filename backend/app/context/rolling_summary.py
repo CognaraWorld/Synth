@@ -11,7 +11,11 @@ Phase 3 implementation.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class RollingSummary:
@@ -21,13 +25,17 @@ class RollingSummary:
     transcript chunk is received. Uses the LLM to compress and
     merge new information into the existing summary.
 
+    Thread-safe: all public methods acquire an internal lock for
+    shared state. The LLM call itself runs outside the lock to
+    avoid blocking other callers.
+
     Attributes:
         summary: The current accumulated summary text.
         update_interval_chars: Minimum characters before triggering
             a summary update.
     """
 
-    def __init__(self, update_interval_chars: int = 500) -> None:
+    def __init__(self, update_interval_chars: int = 300) -> None:
         """Initialize the rolling summary.
 
         Args:
@@ -39,6 +47,7 @@ class RollingSummary:
         self.update_interval_chars = update_interval_chars
         self._pending_text: str = ""
         self._llm_client: Any | None = None
+        self._lock = threading.Lock()
 
     def set_llm_client(self, llm_client: Any) -> None:
         """Inject the LLM client used for summarization calls.
@@ -54,38 +63,50 @@ class RollingSummary:
 
         Accumulates text until the update interval is reached, then
         calls the LLM to merge new content into the existing summary.
+        The LLM call runs outside the lock to avoid blocking.
 
         Args:
             new_transcript_chunk: New transcript text to incorporate.
         """
-        self._pending_text += new_transcript_chunk
+        with self._lock:
+            self._pending_text += new_transcript_chunk
+            if (
+                len(self._pending_text) < self.update_interval_chars
+                or self._llm_client is None
+            ):
+                return
+            pending = self._pending_text
+            current_summary = self.summary
 
-        if (
-            len(self._pending_text) >= self.update_interval_chars
-            and self._llm_client is not None
-        ):
-            prompt = (
-                "You are summarizing a meeting. Here is the current summary:\n"
-                f"{self.summary}\n\n"
-                "New transcript:\n"
-                f"{self._pending_text}\n\n"
-                "Update the summary to include the key points from the new "
-                "transcript. Keep it concise (under 500 words). Focus on "
-                "decisions, action items, and important topics discussed."
-            )
+        # LLM call OUTSIDE the lock (it's slow)
+        prompt = (
+            "You are summarizing a meeting. Here is the current summary:\n"
+            f"{current_summary}\n\n"
+            "New transcript:\n"
+            f"{pending}\n\n"
+            "Update the summary to include the key points from the new "
+            "transcript. Keep it concise (under 500 words). Focus on "
+            "decisions, action items, and important topics discussed."
+        )
 
-            try:
-                # Support both sync and async LLM clients gracefully.
-                result = self._llm_client.query(context="", question=prompt)
-                if asyncio.iscoroutine(result):
-                    result = await result
+        try:
+            # Support both sync and async LLM clients gracefully.
+            result = self._llm_client.query(context="", question=prompt)
+            if asyncio.iscoroutine(result):
+                result = await result
 
-                if result and result.strip():
+            if result and result.strip():
+                with self._lock:
                     self.summary = result
-                self._pending_text = ""
-            except Exception:
-                # LLM failed — keep pending text for next attempt
-                pass
+                    # Only remove the text we actually summarized, preserving
+                    # any new text that arrived during the LLM call
+                    if self._pending_text.startswith(pending):
+                        self._pending_text = self._pending_text[len(pending):]
+                    else:
+                        self._pending_text = ""
+        except Exception as exc:
+            logger.warning("Rolling summary update failed: %s", exc)
+            # Don't clear _pending_text — retry next time
 
     def get_summary(self) -> str:
         """Return the current rolling summary.
@@ -98,13 +119,22 @@ class RollingSummary:
             addendum. Returns empty string if no transcript has been
             processed yet and no pending text exists.
         """
-        if self._pending_text:
-            return (
-                self.summary
-                + "\n\n[Recent, not yet summarized]: "
-                + self._pending_text
-            )
-        return self.summary
+        with self._lock:
+            if self._pending_text:
+                return (
+                    self.summary
+                    + "\n\n[Recent, not yet summarized]: "
+                    + self._pending_text
+                )
+            return self.summary
+
+    def add_pending(self, text: str) -> None:
+        """Append text to the pending buffer (thread-safe, synchronous).
+
+        Used by callers that cannot run async update() (e.g., from sync contexts).
+        """
+        with self._lock:
+            self._pending_text += text
 
     def get_pending_length(self) -> int:
         """Return the character length of text awaiting summarization.
@@ -112,12 +142,14 @@ class RollingSummary:
         Returns:
             Number of characters in the pending buffer.
         """
-        return len(self._pending_text)
+        with self._lock:
+            return len(self._pending_text)
 
     def reset(self) -> None:
         """Clear the summary and all pending text.
 
         Used when resetting between sessions or when the meeting ends.
         """
-        self.summary = ""
-        self._pending_text = ""
+        with self._lock:
+            self.summary = ""
+            self._pending_text = ""

@@ -121,12 +121,51 @@ def classify_query(question: str) -> QueryCategory:
     return QueryCategory.GENERAL
 
 
+_WEB_SEARCH_KEYWORDS: tuple[str, ...] = (
+    "price",
+    "cost",
+    "weather",
+    "news",
+    "latest",
+    "current",
+    "today",
+    "stock",
+    "market",
+    "crypto",
+    "bitcoin",
+    "search",
+    "google",
+    "look up",
+    "find out",
+    "what is the",
+    "who is",
+    "when did",
+    "where is",
+    "how much",
+    "how many",
+    "statistics",
+    "data on",
+    "trending",
+    "update on",
+    "recent",
+    "score",
+    "result",
+    "rate",
+    "convert",
+    "exchange",
+    "definition",
+    "meaning of",
+    "capital of",
+    "population",
+)
+
+
 def needs_web_search(question: str) -> bool:
     """Determine whether a question likely needs live web data.
 
-    Default is to SEARCH — only skip for questions clearly about
-    the meeting itself (what was said, summaries, etc). This ensures
-    the bot always has fresh data for factual questions.
+    Only searches when the question contains keywords indicating
+    external data is needed (prices, news, facts, lookups).
+    Skips search for meeting content, opinions, and general chat.
 
     Args:
         question: The user's question text.
@@ -136,10 +175,14 @@ def needs_web_search(question: str) -> bool:
     """
     question_lower = question.lower()
 
-    # Skip search for questions clearly about meeting content
+    # Never search for meeting content questions
     for keyword in _MEETING_ONLY_KEYWORDS:
         if keyword in question_lower:
             return False
 
-    # Search for everything else — prices, facts, coding, general knowledge
-    return True
+    # Only search when question explicitly needs external data
+    for keyword in _WEB_SEARCH_KEYWORDS:
+        if keyword in question_lower:
+            return True
+
+    return False

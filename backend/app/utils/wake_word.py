@@ -46,13 +46,22 @@ def _build_pattern(wake_word: str) -> re.Pattern:
         # "hey assistant" — include phonetic variants that meeting STT
         # commonly produces. Prefix is REQUIRED to prevent false positives
         # on bare "assistant" or "assist" in normal speech.
-        prefix = r"(?:hey|he|hay|a|they|hi|both|but)[,.\s]+"
+        prefix = r"(?:hey|he|hay|a|as|they|hi|both|but)[,.\s]+"
         name = (
             r"(?:assistant|assistance|assisted|assistent|"
             r"a\s*sistant|a\s*system|a\s*distance|"
-            r"assists|assess|assessing|assisting|"
-            r"insisted|instant|persistent|assist)"
+            r"assists?|assess|assessing|assisting|"
+            r"assist\s*ten|assist\s*and|assist\s*in|"
+            r"insisted|instant|persistent)"
         )
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
+    if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
+        # "nova" or "hey nova" — accepts both with phonetic variants.
+        prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
+        name = r"(?:nova|over|no\s*va|nora|noah|mova|rover)"
         return re.compile(
             rf"\b{prefix}{name}\b",
             re.IGNORECASE,
@@ -70,7 +79,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
 
 def detect(
     transcript_text: str,
-    wake_word: str = "hey assistant",
+    wake_word: str = "nova",
 ) -> tuple[bool, str]:
     """Detect the wake word in transcript text and extract the question.
 
@@ -94,6 +103,19 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
+    # Fast path: exact case-insensitive match with word boundary check
+    ww_lower = wake_word.strip().lower()
+    text_lower = transcript_text.lower()
+    exact_pos = text_lower.find(ww_lower)
+    if exact_pos != -1:
+        # Verify word boundary: char after wake word must be non-alphanumeric
+        end_pos = exact_pos + len(ww_lower)
+        if end_pos >= len(text_lower) or not text_lower[end_pos].isalnum():
+            after = transcript_text[end_pos:]
+            question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+            return (True, question)
+
+    # Fuzzy path: phonetic variants for STT mishearings
     pattern = _build_pattern(wake_word)
     match = pattern.search(transcript_text)
     if match is None:
@@ -102,7 +124,8 @@ def detect(
     # Extract everything after the wake word match
     after = transcript_text[match.end():]
 
-    # Strip leading punctuation (commas, colons, etc.) and whitespace
-    question = re.sub(r"^[\s,;:!?\-]+", "", after).strip()
+    # Strip leading punctuation and STT artifact words (e.g. "ten" from "assist ten")
+    question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+    question = re.sub(r"^(?:ten|and|in|the)\b[\s,;:!?.\-]*", "", question, flags=re.IGNORECASE).strip()
 
     return (True, question)

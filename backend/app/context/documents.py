@@ -283,6 +283,7 @@ class DocumentProcessor:
                 {
                     "text": chunk,
                     "metadata": {
+                        "source": "document",
                         "filename": filename,
                         "chunk_index": idx,
                         "file_type": file_type_lower,

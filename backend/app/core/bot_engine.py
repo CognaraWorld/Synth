@@ -25,11 +25,32 @@ from app.meeting.recall_client import RecallClient, RecallClientError
 from app.meeting.session import MeetingSession, SessionState
 from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-from app.utils.query_router import needs_web_search
+from app.utils.query_router import classify_query
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
 from app.utils.wake_word import detect as detect_wake_word
 
 logger = logging.getLogger(__name__)
+
+# Module-level constants for phrase matching
+_STOP_PHRASES = (
+    "thank you", "thanks", "that's enough", "stop", "okay stop",
+    "ok stop", "shut up", "enough", "got it", "okay got it",
+    "ok got it", "that's fine", "never mind", "nevermind",
+    "okay thanks", "ok thanks", "thank you assistant",
+)
+
+_CORRECTION_TRIGGERS = (
+    "correct", "wrong", "accurate", "fact check", "fact-check",
+    "verify", "true", "false", "mistake", "error", "right",
+    "is that", "are you sure", "double check", "double-check",
+    "actually", "really", "correction",
+)
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Log unhandled exceptions from fire-and-forget background tasks."""
+    if not task.cancelled() and task.exception():
+        logger.error("Background task failed: %s", task.exception())
 
 
 class BotEngineError(Exception):
@@ -69,7 +90,7 @@ class BotEngine:
         self._pending_question: dict[str, dict] = {}  # session_id -> {question, speaker, timestamp}
         self._queued_question: dict[str, dict] = {}  # session_id -> question received during RESPONDING
         self._interrupted: dict[str, bool] = {}  # session_id -> True if participant interrupted bot
-        self._question_collect_time: float = 1.0  # seconds to wait for user to finish speaking
+        self._question_collect_time: float = 0.5  # seconds to wait for user to finish speaking
         self._followup_window: float = 8.0  # seconds after audio finishes playing to accept follow-ups
         self._cooldown_seconds: float = 0.0  # no cooldown
         self._processing_lock: dict[str, asyncio.Lock] = {}  # session_id -> lock
@@ -86,6 +107,7 @@ class BotEngine:
         self._stt: Any | None = None
         self._tts: Any | None = None
         self._models_loaded: bool = False
+        self._model_init_lock: asyncio.Lock = asyncio.Lock()
 
         # Per-session VAD instances (Silero VAD is stateful, cannot be shared)
         self._vad_instances: dict[str, Any] = {}
@@ -93,32 +115,59 @@ class BotEngine:
         # Per-session audio accumulators: session_id -> list of np arrays
         self._audio_buffers: dict[str, list[np.ndarray]] = {}
 
+        # Per-session sentiment tracking
+        self._last_sentiment: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Per-session tracking helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_session_tracking(self, session_id: str) -> None:
+        """Populate all per-session tracking dicts for a session.
+
+        Safe to call multiple times; only creates entries that are missing.
+        """
+        if session_id not in self._processing_lock:
+            self._processing_lock[session_id] = asyncio.Lock()
+        if session_id not in self._vad_instances:
+            self._vad_instances[session_id] = None  # created on demand
+        if session_id not in self._interrupted:
+            self._interrupted[session_id] = False
+        if session_id not in self._queued_question:
+            self._queued_question[session_id] = {}
+
     # ------------------------------------------------------------------
     # Lazy model loading
     # ------------------------------------------------------------------
 
-    def _lazy_load_models(self) -> None:
+    async def _lazy_load_models(self) -> None:
         """Initialize VAD, STT, and TTS models on first use.
 
         Called once before the first meeting join. Loads the Silero VAD,
         faster-whisper STT, and Kokoro TTS models into memory.
+
+        Uses double-checked locking to prevent concurrent first-call
+        races from loading models twice.
         """
         if self._models_loaded:
             return
+        async with self._model_init_lock:
+            if self._models_loaded:
+                return
 
-        logger.info("Loading audio processing models (first use)...")
+            logger.info("Loading audio processing models (first use)...")
 
-        from app.core.stt import SpeechToText
-        from app.core.tts import TextToSpeech
+            from app.core.stt import SpeechToText
+            from app.core.tts import TextToSpeech
 
-        self._stt = SpeechToText(model_size="large-v3", language="en", device="cpu")
-        self._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
+            self._stt = SpeechToText(model_size="large-v3", language="en", device="cpu")
+            self._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
 
-        # Pre-synthesize filler phrases now that TTS is available
-        self._filler_manager.preload(self._tts)
+            # Pre-synthesize filler phrases now that TTS is available
+            self._filler_manager.preload(self._tts)
 
-        self._models_loaded = True
-        logger.info("Audio processing models loaded successfully")
+            self._models_loaded = True
+            logger.info("Audio processing models loaded successfully")
 
     # ------------------------------------------------------------------
     # Meeting lifecycle
@@ -148,7 +197,7 @@ class BotEngine:
             BotEngineError: If bot creation or session setup fails.
         """
         # Ensure heavy models are loaded
-        self._lazy_load_models()
+        await self._lazy_load_models()
 
         # Build session
         meeting_id = meeting_link  # Use the link as the meeting identifier
@@ -213,10 +262,11 @@ class BotEngine:
             # Transition: JOINING -> LISTENING
             session.transition(SessionState.LISTENING)
 
-            # Store the session
+            # Store the session and populate all per-session tracking dicts
             self.sessions[session.session_id] = session
             self._sessions_by_bot_id[bot_id] = session.session_id
             self._audio_buffers[session.session_id] = []
+            self._ensure_session_tracking(session.session_id)
 
             # Create a dedicated VAD instance for this session
             # (Silero VAD is stateful — sharing across sessions causes
@@ -296,6 +346,7 @@ class BotEngine:
         self._queued_question.pop(session_id, None)
         self._interrupted.pop(session_id, None)
         self._processing_lock.pop(session_id, None)
+        self._last_sentiment.pop(session_id, None)
         if session.bot_id:
             self._sessions_by_bot_id.pop(session.bot_id, None)
 
@@ -444,7 +495,7 @@ class BotEngine:
         )
 
         # Step 4: Check for wake word (configurable per agent)
-        wake_word = session.agent_config.get("wake_word", "hey assistant")
+        wake_word = session.agent_config.get("wake_word", "nova")
         wake_detected, question = detect_wake_word(transcript_text, wake_word=wake_word)
         if not wake_detected or not question:
             return None
@@ -517,8 +568,8 @@ class BotEngine:
 
                 self.sessions[session.session_id] = session
                 self._sessions_by_bot_id[bot_id] = session.session_id
-                self._processing_lock[session.session_id] = asyncio.Lock()
                 self._audio_buffers[session.session_id] = []
+                self._ensure_session_tracking(session.session_id)
 
                 from app.core.vad import VoiceActivityDetector
                 self._vad_instances[session.session_id] = VoiceActivityDetector(
@@ -537,6 +588,7 @@ class BotEngine:
         bot_id: str,
         speaker: str,
         text: str,
+        sentiment: str = "",
     ) -> None:
         """Process a transcript chunk received via Recall.ai webhook.
 
@@ -548,6 +600,7 @@ class BotEngine:
             bot_id: The Recall.ai bot ID from the webhook payload.
             speaker: Name of the meeting participant who spoke.
             text: The transcribed text.
+            sentiment: Speaker sentiment from Deepgram (positive/negative/neutral).
         """
         session_id = self._sessions_by_bot_id.get(bot_id)
         session = self.sessions.get(session_id) if session_id else None
@@ -562,13 +615,10 @@ class BotEngine:
         if not session.is_active:
             return
 
-        # Detect stop phrases — user wants bot to shut up immediately
-        _STOP_PHRASES = (
-            "thank you", "thanks", "that's enough", "stop", "okay stop",
-            "ok stop", "shut up", "enough", "got it", "okay got it",
-            "ok got it", "that's fine", "never mind", "nevermind",
-            "okay thanks", "ok thanks", "thank you assistant",
-        )
+        # Safety net: ensure all per-session tracking dicts exist
+        self._ensure_session_tracking(session.session_id)
+
+        # Detect stop phrases (module-level _STOP_PHRASES)
         text_lower = text.lower().strip().rstrip(".,!?")
         is_stop = any(phrase in text_lower for phrase in _STOP_PHRASES)
 
@@ -578,7 +628,8 @@ class BotEngine:
             self._interrupted[sid] = True
             # Tell Recall.ai to stop playing audio right now
             if session.bot_id:
-                asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+                _task = asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+                _task.add_done_callback(_log_task_exception)
             # Only queue as follow-up question if it's NOT a stop phrase
             if not is_stop:
                 self._queued_question[sid] = {
@@ -591,7 +642,8 @@ class BotEngine:
 
         # Stop phrase while audio is still playing (follow-up window)
         if is_stop and session.bot_id:
-            asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+            _task = asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+            _task.add_done_callback(_log_task_exception)
             logger.info("Stop phrase detected — killed audio for session %s", session.session_id[:8])
             return
 
@@ -607,30 +659,49 @@ class BotEngine:
 
         # Background: check for verifiable claims (non-blocking)
         if contains_verifiable_claim(text):
-            asyncio.create_task(self._check_insight(session, speaker, text))
+            _task = asyncio.create_task(self._check_insight(session, speaker, text))
+            _task.add_done_callback(_log_task_exception)
 
         # Check for wake word OR follow-up window
         sid = session.session_id
-        wake_word = session.agent_config.get("wake_word", "hey assistant")
+        wake_word = session.agent_config.get("wake_word", "nova")
         wake_detected, question = detect_wake_word(text, wake_word=wake_word)
         is_question = False
 
         if wake_detected:
             clean = question.strip(" .,!?;:-") if question else ""
             self._last_speaker[sid] = speaker
+            self._last_sentiment[sid] = sentiment
             if clean:
                 is_question = True
                 question = clean
             else:
-                # Wake word detected but no question yet (e.g. "Hey Assistant."
-                # arrives as one chunk, question follows in next chunk).
-                # Mark this speaker as pending so the next transcript from them
-                # is treated as the question.
+                # Wake word detected but no question yet (e.g. "Hey Assistant.")
+                # Acknowledge immediately so the user knows the bot heard them,
+                # then wait for the actual question in the next chunk.
                 self._pending_question[sid] = {
                     "question": "",
                     "speaker": speaker,
                     "timestamp": time.time(),
                 }
+                # Send a quick acknowledgment audio
+                if session.bot_id and self._tts:
+                    try:
+                        ack_phrase = "Yes?"
+                        ack_mp3 = self._filler_manager._mp3_cache.get(ack_phrase)
+                        if not ack_mp3:
+                            # Synthesize and cache a short acknowledgment
+                            ack_audio = self._tts.synthesize(ack_phrase)
+                            if ack_audio:
+                                ack_mp3 = self._recall_client.pcm_to_mp3_b64(ack_audio)
+                                self._filler_manager._mp3_cache[ack_phrase] = ack_mp3
+                        if ack_mp3:
+                            await self._recall_client.send_audio_b64(session.bot_id, ack_mp3)
+                            logger.info("Acknowledgment sent for session %s", sid[:8])
+                    except Exception as exc:
+                        logger.debug("Ack send failed: %s", exc)
+                # Open follow-up window so the next speech is captured
+                self._last_response_time[sid] = time.time()
                 return
         else:
             # Check if this speaker has a pending question waiting for content
@@ -640,7 +711,8 @@ class BotEngine:
                 pending["question"] = text.strip()
                 pending["timestamp"] = time.time()
                 # Schedule processing after collect time
-                asyncio.create_task(self._wait_and_process(session, pending["timestamp"]))
+                _task = asyncio.create_task(self._wait_and_process(session, pending["timestamp"]))
+                _task.add_done_callback(_log_task_exception)
                 return
 
             # Follow-up window logic — accept questions without wake word
@@ -653,9 +725,26 @@ class BotEngine:
                 self._last_speaker.get(sid, "?"), text[:60],
             )
 
-            if not in_followup or len(text.split()) < 2:
+            if not in_followup or len(text.split()) < 4:
                 if not in_followup:
                     self._followup_speakers.pop(sid, None)
+                return
+
+            # Reject incoherent fragments — follow-ups must look like real sentences
+            # (contain a verb, question word, or common conversational pattern)
+            text_lower = text.lower().strip()
+            _COHERENCE_MARKERS = (
+                "what", "who", "where", "when", "why", "how",
+                "can", "could", "would", "should", "will", "do", "does", "did",
+                "is", "are", "was", "were", "have", "has",
+                "tell", "explain", "show", "give", "find", "search",
+                "yes", "no", "yeah", "okay", "sure",
+                "thank", "stop", "enough",
+                "about", "think", "know", "remember", "mean",
+                "?",
+            )
+            if not any(marker in text_lower for marker in _COHERENCE_MARKERS):
+                logger.debug("Dropping incoherent follow-up: %s", text[:60])
                 return
 
             # Accept follow-up from the original speaker or one new speaker
@@ -696,8 +785,15 @@ class BotEngine:
             "timestamp": now,
         }
 
-        # Schedule processing after collect time
-        asyncio.create_task(self._wait_and_process(session, now))
+        # If the question is already substantial (4+ words), process immediately
+        # instead of waiting for collect time — feels much more responsive
+        if len(question.split()) >= 4:
+            _task = asyncio.create_task(self._process_pending_question(session))
+            _task.add_done_callback(_log_task_exception)
+        else:
+            # Short question — wait for more words
+            _task = asyncio.create_task(self._wait_and_process(session, now))
+            _task.add_done_callback(_log_task_exception)
 
     async def _wait_and_process(self, session: MeetingSession, trigger_time: float) -> None:
         """Wait for question collection time, then process if no new input arrived."""
@@ -716,7 +812,11 @@ class BotEngine:
             await self._process_pending_question(session)
 
     async def _process_pending_question(self, session: MeetingSession) -> None:
-        """Process a fully collected question."""
+        """Process a fully collected question.
+
+        Acquires the per-session processing lock to prevent concurrent
+        question handling for the same session.
+        """
         sid = session.session_id
         pending = self._pending_question.pop(sid, None)
         if not pending:
@@ -729,14 +829,17 @@ class BotEngine:
 
         logger.warning("QUESTION session=%s speaker=%s question=%s", sid[:8], speaker, question)
 
-        # Load TTS lazily if not loaded
-        if not self._models_loaded:
-            from app.core.tts import TextToSpeech
-            self._tts = TextToSpeech(voice="am_michael", sample_rate=24000, speed=1.1)
-            self._filler_manager.preload(self._tts)
-            self._models_loaded = True
+        # Load TTS lazily if not loaded (use centralized init)
+        await self._lazy_load_models()
 
-        await self._handle_question(session, question)
+        # Acquire the per-session lock to serialize question processing
+        lock = self._processing_lock.get(sid)
+        if lock is None:
+            self._ensure_session_tracking(sid)
+            lock = self._processing_lock[sid]
+
+        async with lock:
+            await self._handle_question(session, question)
 
     async def _check_insight(self, session: MeetingSession, speaker: str, text: str) -> None:
         """Background task: verify a factual claim and store correction if wrong."""
@@ -801,34 +904,21 @@ class BotEngine:
                         filler_duration = len(filler_pcm) / 48000
             filler_sent_at = time.time()
 
-            # Assemble context + web search in parallel
-            context_task = asyncio.get_event_loop().run_in_executor(
+            # Assemble context + web search in parallel (search runs speculatively)
+            context_task = asyncio.get_running_loop().run_in_executor(
                 None,
                 session.context_manager.assemble_context,
                 question,
                 session.session_id,
             )
-            search_task = None
-            if needs_web_search(question):
-                search_task = asyncio.create_task(
-                    self._search_client.search_formatted(question)
-                )
+            search_task = asyncio.create_task(
+                self._search_client.search_formatted(question)
+            )
 
             context = await context_task
 
-            if search_task:
-                search_results = await search_task
-                context = f"{context}\n\n=== WEB SEARCH RESULTS ===\n{search_results}"
-
             # Include stored insights/corrections ONLY when the user asks about them.
-            # Never volunteer corrections unprompted — only surface when relevant.
             if session.insights:
-                _CORRECTION_TRIGGERS = (
-                    "correct", "wrong", "accurate", "fact check", "fact-check",
-                    "verify", "true", "false", "mistake", "error", "right",
-                    "is that", "are you sure", "double check", "double-check",
-                    "actually", "really", "correction",
-                )
                 q_lower = question.lower()
                 if any(trigger in q_lower for trigger in _CORRECTION_TRIGGERS):
                     insights_text = "\n".join(
@@ -837,7 +927,23 @@ class BotEngine:
                     )
                     context = f"{context}\n\n=== CORRECTIONS NOTED DURING MEETING ===\n{insights_text}\n(Share these corrections since the user asked about accuracy.)"
 
-            # Query LLM → TTS full response → send as one chunk
+            # Add sentiment hint if available (helps LLM match tone)
+            mood = self._last_sentiment.get(session.session_id, "")
+            if mood and mood in ("positive", "negative", "neutral"):
+                context = f"{context}\n\n(Speaker mood: {mood}. Match your tone accordingly.)"
+
+            # Attach search results if available (ran in parallel, adds no latency)
+            try:
+                search_results = await search_task
+                if search_results and search_results.strip():
+                    context = (
+                        f"{context}\n\n=== WEB SEARCH RESULTS (use only if relevant to the question) ===\n"
+                        f"{search_results}"
+                    )
+            except Exception as exc:
+                logger.debug("Speculative search failed (non-blocking): %s", exc)
+
+            # Single LLM call with full context + search results
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
 
@@ -886,6 +992,28 @@ class BotEngine:
                     await self._recall_client.send_audio(session.bot_id, response_audio)
                     logger.warning("Audio sent to bot %s", session.bot_id[:8])
 
+                    # Stay in RESPONDING during playback so interruptions work.
+                    # PCM int16 at 24kHz = 48000 bytes per second.
+                    playback_duration = (
+                        len(response_audio) / (24000 * 2)
+                        if response_audio
+                        else len(response_text) / 15
+                    )
+                    playback_start = time.time()
+
+                    # Poll for interruption during playback
+                    while time.time() - playback_start < playback_duration:
+                        if self._interrupted.get(session.session_id, False):
+                            logger.info("Interrupted during playback — stopping audio for session %s", session.session_id[:8])
+                            await self._recall_client.stop_audio(session.bot_id)
+                            partial = (
+                                f"[Assistant was answering \"{question}\" and said: "
+                                f"\"{response_text.strip()}\" before being interrupted]"
+                            )
+                            session.context_manager.add_transcript(partial)
+                            break
+                        await asyncio.sleep(0.3)  # check every 300ms
+
             # Track response text for echo detection
             if response_text:
                 from app.api.routes.webhook import _recent_bot_output
@@ -904,20 +1032,25 @@ class BotEngine:
             except ValueError:
                 pass
 
-            # Follow-up window starts AFTER audio finishes playing, not when sent.
-            # Estimate playback: ~15 chars/sec of spoken audio.
-            playback_duration = len(response_text) / 15 if response_text else 0.0
-            self._last_response_time[session.session_id] = time.time() + playback_duration
+            # Follow-up window starts now
+            self._last_response_time[session.session_id] = time.time()
 
             # Process queued question only if it contains a wake word
             # (if the person just interrupted to talk normally, don't respond)
             queued = self._queued_question.pop(session.session_id, None)
             if queued:
-                wake_word_cfg = session.agent_config.get("wake_word", "hey assistant")
+                wake_word_cfg = session.agent_config.get("wake_word", "nova")
                 wake_detected, q = detect_wake_word(queued["question"], wake_word=wake_word_cfg)
                 if wake_detected and q:
                     logger.info("Processing queued question for session %s", session.session_id[:8])
-                    asyncio.create_task(self._handle_question(session, q))
+                    # Route through _process_pending_question to acquire the processing lock
+                    self._pending_question[session.session_id] = {
+                        "question": f"nova {q}",  # re-add wake word for detection
+                        "speaker": queued.get("speaker", ""),
+                        "timestamp": time.time(),
+                    }
+                    _task = asyncio.create_task(self._process_pending_question(session))
+                    _task.add_done_callback(_log_task_exception)
                 elif was_interrupted:
                     logger.info("Participant interrupted without wake word — staying silent for session %s", session.session_id[:8])
 

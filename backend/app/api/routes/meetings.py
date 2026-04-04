@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -34,10 +34,6 @@ async def create_meeting(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Check credits
-    if current_user.credits < 1:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
-
     # Verify agent belongs to user
     result = await db.execute(
         select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
@@ -45,6 +41,15 @@ async def create_meeting(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+
+    # Atomic credit deduction (prevents double-spend from concurrent requests)
+    deduct_result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.credits >= 1)
+        .values(credits=User.credits - 1)
+    )
+    if deduct_result.rowcount == 0:
+        raise HTTPException(status_code=402, detail="Insufficient credits")
 
     platform = detect_platform(meeting_data.meeting_link)
 
@@ -56,9 +61,6 @@ async def create_meeting(
         status="pending",
     )
     db.add(meeting)
-
-    # Deduct credit
-    current_user.credits -= 1
 
     await db.commit()
     await db.refresh(meeting)
@@ -141,13 +143,19 @@ async def create_meeting(
         session.transition(SessionState.LISTENING)
         engine.sessions[session.session_id] = session
         engine._sessions_by_bot_id[bot_id] = session.session_id
+        engine._ensure_session_tracking(session.session_id)
 
         logger.info("BotEngine session %s ready for bot %s", session.session_id, bot_id)
 
     except RecallClientError as exc:
         logger.error("Failed to deploy bot for meeting %s: %s", meeting.id, exc)
         meeting.status = "failed"
-        current_user.credits += 1  # refund credit
+        # Atomic credit refund
+        await db.execute(
+            update(User)
+            .where(User.id == current_user.id)
+            .values(credits=User.credits + 1)
+        )
         await db.commit()
         raise HTTPException(status_code=502, detail="Failed to deploy meeting bot. Credit refunded.")
     finally:
