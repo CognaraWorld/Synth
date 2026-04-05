@@ -217,6 +217,33 @@ class MeetingOverrideResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# Chat
+class ChatSendRequest(BaseModel):
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000)]
+
+
+class ChatMessageResponse(BaseModel):
+    id: UUID
+    role: str
+    content: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ChatResponse(BaseModel):
+    user_message: ChatMessageResponse
+    assistant_message: ChatMessageResponse
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: list[ChatMessageResponse]
+    meeting_id: UUID
+    total: int
+    page: int
+    per_page: int
+
+
 # Payments
 class CheckoutRequest(BaseModel):
     pack_id: str = Field(

@@ -1,16 +1,22 @@
 "use client";
 
+import { useState } from "react";
+import { MessageSquare } from "lucide-react";
 import { useMeetings } from "@/hooks/use-meetings";
 import { useTranscriptSocket } from "@/hooks/use-transcript-socket";
+import { ChatSidebar } from "@/components/chat-sidebar";
 import { PageHeader } from "@/components/page-header";
 import { MeetingCard } from "@/components/meeting-card";
 import { BotControlPanel } from "@/components/bot-control-panel";
 import { TranscriptFeed } from "@/components/transcript-feed";
 import { StartMeetingDialog } from "@/components/start-meeting-dialog";
+import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function MeetingsPage() {
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMeetingId, setChatMeetingId] = useState<string | null>(null);
   const { data: meetings, isLoading } = useMeetings();
 
   const upcoming = meetings?.filter((m) => m.status === "SCHEDULED") ?? [];
@@ -19,6 +25,11 @@ export default function MeetingsPage() {
 
   const liveMeeting = live[0];
   useTranscriptSocket(liveMeeting?.id ?? "");
+
+  function openChat(meetingId: string) {
+    setChatMeetingId(meetingId);
+    setChatOpen(true);
+  }
 
   if (isLoading) {
     return (
@@ -69,7 +80,7 @@ export default function MeetingsPage() {
             <div className="space-y-6">
               <MeetingCard meeting={liveMeeting} />
               <div className="grid gap-6 lg:grid-cols-2">
-                <BotControlPanel meetingId={liveMeeting.id} />
+                <BotControlPanel meetingId={liveMeeting.id} onOpenChat={() => openChat(liveMeeting.id)} />
                 <TranscriptFeed />
               </div>
             </div>
@@ -82,12 +93,22 @@ export default function MeetingsPage() {
           ) : (
             <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
               {past.map((meeting) => (
-                <MeetingCard key={meeting.id} meeting={meeting} />
+                <div key={meeting.id} className="space-y-3">
+                  <MeetingCard meeting={meeting} />
+                  <Button variant="outline" size="sm" className="w-full" onClick={() => openChat(meeting.id)}>
+                    <MessageSquare className="h-4 w-4" />
+                    Ask about this meeting
+                  </Button>
+                </div>
               ))}
             </div>
           )}
         </TabsContent>
       </Tabs>
+
+      {chatMeetingId ? (
+        <ChatSidebar meetingId={chatMeetingId} isOpen={chatOpen} onClose={() => setChatOpen(false)} />
+      ) : null}
     </div>
   );
 }
