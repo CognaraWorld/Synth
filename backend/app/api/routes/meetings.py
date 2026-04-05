@@ -287,7 +287,6 @@ async def upsert_meeting_override(
         db.add(override)
 
     payload = override_data.model_dump(exclude_unset=True, exclude_none=True)
-    payload.pop("voice", None)
     persona_inputs_changed = "mode" in payload or "persona_id" in payload
     if persona_inputs_changed:
         candidate_mode = payload.get("mode", override.mode or meeting_agent.mode or "general")
@@ -309,7 +308,7 @@ async def upsert_meeting_override(
         "persona_id",
         override.persona_id or getattr(meeting_agent, "persona_id", "general"),
     )
-    payload["voice"] = get_persona_voice_label(next_persona)
+    payload["voice"] = payload.get("voice", override.voice or get_persona_voice_label(next_persona))
 
     if "system_prompt" not in payload and ("description" in payload or persona_inputs_changed or creating_override):
         next_description = payload.get(
