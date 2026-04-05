@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -80,14 +79,14 @@ class TestQueryRouterCoverage:
 
 class TestFillerManagerCoverage:
     def test_preload_caches_phrase_and_voice_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake_module = types.SimpleNamespace(
-            RecallClient=type(
-                "RecallClient",
-                (),
-                {"pcm_to_mp3_b64": staticmethod(lambda pcm: f"mp3:{pcm.decode('utf-8')}")},
-            )
+        from app.meeting.recall_client import RecallClient
+
+        monkeypatch.setattr(
+            RecallClient,
+            "pcm_to_mp3_b64",
+            staticmethod(lambda pcm: f"mp3:{pcm.decode('utf-8')}"),
         )
-        monkeypatch.setitem(sys.modules, "app.meeting.recall_client", fake_module)
+        monkeypatch.setattr("app.utils.filler.random.choice", lambda phrases: phrases[0])
 
         class FakeTTS:
             voice = "voice-a"
@@ -110,24 +109,36 @@ class TestFillerManagerCoverage:
         assert len(tts.calls) == first_call_count
 
         phrase = manager.get_filler_for_category(QueryCategory.GENERAL)
-        assert manager._cache[f"{phrase}:voice-a"] == phrase.encode("utf-8")
-        assert manager._cache[phrase] == phrase.encode("utf-8")
-        assert manager._mp3_cache[f"{phrase}:voice-a"] == f"mp3:{phrase}"
+        assert manager.get_filler_audio(QueryCategory.GENERAL, voice="voice-a") == phrase.encode("utf-8")
+        assert manager.get_filler_audio(QueryCategory.GENERAL) == phrase.encode("utf-8")
+        assert manager.get_filler_mp3_b64(QueryCategory.GENERAL, voice="voice-a") == f"mp3:{phrase}"
 
     def test_getters_handle_empty_cache_and_voice_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = FillerManager()
         assert manager.get_filler_mp3_b64(QueryCategory.GENERAL, voice="x") == ""
         assert manager.get_filler_audio(QueryCategory.GENERAL, voice="x") == b""
 
-        monkeypatch.setattr("app.utils.filler.random.choice", lambda phrases: phrases[0])
-        phrase = manager.get_filler_for_category(QueryCategory.GENERAL)
-        manager._mp3_cache[phrase] = "plain-mp3"
-        manager._cache[phrase] = b"plain-pcm"
+        from app.meeting.recall_client import RecallClient
 
-        assert manager.get_filler_mp3_b64(QueryCategory.GENERAL, voice="missing") == "plain-mp3"
-        assert manager.get_filler_audio(QueryCategory.GENERAL, voice="missing") == b"plain-pcm"
-        assert manager.get_random_filler_mp3_b64() == "plain-mp3"
-        assert manager.get_random_filler_audio() == b"plain-pcm"
+        monkeypatch.setattr(
+            RecallClient,
+            "pcm_to_mp3_b64",
+            staticmethod(lambda pcm: f"mp3:{pcm.decode('utf-8')}"),
+        )
+        monkeypatch.setattr("app.utils.filler.random.choice", lambda phrases: phrases[0])
+        class FakeTTS:
+            voice = "voice-a"
+
+            def synthesize(self, phrase: str) -> bytes:
+                return phrase.encode("utf-8")
+
+        manager.preload(FakeTTS())
+        phrase = manager.get_filler_for_category(QueryCategory.GENERAL)
+
+        assert manager.get_filler_mp3_b64(QueryCategory.GENERAL, voice="missing") == f"mp3:{phrase}"
+        assert manager.get_filler_audio(QueryCategory.GENERAL, voice="missing") == phrase.encode("utf-8")
+        assert manager.get_random_filler_mp3_b64() == f"mp3:{phrase}"
+        assert manager.get_random_filler_audio() == phrase.encode("utf-8")
 
 
 class TestWakeWordCoverage:
