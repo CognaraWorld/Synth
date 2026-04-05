@@ -50,6 +50,10 @@ async def create_meeting(
     if current_user.credits < 1:
         raise HTTPException(status_code=402, detail="Insufficient credits")
 
+    settings = get_settings()
+    if not (settings.gemini_api_key or "").strip():
+        logger.warning("GEMINI_API_KEY not set — screenshare capture will be skipped")
+
     agent = None
     if meeting_data.agent_id is None:
         agent = await get_effective_primary_agent(db, current_user.id)
@@ -59,7 +63,6 @@ async def create_meeting(
             select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
         )
         agent = result.scalar_one_or_none()
-
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
@@ -87,7 +90,6 @@ async def create_meeting(
     await db.refresh(meeting)
 
     # Build webhook URL for real-time transcription
-    settings = get_settings()
     if not (settings.recall_api_key or "").strip():
         logger.info("Recall.ai API key not configured; meeting %s remains pending", meeting.id)
         return meeting
@@ -169,6 +171,9 @@ async def create_meeting(
                 logger.info("Loaded %d doc summaries for agent %s", len(documents), agent.id)
         except Exception as exc:
             logger.warning("Failed to load doc summaries: %s", exc)
+
+        # Ensure screenshare capture is wired for meetings created via REST route.
+        engine.wire_screen_capture(session)
 
         # Set session states and register
         session.transition(SessionState.JOINING)
@@ -259,6 +264,7 @@ async def upsert_meeting_override(
         db.add(override)
 
     payload = override_data.model_dump(exclude_unset=True, exclude_none=True)
+    payload.pop("voice", None)
     persona_inputs_changed = "mode" in payload or "persona_id" in payload
     if persona_inputs_changed:
         candidate_mode = payload.get("mode", override.mode or meeting_agent.mode or "general")

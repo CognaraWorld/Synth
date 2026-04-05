@@ -116,11 +116,21 @@ class RecallClient:
                 "transcript": {
                     "provider": transcript_provider,
                 },
+                # video_separate_png delivers per-participant frames (including
+                # screenshare) as base64 PNG at ~2fps. gallery_view_v2 is
+                # required for per-participant streams to work.
+                "video_mixed_layout": "gallery_view_v2",
+                "video_separate_png": {},
                 "realtime_endpoints": [
                     {
                         "type": "webhook",
                         "url": webhook_url,
-                        "events": ["transcript.data"],
+                        "events": [
+                            "transcript.data",
+                            "video_separate_png.data",
+                            "participant_events.screenshare_on",
+                            "participant_events.screenshare_off",
+                        ],
                     },
                 ],
             }
