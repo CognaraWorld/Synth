@@ -10,14 +10,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models.database import Meeting, AsyncSessionLocal
+from app.models.database import Meeting, User, AsyncSessionLocal
 from app.utils.bot_profiles import get_persona_tts_voice
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 _bot_engine = None
 _greeted_bots: set[str] = set()  # bot_ids that have already been greeted
 _recent_bot_output: dict[str, list[str]] = {}  # bot_id -> recent bot output texts for echo detection
+_pending_hey: dict[str, float] = {}  # bot_id -> timestamp of isolated "Hey" chunk
 
 
 def get_bot_engine():
@@ -57,6 +60,7 @@ def cleanup_bot_tracking(bot_id: str) -> None:
     """
     _greeted_bots.discard(bot_id)
     _recent_bot_output.pop(bot_id, None)
+    _pending_hey.pop(bot_id, None)
 
 
 @router.post("/recall")
@@ -223,6 +227,22 @@ async def _handle_transcription(data: dict) -> None:
                                     overlap / len(text_words) * 100, text[:80])
                         return
 
+        # Split-chunk wake word merge: if previous chunk was just "Hey",
+        # prepend it to this chunk so "Hey" + "Nova what time" becomes "Hey Nova what time"
+        if bot_id and bot_id in _pending_hey:
+            import time as _time
+            hey_ts = _pending_hey.pop(bot_id)
+            if _time.time() - hey_ts < 2.0:
+                text = "Hey " + text
+                logger.debug("Merged pending 'Hey' with: %s", text[:60])
+
+        # Hold isolated "Hey" for next chunk (split wake word)
+        if text.lower().strip(" .,!?") == "hey":
+            import time as _time
+            _pending_hey[bot_id] = _time.time()
+            logger.debug("Holding isolated 'Hey' for bot %s", bot_id[:8] if bot_id else "?")
+            return
+
         # Quality filter: reject very short fragments that are likely noise
         # But always allow wake word phrases through
         words = text.split()
@@ -230,7 +250,8 @@ async def _handle_transcription(data: dict) -> None:
             text_lower = text.lower().strip(" .,!?")
             common_short = {"yes", "no", "yeah", "okay", "ok", "sure", "right",
                            "thanks", "thank you", "stop", "enough", "got it"}
-            wake_words = {"nova", "hey nova", "nora", "hey nora", "noah", "hey noah"}
+            wake_words = {"nova", "hey nova", "nora", "hey nora", "noah", "hey noah",
+                         "no va", "mova", "rover", "over"}
             if text_lower not in common_short and text_lower not in wake_words:
                 logger.debug("Dropping short fragment: %s: %s", speaker, text)
                 return
@@ -288,6 +309,15 @@ async def _handle_status_change(data: dict) -> None:
         if new_status in ("ended", "failed") and bot_id:
             cleanup_bot_tracking(bot_id)
 
+            # Auto-stop the bot session in BotEngine
+            try:
+                engine = get_bot_engine()
+                session_id = engine._sessions_by_bot_id.get(bot_id)
+                if session_id:
+                    await engine.stop_meeting(session_id)
+            except Exception as exc:
+                logger.warning("Auto-stop on terminal status failed for bot %s: %s", bot_id[:8], exc)
+
         # Update meeting status in database
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -296,6 +326,37 @@ async def _handle_status_change(data: dict) -> None:
             meeting = result.scalar_one_or_none()
             if meeting and meeting.status != new_status:
                 meeting.status = new_status
+
+                # Idempotent billing: atomic UPDATE with credits_used = 0 guard
+                # prevents double-deduct when both stop endpoint and webhook fire.
+                if new_status in ("ended", "failed") and meeting.started_at:
+                    now = datetime.now(timezone.utc).replace(tzinfo=None)
+                    duration_seconds = (now - meeting.started_at).total_seconds()
+                    minutes_used = max(1, math.ceil(duration_seconds / 60))
+
+                    bill_result = await db.execute(
+                        update(Meeting)
+                        .where(Meeting.id == meeting.id, Meeting.credits_used == 0)
+                        .values(
+                            ended_at=now,
+                            duration_minutes=minutes_used,
+                            credits_used=minutes_used,
+                        )
+                    )
+
+                    if bill_result.rowcount == 1:
+                        # We won the race -- settle against the 5-min reserve
+                        delta = minutes_used - 5
+                        await db.execute(
+                            update(User)
+                            .where(User.id == meeting.user_id)
+                            .values(credits=User.credits - delta)
+                        )
+                        logger.info(
+                            "Auto-billed %d minutes for meeting %s (bot %s)",
+                            minutes_used, meeting.id, bot_id[:8],
+                        )
+
                 await db.commit()
                 logger.info(
                     "Meeting %s status updated to %s (bot %s)",
@@ -304,6 +365,46 @@ async def _handle_status_change(data: dict) -> None:
 
     except Exception as exc:
         logger.error("Error processing status webhook: %s", exc, exc_info=True)
+
+
+async def _handle_screenshot(data: dict) -> None:
+    """Process a screenshot event from Recall.ai screen capture."""
+    try:
+        bot_id = ""
+        bot_obj = data.get("bot", {})
+        if isinstance(bot_obj, dict):
+            bot_id = bot_obj.get("id", "")
+        if not bot_id:
+            bot_id = data.get("bot_id", "")
+
+        inner_data = data.get("data", {})
+        if not isinstance(inner_data, dict):
+            return
+
+        # Screenshot data comes as base64 encoded image
+        import base64
+        image_b64 = inner_data.get("image", "") or inner_data.get("screenshot", "")
+        if not image_b64:
+            return
+
+        image_bytes = base64.b64decode(image_b64)
+        if len(image_bytes) < 100:
+            return
+
+        engine = get_bot_engine()
+        session_id = engine._sessions_by_bot_id.get(bot_id)
+        session = engine.sessions.get(session_id) if session_id else None
+        if not session or not session.is_active:
+            return
+
+        # Extract text from screenshot via vision processor
+        extracted = await engine._vision_processor.async_extract_text(image_bytes)
+        if extracted and extracted.strip():
+            session.context_manager.add_transcript(f"[Screen share]: {extracted[:500]}")
+            logger.info("Screenshot text extracted for bot %s (%d chars)", bot_id[:8], len(extracted))
+
+    except Exception as exc:
+        logger.error("Error processing screenshot: %s", exc, exc_info=True)
 
 
 async def _send_greeting(bot_id: str) -> None:
