@@ -111,11 +111,6 @@ async def recall_webhook(request: Request):
             _task.add_done_callback(lambda t: logger.error("Webhook status task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
             handled = True
 
-    if not handled and event and "screenshot" in event.lower():
-        _task = asyncio.create_task(_bounded_handle_screenshot(data))
-        _task.add_done_callback(lambda t: logger.error("Webhook screenshot task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
-        handled = True
-
     if not handled and not event:
         # No event field — direct transcript webhook
         if "bot_id" in payload or "words" in payload or "text" in payload:
@@ -135,12 +130,6 @@ async def _bounded_handle_status_change(data: dict) -> None:
     """Wrap _handle_status_change with concurrency limit."""
     async with _webhook_semaphore:
         await _handle_status_change(data)
-
-
-async def _bounded_handle_screenshot(data: dict) -> None:
-    """Wrap _handle_screenshot with concurrency limit."""
-    async with _webhook_semaphore:
-        await _handle_screenshot(data)
 
 
 async def _handle_transcription(data: dict) -> None:
