@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
 from app.config import get_settings
-from app.models.database import engine, Base
+from app.models.database import engine, Base, DEFAULT_STARTER_CREDITS
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
 from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook
 from app.api.websocket import router as ws_router
@@ -24,6 +24,9 @@ def _add_column_if_missing(
 ) -> None:
     if column_name in columns:
         return
+    # Inject IF NOT EXISTS for PostgreSQL so concurrent startup workers don't race
+    if connection.dialect.name == "postgresql" and "ADD COLUMN" in ddl:
+        ddl = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS", 1)
     connection.execute(text(ddl))
     logger.info("Migration: added %s column to %s table", column_name, table_name)
 
@@ -65,11 +68,15 @@ def _run_migrations(connection):
         )
         connection.execute(text("UPDATE users SET provider = 'email' WHERE provider IS NULL"))
         logger.info("Migration: backfilled users.provider to 'email' for NULL rows")
-        connection.execute(text("UPDATE users SET credits = 3 WHERE credits IS NULL"))
-        logger.info("Migration: backfilled users.credits to 3 for NULL rows")
+        connection.execute(
+            text(f"UPDATE users SET credits = {DEFAULT_STARTER_CREDITS} WHERE credits IS NULL")
+        )
+        logger.info("Migration: backfilled users.credits to %d for NULL rows", DEFAULT_STARTER_CREDITS)
         if dialect_name == "postgresql":
             connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET DEFAULT 'email'"))
-            connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET DEFAULT 3"))
+            connection.execute(
+                text(f"ALTER TABLE users ALTER COLUMN credits SET DEFAULT {DEFAULT_STARTER_CREDITS}")
+            )
             connection.execute(text("ALTER TABLE users ALTER COLUMN provider SET NOT NULL"))
             connection.execute(text("ALTER TABLE users ALTER COLUMN credits SET NOT NULL"))
             logger.info("Migration: enforced users.provider/users.credits defaults and NOT NULL")
@@ -140,8 +147,6 @@ def _run_migrations(connection):
 
     if inspector.has_table("credit_transactions"):
         credit_columns = _get_columns(inspector, "credit_transactions")
-        had_balance_after_column = "balance_after" in credit_columns
-        balance_after_was_nullable = credit_columns.get("balance_after", {}).get("nullable", True)
         meeting_id_type = "UUID" if dialect_name == "postgresql" else "VARCHAR(36)"
         _add_column_if_missing(
             connection=connection,
@@ -209,19 +214,8 @@ def _run_migrations(connection):
                 "WHERE balance_after IS NULL"
             )
         )
-        if dialect_name == "postgresql" and (not had_balance_after_column or balance_after_was_nullable):
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN balance_after SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN amount SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN transaction_type SET NOT NULL")
-            )
-            connection.execute(
-                text("ALTER TABLE credit_transactions ALTER COLUMN description SET NOT NULL")
-            )
+        if dialect_name == "postgresql":
+            # Always ensure defaults (idempotent)
             connection.execute(
                 text("ALTER TABLE credit_transactions ALTER COLUMN amount SET DEFAULT 0")
             )
@@ -237,6 +231,13 @@ def _run_migrations(connection):
                     "ALTER COLUMN description SET DEFAULT 'Legacy credit transaction'"
                 )
             )
+            # Per-column NOT NULL: check each independently so partial drift is always corrected
+            # credit_columns reflects pre-migration state; missing columns default to nullable=True
+            for _col in ("balance_after", "amount", "transaction_type", "description"):
+                if credit_columns.get(_col, {}).get("nullable", True):
+                    connection.execute(
+                        text(f"ALTER TABLE credit_transactions ALTER COLUMN {_col} SET NOT NULL")
+                    )
             logger.info(
                 "Migration: normalized credit_transactions defaults and NOT NULL constraints"
             )
