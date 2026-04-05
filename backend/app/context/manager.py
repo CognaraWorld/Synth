@@ -86,6 +86,8 @@ class ContextManager:
         self._embed_chunk_target: int = 200  # words per RAG chunk
         self._embed_stale_seconds: float = 120.0  # force-flush if oldest entry > 2 min
         self._embed_lock = threading.Lock()
+        self._embed_failed_chunks: list[tuple[str, dict[str, str]]] = []
+        self._embed_retry_count: int = 0
         self._screen_contents: list[str] = []
         # tiktoken tokenizer for accurate token budgeting
         self._tokenizer = None
@@ -315,8 +317,9 @@ class ContextManager:
             self._flush_embed_buffer()
 
         # RollingSummary.update is async. We schedule it on the running
-        # loop when one exists; otherwise the pending text simply
-        # accumulates and will be summarized on the next async call.
+        # loop when one exists; otherwise the pending text accumulates.
+        # We also drain pending text when a loop IS available to prevent
+        # unbounded growth from earlier sync-context ingestion.
         try:
             loop = asyncio.get_running_loop()
             task = loop.create_task(self.rolling_summary.update(text))
@@ -347,7 +350,15 @@ class ContextManager:
         """
         # Extract buffer contents under lock, then release before encoding
         with self._embed_lock:
-            if not self._transcript_embed_buffer or self.rag_pipeline is None:
+            if self.rag_pipeline is None:
+                return
+            has_pending = bool(self._transcript_embed_buffer)
+            has_failed = bool(self._embed_failed_chunks)
+            if not has_pending and not has_failed:
+                return
+            if not has_pending:
+                # Nothing new to embed, but retry failed chunks
+                self._retry_failed_embeds()
                 return
 
             # Check whether we should flush yet
@@ -399,26 +410,85 @@ class ContextManager:
                         if spk:
                             speakers_in_chunk.add(spk)
 
+                chunk_metadata = {
+                    "source_type": "transcript",
+                    "source": "meeting_transcript",
+                    "meeting_id": self.meeting_id,
+                    "agent_id": self.agent_id,
+                    "user_id": self.user_id,
+                    "speakers": ", ".join(sorted(speakers_in_chunk)) or "unknown",
+                    "start_time": first_ts.isoformat(),
+                    "end_time": last_ts.isoformat(),
+                }
                 try:
                     self.rag_pipeline.add_chunk(
                         text=chunk_text,
-                        metadata={
-                            "source_type": "transcript",
-                            "source": "meeting_transcript",
-                            "meeting_id": self.meeting_id,
-                            "agent_id": self.agent_id,
-                            "user_id": self.user_id,
-                            "speakers": ", ".join(sorted(speakers_in_chunk)) or "unknown",
-                            "start_time": first_ts.isoformat(),
-                            "end_time": last_ts.isoformat(),
-                        },
+                        metadata=chunk_metadata,
                     )
                 except Exception as exc:
-                    logger.warning("Failed to embed transcript chunk: %s", exc)
+                    logger.warning("Failed to embed transcript chunk: %s — queued for retry", exc)
+                    self._embed_failed_chunks.append((chunk_text, chunk_metadata))
 
             if end >= len(entry_words):
                 break
             start = end - overlap
+
+        self._retry_failed_embeds()
+
+    def _retry_failed_embeds(self) -> None:
+        """Retry embedding chunks that failed on previous flush attempts.
+
+        After 3 consecutive retry cycles with no progress, drops the
+        remaining failed chunks and logs an error to avoid unbounded growth.
+        """
+        if not self._embed_failed_chunks or self.rag_pipeline is None:
+            return
+        still_failed: list[tuple[str, dict[str, str]]] = []
+        for chunk_text_retry, chunk_meta_retry in self._embed_failed_chunks:
+            try:
+                self.rag_pipeline.add_chunk(text=chunk_text_retry, metadata=chunk_meta_retry)
+                logger.info("Successfully retried embedding a failed chunk")
+            except Exception:
+                still_failed.append((chunk_text_retry, chunk_meta_retry))
+        self._embed_failed_chunks = still_failed
+        if still_failed:
+            self._embed_retry_count += 1
+            if self._embed_retry_count >= 3:
+                logger.error(
+                    "Dropping %d embed chunks after 3 retry cycles — RAG may be degraded",
+                    len(still_failed),
+                )
+                self._embed_failed_chunks.clear()
+                self._embed_retry_count = 0
+        else:
+            self._embed_retry_count = 0
+
+    def _truncate_from_end(self, text: str, max_tokens: int) -> str:
+        """Truncate *text* from the end to fit within *max_tokens*.
+
+        Keeps the beginning of the text which is typically the most
+        relevant for RAG chunks and document summaries (key information
+        tends to appear at the start).
+
+        Args:
+            text: The source text.
+            max_tokens: Token budget for this section.
+
+        Returns:
+            The (possibly truncated) text.
+        """
+        if self.get_token_count(text) <= max_tokens:
+            return text
+        words = text.split()
+        lo, hi = 0, len(words)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            candidate = " ".join(words[:mid])
+            if self.get_token_count(candidate) <= max_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        return " ".join(words[:lo]) + "..." if lo > 0 else ""
 
     def _truncate_from_beginning(self, text: str, max_tokens: int) -> str:
         """Truncate *text* from the beginning to fit within *max_tokens*.
@@ -500,6 +570,14 @@ class ContextManager:
         past_text = self._truncate_from_beginning(past_text, budget_past)
 
         # --- Section 1: Rolling meeting summary ---
+        # Trigger async drain of pending text if a loop is available,
+        # so context always reflects the latest summarized state.
+        try:
+            loop = asyncio.get_running_loop()
+            if self.rolling_summary._pending_text and self.rolling_summary._llm_client:
+                loop.create_task(self.rolling_summary.update(""))
+        except RuntimeError:
+            pass
         summary_text = self.rolling_summary.get_summary()
         summary_text = self._truncate_from_beginning(summary_text, budget_summary)
 
@@ -514,7 +592,7 @@ class ContextManager:
             for doc in doc_summaries_snap:
                 parts.append(f"[{doc['filename']}]:\n{doc['summary']}")
             doc_summary_text = "\n\n".join(parts)
-        doc_summary_text = self._truncate_from_beginning(
+        doc_summary_text = self._truncate_from_end(
             doc_summary_text, budget_doc_summaries
         )
 
@@ -608,7 +686,7 @@ class ContextManager:
             all_chunks = transcript_chunks + document_chunks
             rag_text = "\n\n".join(all_chunks)
 
-        rag_text = self._truncate_from_beginning(rag_text, budget_rag)
+        rag_text = self._truncate_from_end(rag_text, budget_rag)
 
         # --- Section 4: Shared screen content ---
         screen_text = ""
@@ -707,6 +785,65 @@ class ContextManager:
 
         # Flush calls encoding outside the embed lock internally
         self._flush_embed_buffer(force=True)
+
+    def get_checkpoint_state(self) -> dict[str, Any]:
+        """Snapshot current memory state for periodic persistence.
+
+        Returns a serializable dict that can be stored in the DB so
+        session recovery after a crash has access to the rolling summary,
+        entity tracker, and recent transcript instead of starting from zero.
+
+        Returns:
+            Dictionary with summary, entities, and recent buffer text.
+        """
+        with self._state_lock:
+            entities_snap = {k: list(v) for k, v in self._entities.items()}
+
+        recent_text = self.raw_buffer.get_recent(minutes=self.raw_buffer.max_minutes)
+        summary_text = self.rolling_summary.get_summary()
+        key_facts = list(self.rolling_summary._key_facts)
+
+        return {
+            "rolling_summary": summary_text,
+            "key_facts": key_facts,
+            "entities": entities_snap,
+            "recent_transcript": recent_text,
+            "meeting_id": self.meeting_id,
+            "agent_id": self.agent_id,
+            "user_id": self.user_id,
+        }
+
+    def restore_from_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Restore memory state from a checkpoint dict.
+
+        Used during session recovery after a crash/restart to avoid
+        losing the rolling summary, entities, and recent context.
+
+        Args:
+            checkpoint: Dict from a prior ``get_checkpoint_state()`` call.
+        """
+        if not checkpoint:
+            return
+        summary = checkpoint.get("rolling_summary", "")
+        if summary:
+            self.rolling_summary.summary = summary
+        key_facts = checkpoint.get("key_facts", [])
+        if key_facts:
+            self.rolling_summary._key_facts = key_facts
+
+        entities = checkpoint.get("entities", {})
+        if entities:
+            with self._state_lock:
+                for key in self._entities:
+                    if key in entities:
+                        self._entities[key] = set(entities[key])
+
+        logger.info(
+            "Restored checkpoint for meeting %s: summary=%d chars, %d entities",
+            self.meeting_id,
+            len(summary),
+            sum(len(v) for v in entities.values()) if entities else 0,
+        )
 
     def reset(self) -> None:
         """Clear all context layers.

@@ -62,7 +62,18 @@ def _get_shared_chroma_client() -> chromadb.PersistentClient:
         if _shared_chroma_client is not None:
             return _shared_chroma_client
         persist_dir = Path(__file__).resolve().parent.parent.parent / "chroma_data"
-        persist_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            # Verify directory is actually writable
+            test_file = persist_dir / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+        except OSError:
+            logger.error(
+                "ChromaDB persistence directory %s is not writable — "
+                "embeddings will NOT survive restarts",
+                persist_dir,
+            )
         _shared_chroma_client = chromadb.PersistentClient(path=str(persist_dir))
         return _shared_chroma_client
 

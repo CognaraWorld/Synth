@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uuid as uuid_module
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -49,6 +50,16 @@ def _run_migrations(connection):
             columns=document_columns,
             column_name="doc_summary",
             ddl="ALTER TABLE documents ADD COLUMN doc_summary TEXT",
+        )
+
+    if inspector.has_table("meetings"):
+        meeting_columns = _get_columns(inspector, "meetings")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="meetings",
+            columns=meeting_columns,
+            column_name="context_checkpoint",
+            ddl="ALTER TABLE meetings ADD COLUMN context_checkpoint TEXT",
         )
 
     if inspector.has_table("users"):
@@ -427,6 +438,22 @@ async def _cleanup_stale_bots():
             bot_engine = get_bot_engine()
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             stale_ids = []
+
+            # Checkpoint active sessions to DB for crash recovery
+            try:
+                import json as _json
+                for sid, session in list(bot_engine.sessions.items()):
+                    if session.is_active:
+                        checkpoint = session.context_manager.get_checkpoint_state()
+                        async with AsyncSessionLocal() as ckpt_db:
+                            await ckpt_db.execute(
+                                update(Meeting)
+                                .where(Meeting.id == uuid_module.UUID(session.meeting_id))
+                                .values(context_checkpoint=_json.dumps(checkpoint, default=str))
+                            )
+                            await ckpt_db.commit()
+            except Exception as ckpt_exc:
+                logger.debug("Context checkpoint save failed: %s", ckpt_exc)
 
             for sid, session in list(bot_engine.sessions.items()):
                 if session.get_duration() > 7200:  # 2 hours

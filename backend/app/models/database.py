@@ -116,6 +116,7 @@ class Meeting(Base):
     ended_at = Column(DateTime, nullable=True)
     duration_minutes = Column(Float, nullable=True)
     credits_used = Column(Integer, default=0)
+    context_checkpoint = Column(Text, nullable=True)  # JSON snapshot for crash recovery
     created_at = Column(DateTime, default=_utcnow)
 
     user = relationship("User", back_populates="meetings")

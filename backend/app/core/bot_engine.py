@@ -713,6 +713,7 @@ class BotEngine:
                         select(Meeting)
                         .options(joinedload(Meeting.summary))
                         .where(
+                            Meeting.user_id == meeting.user_id,
                             Meeting.agent_id == meeting.agent_id,
                             Meeting.status == "ended",
                             Meeting.id != meeting.id,
@@ -726,6 +727,15 @@ class BotEngine:
                             session.context_manager.add_past_meeting_summary(date_str, pm.summary.content)
                 except Exception as past_exc:
                     logger.warning("Failed to load past summaries during recovery: %s", past_exc)
+
+                # Restore context checkpoint if available (crash recovery)
+                if meeting.context_checkpoint:
+                    try:
+                        import json
+                        checkpoint = json.loads(meeting.context_checkpoint)
+                        session.context_manager.restore_from_checkpoint(checkpoint)
+                    except Exception as ckpt_exc:
+                        logger.warning("Failed to restore context checkpoint: %s", ckpt_exc)
 
                 # Wire up screen capture
                 self.wire_screen_capture(session)
