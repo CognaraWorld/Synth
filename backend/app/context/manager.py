@@ -348,19 +348,20 @@ class ContextManager:
         Args:
             force: If True, embed whatever is buffered regardless of size.
         """
-        # Extract buffer contents under lock, then release before encoding
+        # Check state under lock, then release before slow encoding work
         with self._embed_lock:
             if self.rag_pipeline is None:
                 return
             has_pending = bool(self._transcript_embed_buffer)
             has_failed = bool(self._embed_failed_chunks)
-            if not has_pending and not has_failed:
-                return
-            if not has_pending:
-                # Nothing new to embed, but retry failed chunks
-                self._retry_failed_embeds()
-                return
 
+        if not has_pending and not has_failed:
+            return
+        if not has_pending:
+            self._retry_failed_embeds()
+            return
+
+        with self._embed_lock:
             # Check whether we should flush yet
             combined = " ".join(text for _, text in self._transcript_embed_buffer)
             word_count = len(combined.split())
@@ -438,30 +439,49 @@ class ContextManager:
     def _retry_failed_embeds(self) -> None:
         """Retry embedding chunks that failed on previous flush attempts.
 
-        After 3 consecutive retry cycles with no progress, drops the
-        remaining failed chunks and logs an error to avoid unbounded growth.
+        Snapshots the failed list under lock, retries outside the lock
+        (slow IO), then merges results back under lock. Drops remaining
+        chunks after 3 consecutive cycles with zero progress.
         """
-        if not self._embed_failed_chunks or self.rag_pipeline is None:
+        if self.rag_pipeline is None:
             return
+
+        with self._embed_lock:
+            if not self._embed_failed_chunks:
+                return
+            chunks_to_retry = list(self._embed_failed_chunks)
+
+        # Retry outside the lock — add_chunk may be slow
         still_failed: list[tuple[str, dict[str, str]]] = []
-        for chunk_text_retry, chunk_meta_retry in self._embed_failed_chunks:
+        succeeded = 0
+        for chunk_text_retry, chunk_meta_retry in chunks_to_retry:
             try:
                 self.rag_pipeline.add_chunk(text=chunk_text_retry, metadata=chunk_meta_retry)
-                logger.info("Successfully retried embedding a failed chunk")
+                succeeded += 1
             except Exception:
                 still_failed.append((chunk_text_retry, chunk_meta_retry))
-        self._embed_failed_chunks = still_failed
-        if still_failed:
-            self._embed_retry_count += 1
-            if self._embed_retry_count >= 3:
-                logger.error(
-                    "Dropping %d embed chunks after 3 retry cycles — RAG may be degraded",
-                    len(still_failed),
-                )
-                self._embed_failed_chunks.clear()
+
+        if succeeded:
+            logger.info("Retried %d failed embed chunks successfully", succeeded)
+
+        # Merge back under lock — preserve any new failures added concurrently
+        with self._embed_lock:
+            # Remove retried items from the live list, keep new ones
+            retried_set = set(id(c) for c in chunks_to_retry)
+            new_failures = [c for c in self._embed_failed_chunks if id(c) not in retried_set]
+            self._embed_failed_chunks = new_failures + still_failed
+
+            if still_failed and succeeded == 0:
+                self._embed_retry_count += 1
+                if self._embed_retry_count >= 3:
+                    logger.error(
+                        "Dropping %d embed chunks after 3 retry cycles with no progress",
+                        len(still_failed),
+                    )
+                    self._embed_failed_chunks = [c for c in self._embed_failed_chunks if c not in still_failed]
+                    self._embed_retry_count = 0
+            else:
                 self._embed_retry_count = 0
-        else:
-            self._embed_retry_count = 0
 
     def _truncate_from_end(self, text: str, max_tokens: int) -> str:
         """Truncate *text* from the end to fit within *max_tokens*.
@@ -570,14 +590,7 @@ class ContextManager:
         past_text = self._truncate_from_beginning(past_text, budget_past)
 
         # --- Section 1: Rolling meeting summary ---
-        # Trigger async drain of pending text if a loop is available,
-        # so context always reflects the latest summarized state.
-        try:
-            loop = asyncio.get_running_loop()
-            if self.rolling_summary._pending_text and self.rolling_summary._llm_client:
-                loop.create_task(self.rolling_summary.update(""))
-        except RuntimeError:
-            pass
+        # Note: get_summary() appends unsummarized pending text automatically
         summary_text = self.rolling_summary.get_summary()
         summary_text = self._truncate_from_beginning(summary_text, budget_summary)
 
@@ -799,7 +812,6 @@ class ContextManager:
         with self._state_lock:
             entities_snap = {k: list(v) for k, v in self._entities.items()}
 
-        recent_text = self.raw_buffer.get_recent(minutes=self.raw_buffer.max_minutes)
         summary_text = self.rolling_summary.get_summary()
         key_facts = list(self.rolling_summary._key_facts)
 
@@ -807,7 +819,6 @@ class ContextManager:
             "rolling_summary": summary_text,
             "key_facts": key_facts,
             "entities": entities_snap,
-            "recent_transcript": recent_text,
             "meeting_id": self.meeting_id,
             "agent_id": self.agent_id,
             "user_id": self.user_id,

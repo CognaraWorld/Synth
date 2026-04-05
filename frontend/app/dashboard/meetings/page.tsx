@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { Video } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -44,7 +43,6 @@ function EmptyState() {
 }
 
 export default function MeetingsPage() {
-  const router = useRouter();
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -118,11 +116,7 @@ export default function MeetingsPage() {
             </TableHeader>
             <TableBody>
               {meetings.map((meeting) => (
-                <TableRow
-                  key={meeting.id}
-                  className="cursor-pointer"
-                  onClick={() => router.push(`/dashboard/meetings/${meeting.id}`)}
-                >
+                <TableRow key={meeting.id}>
                   <TableCell className="font-medium">
                     {meeting.platform.charAt(0).toUpperCase() + meeting.platform.slice(1)} Meeting
                   </TableCell>

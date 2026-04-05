@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import uuid as uuid_module
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -442,16 +441,19 @@ async def _cleanup_stale_bots():
             # Checkpoint active sessions to DB for crash recovery
             try:
                 import json as _json
-                for sid, session in list(bot_engine.sessions.items()):
-                    if session.is_active:
-                        checkpoint = session.context_manager.get_checkpoint_state()
-                        async with AsyncSessionLocal() as ckpt_db:
+                async with AsyncSessionLocal() as ckpt_db:
+                    has_updates = False
+                    for sid, session in list(bot_engine.sessions.items()):
+                        if session.is_active and session.bot_id:
+                            checkpoint = session.context_manager.get_checkpoint_state()
                             await ckpt_db.execute(
                                 update(Meeting)
-                                .where(Meeting.id == uuid_module.UUID(session.meeting_id))
+                                .where(Meeting.bot_id == session.bot_id)
                                 .values(context_checkpoint=_json.dumps(checkpoint, default=str))
                             )
-                            await ckpt_db.commit()
+                            has_updates = True
+                    if has_updates:
+                        await ckpt_db.commit()
             except Exception as ckpt_exc:
                 logger.debug("Context checkpoint save failed: %s", ckpt_exc)
 

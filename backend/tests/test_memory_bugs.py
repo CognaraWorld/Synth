@@ -31,7 +31,11 @@ class TestPastMeetingScopeIsolation:
 
 
 class TestEmbedFailureRetry:
-    """Fix: failed embed chunks are journaled and retried."""
+    """Fix: failed embed chunks are journaled and retried.
+
+    RAGPipeline.add_chunk now raises on failure (no internal swallow),
+    so ContextManager can catch and journal failed chunks.
+    """
 
     def test_failed_embed_is_journaled(self) -> None:
         cm = ContextManager(meeting_id="m1", agent_id="a1", user_id="u1")
@@ -39,12 +43,10 @@ class TestEmbedFailureRetry:
         mock_rag.add_chunk.side_effect = RuntimeError("ChromaDB connection lost")
         cm.set_rag_pipeline(mock_rag)
 
-        # Simulate evicted transcript entering embed buffer
         now = datetime.now(timezone.utc)
         cm._transcript_embed_buffer = [(now, "Alice: We should use PostgreSQL for the main DB")]
         cm._flush_embed_buffer(force=True)
 
-        # The failed chunk should be in the retry journal
         assert len(cm._embed_failed_chunks) == 1
         assert "PostgreSQL" in cm._embed_failed_chunks[0][0]
 
@@ -52,7 +54,7 @@ class TestEmbedFailureRetry:
         cm = ContextManager(meeting_id="m1", agent_id="a1", user_id="u1")
         mock_rag = MagicMock()
 
-        # Always fail
+        # Always fail initially
         mock_rag.add_chunk.side_effect = RuntimeError("ChromaDB down")
         cm.set_rag_pipeline(mock_rag)
 
@@ -61,26 +63,24 @@ class TestEmbedFailureRetry:
         cm._flush_embed_buffer(force=True)
         assert len(cm._embed_failed_chunks) == 1
 
-        # Now make RAG work again — retry on next flush should succeed
+        # Now make RAG work — retry on next flush should succeed
         mock_rag.add_chunk.side_effect = None
         cm._flush_embed_buffer(force=True)
         assert len(cm._embed_failed_chunks) == 0
 
-    def test_failed_chunks_dropped_after_3_retries(self) -> None:
+    def test_failed_chunks_dropped_after_3_retries_with_no_progress(self) -> None:
         cm = ContextManager(meeting_id="m1", agent_id="a1", user_id="u1")
         mock_rag = MagicMock()
         mock_rag.add_chunk.side_effect = RuntimeError("Permanently broken")
         cm.set_rag_pipeline(mock_rag)
 
-        # Manually add a failed chunk
+        # Manually seed a failed chunk
         cm._embed_failed_chunks = [("some text", {"meeting_id": "m1"})]
 
-        # Retry 3 times
+        # Retry 3 times with no progress
         for _ in range(3):
-            cm._transcript_embed_buffer = []
-            cm._flush_embed_buffer(force=True)
+            cm._retry_failed_embeds()
 
-        # After 3 retries, chunks should be dropped
         assert len(cm._embed_failed_chunks) == 0
 
 
@@ -130,6 +130,8 @@ class TestCheckpointSaveRestore:
         assert "Shipping date: Dec 15" in checkpoint["key_facts"]
         assert "Use PostgreSQL" in checkpoint["entities"]["decisions"]
         assert "Alice" in checkpoint["entities"]["people"]
+        # recent_transcript should NOT be in checkpoint (not restorable)
+        assert "recent_transcript" not in checkpoint
 
     def test_restore_from_checkpoint_recovers_state(self) -> None:
         cm = ContextManager(meeting_id="m1", agent_id="a1", user_id="u1")
@@ -142,7 +144,6 @@ class TestCheckpointSaveRestore:
                 "topics": ["pricing"],
                 "action_items": ["Draft proposal"],
             },
-            "recent_transcript": "",
             "meeting_id": "m1",
         }
 

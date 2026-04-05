@@ -68,12 +68,10 @@ def _get_shared_chroma_client() -> chromadb.PersistentClient:
             test_file = persist_dir / ".write_test"
             test_file.touch()
             test_file.unlink()
-        except OSError:
-            logger.error(
-                "ChromaDB persistence directory %s is not writable — "
-                "embeddings will NOT survive restarts",
-                persist_dir,
-            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"ChromaDB persistence directory {persist_dir} is not writable"
+            ) from exc
         _shared_chroma_client = chromadb.PersistentClient(path=str(persist_dir))
         return _shared_chroma_client
 
@@ -116,17 +114,17 @@ class RAGPipeline:
     # ------------------------------------------------------------------
 
     def add_chunk(self, text: str, metadata: dict[str, Any]) -> None:
-        """Add a text chunk to the vector store with full metadata."""
-        try:
-            embedding = self._encode(text)
-            self._collection.add(
-                ids=[str(uuid4())],
-                documents=[text],
-                metadatas=[metadata],
-                embeddings=[embedding],
-            )
-        except Exception as exc:
-            logger.error("Failed to add chunk to ChromaDB: %s", exc)
+        """Add a text chunk to the vector store with full metadata.
+
+        Raises on failure so callers can implement retry/journal logic.
+        """
+        embedding = self._encode(text)
+        self._collection.add(
+            ids=[str(uuid4())],
+            documents=[text],
+            metadatas=[metadata],
+            embeddings=[embedding],
+        )
 
     def add_chunks_batch(self, chunks: list[dict[str, Any]]) -> None:
         """Add multiple text chunks in a single operation."""
