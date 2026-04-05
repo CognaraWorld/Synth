@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.database import Meeting, AsyncSessionLocal
+from app.utils.bot_profiles import get_persona_tts_voice
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,17 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 _bot_engine = None
 _greeted_bots: set[str] = set()  # bot_ids that have already been greeted
 _recent_bot_output: dict[str, list[str]] = {}  # bot_id -> recent bot output texts for echo detection
+
+# Shared HTTP client for fetching screenshot URLs — avoids per-request connection pool churn
+_http_client: "httpx.AsyncClient | None" = None
+
+
+def _get_http_client() -> "httpx.AsyncClient":
+    global _http_client
+    if _http_client is None:
+        import httpx
+        _http_client = httpx.AsyncClient(timeout=10.0)
+    return _http_client
 
 
 def get_bot_engine():
@@ -97,13 +109,27 @@ async def recall_webhook(request: Request):
     # Uses bounded concurrency to prevent resource exhaustion.
     handled = False
     if event:
-        if "transcript" in event.lower():
+        if event in ("transcript.data", "transcript.partial_data"):
             _task = asyncio.create_task(_bounded_handle_transcription(data))
-            _task.add_done_callback(lambda t: logger.error("Webhook transcript task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _task.add_done_callback(
+                lambda t: logger.error("Webhook transcript task failed: %s", t.exception())
+                if not t.cancelled() and t.exception()
+                else None
+            )
+            handled = True
+        elif event.startswith("bot.") and "status" not in event:
+            # bot.joining_call, bot.in_call_recording, bot.call_ended, etc.
+            asyncio.create_task(_handle_status_change(data))
             handled = True
         elif "status" in event.lower():
             _task = asyncio.create_task(_bounded_handle_status_change(data))
             _task.add_done_callback(lambda t: logger.error("Webhook status task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            handled = True
+        elif event == "video_separate_png.data":
+            asyncio.create_task(_handle_video_frame(data))
+            handled = True
+        elif event in ("participant_events.screenshare_on", "participant_events.screenshare_off"):
+            asyncio.create_task(_handle_screenshare_event(event, data))
             handled = True
 
     if not handled and not event:
@@ -305,6 +331,102 @@ async def _handle_status_change(data: dict) -> None:
         logger.error("Error processing status webhook: %s", exc, exc_info=True)
 
 
+async def _handle_video_frame(data: dict) -> None:
+    """Process a video_separate_png.data event from Recall.ai.
+
+    Filters for screenshare-type frames only, then delegates to
+    ScreenCaptureManager for change detection and Gemini extraction.
+    """
+    try:
+        bot_id = ""
+        bot_obj = data.get("bot", {})
+        if isinstance(bot_obj, dict):
+            bot_id = bot_obj.get("id", "")
+        if not bot_id:
+            return
+
+        inner = data.get("data", {})
+        if not isinstance(inner, dict):
+            return
+
+        # Only process screenshare frames — ignore webcam frames
+        frame_type = inner.get("type", "")
+        if frame_type != "screenshare":
+            return
+
+        # Extract base64 PNG from buffer field
+        b64_buffer = inner.get("buffer", "")
+        if not b64_buffer:
+            return
+
+        import base64
+        try:
+            image_bytes = base64.b64decode(b64_buffer)
+        except Exception:
+            logger.warning("Failed to decode base64 video frame for bot %s", bot_id[:8])
+            return
+
+        engine = get_bot_engine()
+        session = await engine.get_or_recover_session(bot_id)
+        if not session or not session.screen_capture:
+            return
+
+        result = await session.screen_capture.handle_screenshot(image_bytes)
+
+        # Speak the video-apology aloud if this is the first video detection
+        from app.meeting.screen_capture import CaptureOutcome
+        if result.outcome == CaptureOutcome.VIDEO and result.apology:
+            if engine._tts:
+                import asyncio as _asyncio
+                loop = _asyncio.get_running_loop()
+                try:
+                    audio = await loop.run_in_executor(
+                        None, lambda: engine._tts.synthesize(result.apology)
+                    )
+                    if audio:
+                        await engine._recall_client.send_audio(bot_id, audio)
+                        logger.info("Spoke video-apology for bot %s", bot_id[:8])
+                except Exception as exc:
+                    logger.warning("Failed to speak video apology: %s", exc)
+
+    except Exception as exc:
+        logger.error("Error processing video frame webhook: %s", exc, exc_info=True)
+
+
+async def _handle_screenshare_event(event: str, data: dict) -> None:
+    """Process participant_events.screenshare_on/off events.
+
+    Resets ScreenCaptureManager state when a participant stops sharing
+    so the next share starts fresh (no stale hash from previous session).
+    """
+    try:
+        bot_id = ""
+        bot_obj = data.get("bot", {})
+        if isinstance(bot_obj, dict):
+            bot_id = bot_obj.get("id", "")
+        if not bot_id:
+            return
+
+        engine = get_bot_engine()
+        session = await engine.get_or_recover_session(bot_id)
+        if not session or not session.screen_capture:
+            return
+
+        participant = data.get("data", {}).get("participant", {})
+        name = participant.get("name", "unknown") if isinstance(participant, dict) else "unknown"
+
+        if event == "participant_events.screenshare_on":
+            logger.info("Screen share started by %s (bot %s)", name, bot_id[:8])
+            # Reset hash so first frame of new share is always processed
+            session.screen_capture.reset_for_new_share()
+        else:
+            logger.info("Screen share stopped by %s (bot %s)", name, bot_id[:8])
+            session.screen_capture.reset_for_new_share()
+
+    except Exception as exc:
+        logger.error("Error processing screenshare event: %s", exc, exc_info=True)
+
+
 async def _send_greeting(bot_id: str) -> None:
     """Send an intro greeting immediately when the bot joins the call."""
     try:
@@ -312,17 +434,24 @@ async def _send_greeting(bot_id: str) -> None:
         # Use centralized model initialization (thread-safe, double-checked)
         await engine._lazy_load_models()
 
-        # Pull agent name and wake word from the session config
+        # Pull agent name, wake word, and persona from the session config.
         session_id = engine._sessions_by_bot_id.get(bot_id)
         session = engine.sessions.get(session_id) if session_id else None
         agent_name = "your AI assistant"
         wake_phrase = "Hey Nova"
+        persona_id = "general"
         if session:
             name = session.agent_config.get("agent_name", "")
             if name:
                 agent_name = name
             ww = session.agent_config.get("wake_word", "nova")
             wake_phrase = ww.title()
+            persona_id = session.agent_config.get("persona_id", "general")
+
+        target_voice = get_persona_tts_voice(persona_id)
+        if engine._tts and engine._tts.voice != target_voice:
+            engine._tts.voice = target_voice
+            engine._filler_manager.preload(engine._tts)
 
         greeting = (
             f"Hi everyone, I'm {agent_name} for this meeting. "

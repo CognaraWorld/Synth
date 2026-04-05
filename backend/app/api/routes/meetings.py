@@ -11,9 +11,21 @@ from app.api.routes.auth import get_current_user
 from app.api.routes.webhook import get_bot_engine, set_bot_engine
 from app.config import get_settings
 from app.meeting.recall_client import RecallClient, RecallClientError
-from app.models.database import Agent, Meeting, MeetingSummary, User, get_db
-from app.models.schemas import MeetingCreate, MeetingDetailResponse, MeetingResponse
+from app.models.database import Agent, Meeting, MeetingOverride, MeetingSummary, User, get_db
+from app.models.schemas import (
+    MeetingCreate,
+    MeetingDetailResponse,
+    MeetingOverrideResponse,
+    MeetingOverrideUpsert,
+    MeetingResponse,
+)
+from app.utils.bot_profiles import (
+    build_system_prompt,
+    get_effective_primary_agent,
+    get_persona_voice_label,
+)
 from app.utils.meeting_links import detect_meeting_platform
+from app.utils.prompt_builder import resolve_persona_id
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +46,19 @@ async def create_meeting(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify agent belongs to user
-    result = await db.execute(
-        select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
-    )
-    agent = result.scalar_one_or_none()
+    # Check credits
+    if current_user.credits < 1:
+        raise HTTPException(status_code=402, detail="Insufficient credits")
+
+    agent = None
+    if meeting_data.agent_id is None:
+        agent = await get_effective_primary_agent(db, current_user.id)
+    else:
+        # Verify agent belongs to user
+        result = await db.execute(
+            select(Agent).where(Agent.id == meeting_data.agent_id, Agent.user_id == current_user.id)
+        )
+        agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
@@ -55,7 +75,7 @@ async def create_meeting(
 
     meeting = Meeting(
         user_id=current_user.id,
-        agent_id=meeting_data.agent_id,
+        agent_id=agent.id,
         platform=platform,
         meeting_link=meeting_data.meeting_link,
         status="pending",
@@ -67,6 +87,15 @@ async def create_meeting(
 
     # Build webhook URL for real-time transcription
     settings = get_settings()
+    if not (settings.recall_api_key or "").strip():
+        logger.info("Recall.ai API key not configured; meeting %s remains pending", meeting.id)
+        return meeting
+    if not (settings.gemini_api_key or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY is required for screenshare capture.",
+        )
+
     webhook_url = None
     if settings.webhook_base_url:
         webhook_url = f"{settings.webhook_base_url.rstrip('/')}/api/webhook/recall"
@@ -92,7 +121,10 @@ async def create_meeting(
             "agent_id": str(agent.id),
             "agent_name": agent.name or "Synth",
             "mode": agent.mode or "general",
+            "persona_id": getattr(agent, "persona_id", "general"),
             "description": agent.description or "",
+            "system_prompt": agent.system_prompt or "",
+            "voice": agent.voice or "female",
         }
 
         # Register session directly (bot already deployed via RecallClient above)
@@ -105,12 +137,16 @@ async def create_meeting(
         )
         session.bot_id = bot_id
 
-        # Build system prompt
-        from app.utils.prompt_builder import build_custom_prompt, build_general_prompt
-        if agent_config["mode"] == "custom" and agent_config["description"]:
-            session.agent_config["system_prompt"] = build_custom_prompt(agent_config["description"])
+        # Build system prompt (prefer persisted prompt; fallback for legacy rows)
+        persisted_prompt = (agent_config.get("system_prompt") or "").strip()
+        if persisted_prompt:
+            session.agent_config["system_prompt"] = persisted_prompt
         else:
-            session.agent_config["system_prompt"] = build_general_prompt()
+            session.agent_config["system_prompt"] = build_system_prompt(
+                agent_config.get("mode", "general"),
+                agent_config.get("description", ""),
+                agent_config.get("persona_id"),
+            )
 
         # Wire up rolling summary with LLM
         session.context_manager.rolling_summary.set_llm_client(engine._llm_client)
@@ -137,6 +173,9 @@ async def create_meeting(
                 logger.info("Loaded %d doc summaries for agent %s", len(documents), agent.id)
         except Exception as exc:
             logger.warning("Failed to load doc summaries: %s", exc)
+
+        # Ensure screenshare capture is wired for meetings created via REST route.
+        engine.wire_screen_capture(session)
 
         # Set session states and register
         session.transition(SessionState.JOINING)
@@ -192,6 +231,84 @@ async def get_meeting(
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return meeting
+
+
+@router.put("/{meeting_id}/override", response_model=MeetingOverrideResponse)
+async def upsert_meeting_override(
+    meeting_id: UUID,
+    override_data: MeetingOverrideUpsert,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Meeting)
+        .options(joinedload(Meeting.agent), joinedload(Meeting.override))
+        .where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
+    )
+    meeting = result.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    if meeting.status == "active":
+        raise HTTPException(
+            status_code=409,
+            detail="Meeting overrides can only be changed before the meeting is active.",
+        )
+
+    meeting_agent = meeting.agent
+    if meeting_agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    override = meeting.override
+    creating_override = override is None
+    if override is None:
+        override = MeetingOverride(meeting_id=meeting.id)
+        db.add(override)
+
+    payload = override_data.model_dump(exclude_unset=True, exclude_none=True)
+    payload.pop("voice", None)
+
+    persona_inputs_changed = "mode" in payload or "persona_id" in payload
+    if persona_inputs_changed:
+        candidate_mode = payload.get("mode", override.mode or meeting_agent.mode or "general")
+        candidate_persona = payload.get(
+            "persona_id",
+            override.persona_id or getattr(meeting_agent, "persona_id", "general"),
+        )
+        resolved_persona = resolve_persona_id(candidate_mode, candidate_persona)
+        payload["mode"] = "general"
+        payload["persona_id"] = resolved_persona
+    elif creating_override:
+        payload["mode"] = "general"
+        payload["persona_id"] = resolve_persona_id(
+            meeting_agent.mode or "general",
+            getattr(meeting_agent, "persona_id", "general"),
+        )
+
+    next_persona = payload.get(
+        "persona_id",
+        override.persona_id or getattr(meeting_agent, "persona_id", "general"),
+    )
+    payload["voice"] = get_persona_voice_label(next_persona)
+
+    if "system_prompt" not in payload and ("description" in payload or persona_inputs_changed or creating_override):
+        next_description = payload.get(
+            "description",
+            override.description if override.description is not None else meeting_agent.description,
+        ) or ""
+        next_mode = payload.get("mode", override.mode or meeting_agent.mode or "general")
+        next_persona = payload.get(
+            "persona_id",
+            override.persona_id or getattr(meeting_agent, "persona_id", "general"),
+        )
+        payload["system_prompt"] = build_system_prompt(next_mode, next_description, next_persona)
+
+    for field, value in payload.items():
+        setattr(override, field, value)
+
+    await db.commit()
+    await db.refresh(override)
+    return override
 
 
 @router.post("/{meeting_id}/stop", response_model=MeetingResponse)
