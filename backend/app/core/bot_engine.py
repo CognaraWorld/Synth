@@ -345,6 +345,11 @@ class BotEngine:
         # Flush remaining transcript chunks to RAG then cleanup
         session.context_manager.flush_remaining_embeddings()
 
+        # Save meeting summary to database for cross-meeting memory
+        if session.bot_id and summary:
+            _task = asyncio.create_task(self._save_meeting_summary(session.bot_id, summary))
+            _task.add_done_callback(_log_task_exception)
+
         # Clean up all session resources
         vad = self._vad_instances.pop(session_id, None)
         if vad is not None:
@@ -1162,6 +1167,48 @@ class BotEngine:
             except ValueError:
                 pass
             return None
+
+    # ------------------------------------------------------------------
+    # Cross-meeting memory
+    # ------------------------------------------------------------------
+
+    async def _save_meeting_summary(self, bot_id: str, content: str) -> None:
+        """Persist meeting summary to the database for cross-meeting memory.
+
+        Args:
+            bot_id: The Recall.ai bot ID to look up the meeting record.
+            content: The rolling summary content to save.
+        """
+        try:
+            from app.models.database import Meeting, MeetingSummary, AsyncSessionLocal
+            from sqlalchemy import select
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(Meeting).where(Meeting.bot_id == bot_id)
+                )
+                meeting = result.scalar_one_or_none()
+                if not meeting:
+                    logger.warning("No meeting found for bot %s — summary not saved", bot_id[:8])
+                    return
+
+                # Check if summary already exists
+                existing = await db.execute(
+                    select(MeetingSummary).where(MeetingSummary.meeting_id == meeting.id)
+                )
+                if existing.scalar_one_or_none():
+                    logger.debug("Summary already exists for meeting %s", meeting.id)
+                    return
+
+                summary_record = MeetingSummary(
+                    meeting_id=meeting.id,
+                    content=content,
+                )
+                db.add(summary_record)
+                await db.commit()
+                logger.info("Meeting summary saved for meeting %s (bot %s)", meeting.id, bot_id[:8])
+        except Exception as exc:
+            logger.error("Failed to save meeting summary: %s", exc)
 
     # ------------------------------------------------------------------
     # Internal helpers
