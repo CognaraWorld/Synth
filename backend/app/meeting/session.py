@@ -99,6 +99,12 @@ class MeetingSession:
         # AI insights: corrections detected during passive listening
         self.insights: list[dict[str, str]] = []
 
+        # Operator steering controls (used by live control endpoints)
+        self.operator_muted: bool = False
+        self.output_stop_requested: bool = False
+        self.last_instruction_at: datetime | None = None
+        self.operator_instructions: list[str] = []
+
         # Timestamps
         now = datetime.now(timezone.utc)
         self.created_at: datetime = now
@@ -198,6 +204,11 @@ class MeetingSession:
             "created_at": self.created_at.isoformat(),
             "duration_seconds": round(self.get_duration(), 2),
             "is_active": self.is_active,
+            "operator_muted": self.operator_muted,
+            "output_stop_requested": self.output_stop_requested,
+            "last_instruction_at": (
+                self.last_instruction_at.isoformat() if self.last_instruction_at else None
+            ),
             "history": [
                 {"timestamp": ts, "state": state.value}
                 for ts, state in self._history
