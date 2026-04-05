@@ -13,10 +13,13 @@ import logging
 import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.context.manager import ContextManager
+
+if TYPE_CHECKING:
+    from app.meeting.screen_capture import ScreenCaptureManager
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,9 @@ class MeetingSession:
         self.agent_config: dict[str, Any] = agent_config or {}
         self.state: SessionState = SessionState.PENDING
         self.context_manager: ContextManager = ContextManager()
+
+        # Screen capture manager — wired up by BotEngine after session creation
+        self.screen_capture: "ScreenCaptureManager | None" = None
 
         # Bot ID assigned by Recall.ai after deployment
         self.bot_id: str | None = None

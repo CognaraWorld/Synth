@@ -47,6 +47,10 @@ class ContextManager:
         rag_pipeline: The RAG retrieval pipeline (``None`` until set).
     """
 
+    # Maximum number of screen content entries to retain.
+    # Older entries are dropped to prevent unbounded memory growth.
+    _MAX_SCREEN_ENTRIES: int = 30
+
     def __init__(self, max_context_tokens: int = 16000) -> None:
         """Initialize the context manager and its sub-components.
 
@@ -71,6 +75,7 @@ class ContextManager:
         self._embed_chunk_target: int = 200  # words per RAG chunk
         self._embed_stale_seconds: float = 120.0  # force-flush if oldest entry > 2 min
         self._embed_lock = threading.Lock()
+        self._screen_contents: list[str] = []
 
     def set_rag_pipeline(self, rag: Any) -> None:
         """Inject the RAG retrieval pipeline.
@@ -92,6 +97,20 @@ class ContextManager:
             self.document_summaries.append(
                 {"filename": filename, "summary": summary}
             )
+
+    def add_screen_content(self, content: str) -> None:
+        """Register extracted screen content for inclusion in context.
+
+        Retains only the most recent _MAX_SCREEN_ENTRIES entries to
+        prevent unbounded memory growth during long meetings.
+
+        Args:
+            content: Text extracted from the shared screen by Gemini Vision.
+        """
+        if content and content.strip():
+            self._screen_contents.append(content.strip())
+            if len(self._screen_contents) > self._MAX_SCREEN_ENTRIES:
+                self._screen_contents.pop(0)
 
     def add_past_meeting_summary(self, meeting_date: str, summary: str) -> None:
         """Register a past meeting summary for cross-meeting memory.
@@ -390,14 +409,16 @@ class ContextManager:
         1. Rolling summary of the full conversation
         2. Recent raw transcript (last ~10 minutes)
         3. Document summaries (full-document understanding)
-        4. RAG-retrieved chunks (specific passages) — PRIMARY SOURCE
+        4. Shared screen content (Gemini-extracted from screenshare frames)
+        5. RAG-retrieved chunks (specific passages) — PRIMARY SOURCE
 
         Token budget allocation (approximate):
         - 10 % past meeting summaries
         - 15 % meeting summary
         - 25 % recent buffer
-        - 20 % document summaries
-        - 30 % RAG chunks
+        - 10 % document summaries
+        - 20 % shared screen content
+        - 20 % RAG chunks
 
         Args:
             question: The user's question, used to guide RAG retrieval.
@@ -411,8 +432,9 @@ class ContextManager:
         budget_past = int(self.max_context_tokens * 0.10)
         budget_summary = int(self.max_context_tokens * 0.15)
         budget_buffer = int(self.max_context_tokens * 0.25)
-        budget_doc_summaries = int(self.max_context_tokens * 0.20)
-        budget_rag = int(self.max_context_tokens * 0.30)
+        budget_doc_summaries = int(self.max_context_tokens * 0.10)
+        budget_screen = int(self.max_context_tokens * 0.20)
+        budget_rag = int(self.max_context_tokens * 0.20)
 
         # --- Section 0: Past meeting summaries (cross-meeting memory) ---
         past_text = ""
@@ -442,7 +464,7 @@ class ContextManager:
             doc_summary_text, budget_doc_summaries
         )
 
-        # --- Section 4: RAG chunks (specific passages) ---
+        # --- Section 5: RAG chunks (specific passages) — computed before screen but output after ---
         # Flush any pending transcript into RAG before searching,
         # so recently-pruned content is findable immediately.
         if self.rag_pipeline is not None:
@@ -476,6 +498,23 @@ class ContextManager:
                 rag_text = ""
 
         rag_text = self._truncate_from_beginning(rag_text, budget_rag)
+
+        # --- Section 4: Shared screen content ---
+        screen_text = ""
+        if self._screen_contents:
+            # Walk from the end (most recent) accumulating until budget is reached,
+            # avoiding constructing the full string only to truncate most of it.
+            max_words = int(budget_screen / 1.3)
+            parts: list[str] = []
+            word_count = 0
+            for entry in reversed(self._screen_contents):
+                entry_words = len(entry.split())
+                if word_count + entry_words > max_words:
+                    break
+                parts.append(entry)
+                word_count += entry_words
+            if parts:
+                screen_text = "\n\n---\n\n".join(reversed(parts))
 
         # --- Assemble (skip empty sections to avoid confusing the LLM) ---
         sections: list[str] = []
@@ -513,6 +552,11 @@ class ContextManager:
         if doc_summary_text.strip():
             sections.append("=== DOCUMENT OVERVIEWS ===")
             sections.append(doc_summary_text)
+            sections.append("")
+
+        if screen_text.strip():
+            sections.append("=== SHARED SCREEN CONTENT ===")
+            sections.append(screen_text)
             sections.append("")
 
         if rag_text.strip():
@@ -565,6 +609,7 @@ class ContextManager:
         self.raw_buffer.clear()
         self.rag_pipeline = None
         self.document_summaries.clear()
+        self._screen_contents.clear()
         self.past_meeting_summaries.clear()
         self._entities = {
             "people": set(),
