@@ -96,6 +96,7 @@ class BotEngine:
         self._cooldown_seconds: float = 0.0  # no cooldown
         self._processing_lock: dict[str, asyncio.Lock] = {}  # session_id -> lock
         self._tts_lock: asyncio.Lock = asyncio.Lock()  # serializes TTS voice switch + synthesis across sessions
+        self._recovery_lock_by_bot_id: dict[str, asyncio.Lock] = {}  # bot_id -> lock
 
         # Lightweight services — safe to initialize at startup
         self._settings = get_settings()
@@ -137,6 +138,50 @@ class BotEngine:
             self._interrupted[session_id] = False
         if session_id not in self._queued_question:
             self._queued_question[session_id] = {}
+
+    def wire_screen_capture(self, session: MeetingSession) -> None:
+        """Attach a ScreenCaptureManager to a session."""
+        from app.meeting.screen_capture import ScreenCaptureManager
+
+        gemini_api_key = (self._settings.gemini_api_key or "").strip()
+        if not gemini_api_key:
+            raise BotEngineError(
+                "GEMINI_API_KEY is required for screenshare capture and extraction."
+            )
+
+        from app.core.gemini import GeminiVisionClient
+        gemini = GeminiVisionClient(api_key=gemini_api_key)
+
+        session.screen_capture = ScreenCaptureManager(
+            session_id=session.session_id,
+            context_manager=session.context_manager,
+            gemini=gemini,
+        )
+        logger.info("Screen capture enabled for session %s", session.session_id[:8])
+
+    async def get_or_recover_session(self, bot_id: str) -> MeetingSession | None:
+        """Return in-memory session for bot_id, or recover it from storage."""
+        session_id = self._sessions_by_bot_id.get(bot_id)
+        session = self.sessions.get(session_id) if session_id else None
+        if session:
+            if getattr(session, "screen_capture", None) is None:
+                self.wire_screen_capture(session)
+            return session
+
+        lock = self._recovery_lock_by_bot_id.setdefault(bot_id, asyncio.Lock())
+        async with lock:
+            session_id = self._sessions_by_bot_id.get(bot_id)
+            session = self.sessions.get(session_id) if session_id else None
+            if session:
+                if getattr(session, "screen_capture", None) is None:
+                    self.wire_screen_capture(session)
+                return session
+            session = await self._recover_session(bot_id)
+            if session is None:
+                # Prune lock to prevent unbounded growth for unknown/inactive bot IDs
+                self._recovery_lock_by_bot_id.pop(bot_id, None)
+                return None
+            return session
 
     # ------------------------------------------------------------------
     # Lazy model loading
@@ -259,6 +304,8 @@ class BotEngine:
             except Exception as exc:
                 logger.warning("Failed to load document summaries: %s", exc)
 
+        self.wire_screen_capture(session)
+
         try:
             # Transition: PENDING -> JOINING
             session.transition(SessionState.JOINING)
@@ -366,6 +413,7 @@ class BotEngine:
         self._last_sentiment.pop(session_id, None)
         if session.bot_id:
             self._sessions_by_bot_id.pop(session.bot_id, None)
+            self._recovery_lock_by_bot_id.pop(session.bot_id, None)
 
         logger.info(
             "Session %s ended (duration=%.1fs)",
@@ -645,6 +693,12 @@ class BotEngine:
                 for doc in doc_result.scalars().all():
                     session.context_manager.add_document_summary(doc.filename, doc.doc_summary)
 
+                # Wire up screen capture.
+                # State (_last_hash, _video_warned) starts fresh after a restart —
+                # the first frame of an ongoing share may produce one extra Gemini
+                # call, but capture is fully functional again immediately.
+                self.wire_screen_capture(session)
+
                 session.transition(SessionState.JOINING)
                 session.transition(SessionState.LISTENING)
 
@@ -684,15 +738,10 @@ class BotEngine:
             text: The transcribed text.
             sentiment: Speaker sentiment from Deepgram (positive/negative/neutral).
         """
-        session_id = self._sessions_by_bot_id.get(bot_id)
-        session = self.sessions.get(session_id) if session_id else None
-
-        # Recover session from DB if not in memory (e.g. after restart)
+        session = await self.get_or_recover_session(bot_id)
         if not session:
-            session = await self._recover_session(bot_id)
-            if not session:
-                logger.warning("No active meeting for bot_id=%s", bot_id)
-                return
+            logger.warning("No active meeting for bot_id=%s", bot_id)
+            return
 
         if not session.is_active:
             return
@@ -968,6 +1017,7 @@ class BotEngine:
             return None
 
         try:
+            self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
             # Classify question and send context-aware filler immediately
             from app.utils.query_router import classify_query
             category = classify_query(question)
