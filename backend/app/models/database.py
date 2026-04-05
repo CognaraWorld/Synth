@@ -138,6 +138,12 @@ class Meeting(Base):
         back_populates="meeting",
         cascade="all, delete-orphan",
     )
+    chat_messages = relationship(
+        "ChatMessage",
+        back_populates="meeting",
+        order_by="ChatMessage.created_at",
+        cascade="all, delete-orphan",
+    )
     override = relationship("MeetingOverride", back_populates="meeting", uselist=False, cascade="all, delete-orphan")
 
 
@@ -237,6 +243,20 @@ class MeetingOverride(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     meeting = relationship("Meeting", back_populates="override")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+    meeting = relationship("Meeting", back_populates="chat_messages")
+    user = relationship("User")
 
 
 # Database engine setup

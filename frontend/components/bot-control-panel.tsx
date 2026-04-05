@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Mic, MicOff, PhoneOff, SendHorizonal, Square } from "lucide-react";
+import { MessageSquare, Mic, MicOff, PhoneOff, SendHorizonal, Square } from "lucide-react";
 import { useLiveControls } from "@/hooks/use-live-controls";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,7 +9,15 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useTranscriptStore } from "@/stores/transcript-store";
 
-export function BotControlPanel({ botName = "Nova", meetingId }: { botName?: string; meetingId?: string }) {
+export function BotControlPanel({
+  botName = "Nova",
+  meetingId,
+  onOpenChat,
+}: {
+  botName?: string;
+  meetingId?: string;
+  onOpenChat?: () => void;
+}) {
   const [instruction, setInstruction] = useState("");
   const controls = useLiveControls(meetingId ?? "");
   const status = useTranscriptStore((state) => state.status);
@@ -123,7 +131,7 @@ export function BotControlPanel({ botName = "Nova", meetingId }: { botName?: str
           </Button>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-4">
           <Button variant="outline" onClick={handleMuteToggle}>
             {status === "MUTED" ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
             {status === "MUTED" ? "Unmute" : "Mute"}
@@ -135,6 +143,10 @@ export function BotControlPanel({ botName = "Nova", meetingId }: { botName?: str
           <Button variant="destructive" onClick={handleLeave}>
             <PhoneOff className="h-4 w-4" />
             Leave Meeting
+          </Button>
+          <Button variant="outline" onClick={onOpenChat}>
+            <MessageSquare className="h-4 w-4" />
+            Chat
           </Button>
         </div>
       </CardContent>

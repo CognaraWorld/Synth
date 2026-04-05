@@ -9,7 +9,7 @@ from sqlalchemy import inspect, text
 from app.config import get_settings
 from app.models.database import engine, Base, DEFAULT_STARTER_CREDITS
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
-from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook, reports, usage
+from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook, reports, usage, chat
 from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -576,6 +576,7 @@ app.include_router(credits.router, prefix="/api")
 app.include_router(webhook.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
 app.include_router(usage.router, prefix="/api")
+app.include_router(chat.router, prefix="/api")
 app.include_router(ws_router, prefix="/api")
 
 
