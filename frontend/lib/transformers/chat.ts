@@ -14,8 +14,6 @@ export interface BackendChatHistoryResponse {
   messages: BackendChatMessageResponse[];
   meeting_id: string;
   total: number;
-  page: number;
-  per_page: number;
 }
 
 export interface ChatMessage {

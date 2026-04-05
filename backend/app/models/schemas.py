@@ -224,7 +224,7 @@ class ChatSendRequest(BaseModel):
 
 class ChatMessageResponse(BaseModel):
     id: UUID
-    role: str
+    role: Literal["user", "assistant"]
     content: str
     created_at: datetime
 
@@ -240,8 +240,6 @@ class ChatHistoryResponse(BaseModel):
     messages: list[ChatMessageResponse]
     meeting_id: UUID
     total: int
-    page: int
-    per_page: int
 
 
 # Payments

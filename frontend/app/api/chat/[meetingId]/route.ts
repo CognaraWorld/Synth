@@ -9,17 +9,18 @@ const chatMessageSchema = z.object({
   message: z.string().min(1).max(5000),
 });
 
-export async function GET(_: Request, { params }: { params: { meetingId: string } }) {
+export async function GET(request: NextRequest, { params }: { params: { meetingId: string } }) {
   const token = await requireBackendToken();
   if (!token) {
     return notAuthenticatedResponse();
   }
 
   try {
-    const history = await backendGet<BackendChatHistoryResponse>(
-      `/api/meetings/${params.meetingId}/chat/history`,
-      token
-    );
+    // Forward query params (per_page, before) to backend
+    const { searchParams } = new URL(request.url);
+    const qs = searchParams.toString();
+    const path = `/api/meetings/${params.meetingId}/chat/history${qs ? `?${qs}` : ""}`;
+    const history = await backendGet<BackendChatHistoryResponse>(path, token);
     return successResponse(history);
   } catch (error) {
     return backendErrorResponse(error, "Failed to load chat history");

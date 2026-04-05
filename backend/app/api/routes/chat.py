@@ -1,4 +1,6 @@
 import logging
+from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,14 +9,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.api.routes.auth import get_current_user
-from app.core.llm import LLMClient
 from app.models.database import Agent, ChatMessage, Meeting, MeetingSummary, User, get_db
 from app.models.schemas import ChatHistoryResponse, ChatResponse, ChatSendRequest
 from app.utils.bot_profiles import build_system_prompt
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
-_llm = LLMClient()
+
+# Lazy LLM singleton — avoids import-time failure if LLM deps are missing.
+_llm = None
+
+# Per-user rate limit: max requests per minute.
+_CHAT_RATE_LIMIT = 20
+_rate_limit_buckets: dict[str, list[float]] = {}
+
+
+def _get_llm():
+    global _llm
+    if _llm is None:
+        from app.core.llm import LLMClient
+        _llm = LLMClient()
+    return _llm
+
+
+def _check_rate_limit(user_id: str) -> None:
+    """Simple in-memory sliding window rate limiter."""
+    now = datetime.now(timezone.utc).timestamp()
+    window = 60.0  # 1 minute
+
+    bucket = _rate_limit_buckets.get(user_id, [])
+    bucket = [t for t in bucket if now - t < window]
+    if len(bucket) >= _CHAT_RATE_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Chat rate limit exceeded. Max {_CHAT_RATE_LIMIT} messages per minute.",
+        )
+    bucket.append(now)
+    _rate_limit_buckets[user_id] = bucket
+
 
 _CHAT_MODE_SUFFIX = (
     "\n\nYou are now in chat mode answering questions about this meeting. "
@@ -71,7 +103,7 @@ async def _build_chat_context(meeting: Meeting, chat_history: list[ChatMessage],
             if document.doc_summary:
                 document_blocks.append(f"{document.filename}: {document.doc_summary}")
         if document_blocks:
-            parts.append(f"## Documents\n" + "\n\n".join(document_blocks[:5]))
+            parts.append("## Documents\n" + "\n\n".join(document_blocks[:5]))
 
     if chat_history:
         history_text = "\n".join(
@@ -90,6 +122,8 @@ async def send_chat_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    _check_rate_limit(str(current_user.id))
+
     meeting = await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
     user_message = ChatMessage(
@@ -122,7 +156,7 @@ async def send_chat_message(
     system_prompt = f"{system_prompt}{_CHAT_MODE_SUFFIX}"
 
     try:
-        assistant_reply = await _llm.async_query(
+        assistant_reply = await _get_llm().async_query(
             context=context,
             question=req.message,
             system_prompt=system_prompt,
@@ -154,33 +188,41 @@ async def send_chat_message(
 @router.get("/meetings/{meeting_id}/chat/history", response_model=ChatHistoryResponse)
 async def get_chat_history(
     meeting_id: UUID,
-    page: int = Query(default=1, ge=1),
     per_page: int = Query(default=50, ge=1, le=100),
+    before: datetime | None = Query(default=None, description="Load messages before this timestamp (for pagination)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
+    """Return the latest N messages in chronological order.
 
-    offset = (page - 1) * per_page
+    Default behavior (no ``before``): fetch the most recent ``per_page``
+    messages and return them oldest-first for rendering.
+
+    With ``before``: fetch ``per_page`` messages older than the given
+    timestamp (for infinite-scroll-up pagination).
+    """
+    await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
     count_result = await db.execute(
         select(func.count(ChatMessage.id)).where(ChatMessage.meeting_id == meeting_id)
     )
     total = count_result.scalar() or 0
 
-    result = await db.execute(
+    query = (
         select(ChatMessage)
         .where(ChatMessage.meeting_id == meeting_id)
-        .order_by(ChatMessage.created_at.asc())
-        .offset(offset)
-        .limit(per_page)
     )
-    messages = result.scalars().all()
+
+    if before is not None:
+        query = query.where(ChatMessage.created_at < before)
+
+    # Fetch newest N by ordering DESC then reverse for chronological render.
+    query = query.order_by(ChatMessage.created_at.desc()).limit(per_page)
+    result = await db.execute(query)
+    messages = list(reversed(result.scalars().all()))
 
     return ChatHistoryResponse(
-        messages=list(messages),
+        messages=messages,
         meeting_id=meeting_id,
         total=total,
-        page=page,
-        per_page=per_page,
     )

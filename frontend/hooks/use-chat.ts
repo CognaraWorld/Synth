@@ -12,16 +12,19 @@ export function useChat(meetingId: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setMessages([]);
     setHistoryLoaded(false);
+    setError(null);
   }, [meetingId]);
 
+  // Load most recent messages (backend returns newest N in chronological order)
   useEffect(() => {
     if (!meetingId || historyLoaded) return;
 
-    fetch(`/api/chat/${meetingId}`, { cache: "no-store" })
+    fetch(`/api/chat/${meetingId}?per_page=50`, { cache: "no-store" })
       .then((response) => response.json())
       .then((data: { data?: BackendChatHistoryResponse }) => {
         if (data.data?.messages) {
@@ -35,6 +38,7 @@ export function useChat(meetingId: string) {
   const sendMessage = useCallback(
     async (text: string) => {
       if (!text.trim() || isLoading) return;
+      setError(null);
 
       const tempId = `temp_${Date.now()}`;
       const userMessage: ChatMessage = {
@@ -55,7 +59,8 @@ export function useChat(meetingId: string) {
         });
 
         if (!response.ok) {
-          throw new Error("Chat request failed");
+          const body = await response.json().catch(() => null) as { error?: string } | null;
+          throw new Error(body?.error || "Chat request failed");
         }
 
         const data = (await response.json()) as { data: BackendChatResponse };
@@ -67,8 +72,9 @@ export function useChat(meetingId: string) {
             transformChatMessage(data.data.assistant_message),
           ];
         });
-      } catch {
+      } catch (err) {
         setMessages((current) => current.filter((message) => message.id !== tempId));
+        setError(err instanceof Error ? err.message : "Failed to send message. Try again.");
       } finally {
         setIsLoading(false);
       }
@@ -76,5 +82,5 @@ export function useChat(meetingId: string) {
     [isLoading, meetingId]
   );
 
-  return { messages, sendMessage, isLoading };
+  return { messages, sendMessage, isLoading, error };
 }

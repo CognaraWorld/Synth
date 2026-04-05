@@ -18,7 +18,7 @@ export function ReportDetailClient({ report }: { report: ReportDTO }) {
       <PageHeader
         eyebrow="Reports"
         title={report.meetingTitle}
-        description={`${formatMeetingTime(report.scheduledTime)} | ${formatMinutes(report.durationMinutes)}`}
+        description={`${formatMeetingTime(report.scheduledTime)} · ${formatMinutes(report.durationMinutes)}`}
         actions={
           <div className="flex gap-3">
             <Button variant="outline" onClick={() => setChatOpen(true)}>
