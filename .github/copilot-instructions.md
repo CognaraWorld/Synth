@@ -61,4 +61,5 @@ Avoid low-value nitpicks unless they indicate a larger consistency problem.
 - PRs should clearly state the issue being solved, the proposed solution, the reasoning behind it, the verification performed, and any risks or follow-ups.
 - Keep the `@copilot` line in PR descriptions because that is part of this team's workflow.
 - Also recommend requesting Copilot review through GitHub or enabling automatic Copilot code review, because that is the GitHub-native review path.
+- Always resolve all merge conflicts cleanly before requesting review, re-requesting review, or merging a PR.
 - Expect at least one approval from another owner before merge.

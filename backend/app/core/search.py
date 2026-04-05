@@ -1,10 +1,8 @@
-"""SearXNG search client.
+"""Web search client.
 
-Provides web search capabilities via a self-hosted SearXNG instance.
-Used to augment the LLM's knowledge with real-time information when
-answering questions that require up-to-date data.
-
-Phase 4 implementation.
+Provides web search via Serper (Google SERP API) as primary,
+with SearXNG self-hosted as fallback. Used to augment the LLM's
+knowledge with real-time information during meetings.
 """
 
 from __future__ import annotations
@@ -17,6 +15,8 @@ import httpx
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_SERPER_URL = "https://google.serper.dev/search"
 
 
 @dataclass
@@ -35,26 +35,31 @@ class SearchResult:
 
 
 class SearchClient:
-    """Client for querying a SearXNG instance.
+    """Web search client with Serper (primary) and SearXNG (fallback).
 
-    Sends search queries to the configured SearXNG server and returns
-    structured results for inclusion in the LLM context window.
+    Uses Serper API when a key is configured, otherwise falls back
+    to a local SearXNG instance.
 
     Attributes:
-        base_url: URL of the SearXNG instance.
         max_results: Maximum number of results to return per query.
     """
 
     def __init__(self, max_results: int = 5) -> None:
-        """Initialize the SearXNG client.
+        """Initialize the search client.
 
         Args:
             max_results: Maximum number of results to return per query.
         """
         self.settings = get_settings()
-        self.base_url = self.settings.searxng_url.rstrip("/")
         self.max_results = max_results
         self._client = httpx.AsyncClient(timeout=10.0)
+
+        # Determine which backend to use
+        self._use_serper = bool(self.settings.serper_api_key)
+        if self._use_serper:
+            logger.info("Search client using Serper API")
+        else:
+            logger.info("Search client using SearXNG at %s", self.settings.searxng_url)
 
     async def __aenter__(self) -> SearchClient:
         return self
@@ -65,12 +70,59 @@ class SearchClient:
     async def search(self, query: str) -> list[SearchResult]:
         """Execute a web search query.
 
+        Routes to Serper or SearXNG based on configuration.
+
         Args:
             query: The search query string.
 
         Returns:
             A list of SearchResult objects, up to max_results.
         """
+        if self._use_serper:
+            return await self._search_serper(query)
+        return await self._search_searxng(query)
+
+    async def _search_serper(self, query: str) -> list[SearchResult]:
+        """Search via Serper (Google SERP API)."""
+        headers = {
+            "X-API-KEY": self.settings.serper_api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "q": query,
+            "num": self.max_results,
+        }
+
+        try:
+            response = await self._client.post(
+                _SERPER_URL,
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Serper search failed for query %r: %s", query, exc)
+            # Fall back to SearXNG if Serper fails
+            return await self._search_searxng(query)
+
+        results: list[SearchResult] = []
+        for item in data.get("organic", []):
+            if len(results) >= self.max_results:
+                break
+            results.append(
+                SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                )
+            )
+
+        return results
+
+    async def _search_searxng(self, query: str) -> list[SearchResult]:
+        """Search via self-hosted SearXNG instance."""
+        base_url = self.settings.searxng_url.rstrip("/")
         params = {
             "q": query,
             "format": "json",
@@ -79,7 +131,7 @@ class SearchClient:
 
         try:
             response = await self._client.get(
-                f"{self.base_url}/search",
+                f"{base_url}/search",
                 params=params,
             )
             response.raise_for_status()

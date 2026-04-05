@@ -239,12 +239,13 @@ class TestContextManagerAssembleContext:
     """Test context assembly output."""
 
     def test_assemble_context_empty(self) -> None:
-        """Sections should be present even when there is no data."""
+        """All four sections should be present even when there is no data."""
         cm = ContextManager()
         result = cm.assemble_context(question="What was discussed?", session_id="s1")
         assert "=== MEETING SUMMARY ===" in result
         assert "=== RECENT CONVERSATION (last 5 minutes) ===" in result
-        assert "=== RELEVANT DOCUMENTS ===" in result
+        assert "=== DOCUMENT OVERVIEWS ===" in result
+        assert "=== RELEVANT DOCUMENT PASSAGES ===" in result
 
     def test_assemble_context_with_buffer(self) -> None:
         cm = ContextManager()
@@ -263,7 +264,7 @@ class TestContextManagerAssembleContext:
         result = cm.assemble_context(question="How to set up API?", session_id="s1")
         assert "FastAPI docs excerpt" in result
         assert "[api.pdf]" in result
-        mock_rag.search.assert_called_once_with(query="How to set up API?", top_k=3)
+        mock_rag.search.assert_called_once_with(query="How to set up API?", top_k=5)
 
     def test_assemble_context_rag_failure_graceful(self) -> None:
         """A failing RAG pipeline should not crash assembly."""
@@ -290,15 +291,36 @@ class TestContextManagerAssembleContext:
         assert result_tokens < raw_tokens
 
     def test_assemble_context_without_rag(self) -> None:
-        """When no RAG pipeline is set, the documents section is empty."""
+        """When no RAG pipeline is set, the passages section is empty."""
         cm = ContextManager()
         cm.add_transcript("Some discussion content.")
         result = cm.assemble_context(question="test", session_id="s1")
-        # The RELEVANT DOCUMENTS section exists but is blank after the header.
         lines = result.split("\n")
-        doc_idx = next(i for i, l in enumerate(lines) if "RELEVANT DOCUMENTS" in l)
-        # The line after the header should be empty (no doc content).
+        doc_idx = next(i for i, l in enumerate(lines) if "RELEVANT DOCUMENT PASSAGES" in l)
         assert lines[doc_idx + 1].strip() == ""
+
+    def test_assemble_context_with_document_summaries(self) -> None:
+        """Document summaries should appear in the DOCUMENT OVERVIEWS section."""
+        cm = ContextManager()
+        cm.add_document_summary("report.pdf", "Q3 revenue was $10M, up 23% YoY.")
+        result = cm.assemble_context(question="test", session_id="s1")
+        assert "Q3 revenue was $10M" in result
+        assert "[report.pdf]" in result
+        assert "=== DOCUMENT OVERVIEWS ===" in result
+
+    def test_add_document_summary_ignores_empty(self) -> None:
+        """Empty summaries should not be added."""
+        cm = ContextManager()
+        cm.add_document_summary("empty.pdf", "")
+        cm.add_document_summary("blank.pdf", "   ")
+        assert len(cm.document_summaries) == 0
+
+    def test_reset_clears_document_summaries(self) -> None:
+        """Reset should clear document summaries."""
+        cm = ContextManager()
+        cm.add_document_summary("report.pdf", "Some summary")
+        cm.reset()
+        assert len(cm.document_summaries) == 0
 
 
 class TestContextManagerReset:

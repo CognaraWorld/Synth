@@ -38,3 +38,4 @@ postgres_data/
 
 # Logs
 *.log
+backend/chroma_data/

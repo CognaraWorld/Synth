@@ -7,38 +7,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.routes.auth import get_current_user
 from app.models.database import Agent, User, get_db
 from app.models.schemas import AgentCreate, AgentResponse, AgentUpdate
+from app.utils.bot_profiles import (
+    build_system_prompt,
+    get_effective_primary_agent,
+    get_persona_voice_label,
+    mark_primary_agent,
+)
+from app.utils.prompt_builder import resolve_persona_id
 
 router = APIRouter(prefix="/agents", tags=["agents"])
-
-GENERAL_SYSTEM_PROMPT = """You are Synth, a helpful AI meeting assistant. You are participating in a live meeting as a voice participant.
-
-Guidelines:
-- Listen carefully to the conversation and provide helpful, concise answers when asked
-- Only speak when addressed by name ("Hey Synth" or "Synth")
-- Keep responses brief and meeting-appropriate (30 seconds or less when spoken)
-- If you need to search the web for information, do so and provide accurate answers
-- If you're unsure about something, say so honestly
-- Be professional, friendly, and concise
-- Reference uploaded documents when relevant to the discussion"""
-
-
-async def generate_custom_prompt(description: str) -> str:
-    """Generate a tailored system prompt from user description.
-    In Phase 5, this will use Claude Haiku to generate the prompt.
-    For now, use a template approach."""
-    return f"""You are Synth, an AI meeting assistant with the following role and expertise:
-
-{description}
-
-Guidelines:
-- Stay in character for the entire meeting based on the role described above
-- Listen carefully to the conversation and provide helpful, concise answers when asked
-- Only speak when addressed by name ("Hey Synth" or "Synth")
-- Keep responses brief and meeting-appropriate (30 seconds or less when spoken)
-- Draw on your described expertise to provide relevant insights
-- If you need to search the web for information, do so and provide accurate answers
-- If asked about uploaded documents, reference them specifically
-- Be professional, friendly, and concise"""
 
 
 @router.post("/", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
@@ -47,17 +24,20 @@ async def create_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if agent_data.mode == "custom":
-        system_prompt = await generate_custom_prompt(agent_data.description)
-    else:
-        system_prompt = GENERAL_SYSTEM_PROMPT
+    has_primary = await get_effective_primary_agent(db, current_user.id) is not None
+    persona_id = resolve_persona_id(agent_data.mode, agent_data.persona_id)
+    mode = "general"
 
     agent = Agent(
         user_id=current_user.id,
         name=agent_data.name,
         description=agent_data.description,
-        system_prompt=system_prompt,
-        mode=agent_data.mode,
+        system_prompt=build_system_prompt(mode, agent_data.description, persona_id),
+        mode=mode,
+        persona_id=persona_id,
+        voice=get_persona_voice_label(persona_id),
+        response_mode=agent_data.response_mode,
+        is_primary=not has_primary,
     )
     db.add(agent)
     await db.commit()
@@ -105,7 +85,24 @@ async def update_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    for field, value in update_data.model_dump(exclude_unset=True).items():
+    payload = update_data.model_dump(exclude_unset=True, exclude_none=True)
+    persona_inputs_changed = "mode" in payload or "persona_id" in payload
+    if persona_inputs_changed:
+        candidate_mode = payload.get("mode", agent.mode)
+        candidate_persona = payload.get("persona_id", agent.persona_id)
+        resolved_persona = resolve_persona_id(candidate_mode, candidate_persona)
+        payload["mode"] = "general"
+        payload["persona_id"] = resolved_persona
+
+    next_persona = payload.get("persona_id", agent.persona_id)
+    payload["voice"] = get_persona_voice_label(next_persona)
+
+    if "system_prompt" not in payload and ("description" in payload or persona_inputs_changed):
+        next_description = payload.get("description", agent.description)
+        next_mode = payload.get("mode", agent.mode)
+        payload["system_prompt"] = build_system_prompt(next_mode, next_description, next_persona)
+
+    for field, value in payload.items():
         setattr(agent, field, value)
 
     await db.commit()
@@ -126,5 +123,18 @@ async def delete_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    was_primary = agent.is_primary
     await db.delete(agent)
+    await db.flush()
+
+    if was_primary:
+        replacement_result = await db.execute(
+            select(Agent)
+            .where(Agent.user_id == current_user.id)
+            .order_by(Agent.created_at.desc())
+        )
+        replacement = replacement_result.scalars().first()
+        if replacement:
+            await mark_primary_agent(db, current_user.id, replacement)
+
     await db.commit()

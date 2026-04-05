@@ -18,7 +18,8 @@ def _build_pattern(wake_word: str) -> re.Pattern:
     """Build a regex pattern for the given wake word.
 
     Supports "hey <name>" and bare "<name>" patterns with optional
-    punctuation between words. Cached for performance.
+    punctuation between words. Includes common phonetic misheard
+    variants from meeting caption STT systems.
 
     Args:
         wake_word: The trigger phrase (e.g. "hey synth").
@@ -27,8 +28,45 @@ def _build_pattern(wake_word: str) -> re.Pattern:
         Compiled regex pattern.
     """
     parts = wake_word.strip().lower().split()
+    if len(parts) == 2 and parts[0] == "hey" and parts[1] == "synth":
+        # "hey synth" — include phonetic variants that caption STT produces.
+        # Prefix is REQUIRED to avoid false positives on bare words like
+        # "since", "said", "system" in normal speech.
+        prefix = r"(?:hey|he|hay|a|they|hi|both|but)[,.\s]+"
+        name = (
+            r"(?:synth|sint|sent|since|sink|sync|sins|sinth|cinth|"
+            r"synths|sense|said|sit|assist|assistant|listen|"
+            r"tasted|system|cyst|sixth|sis|says)"
+        )
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
+    if len(parts) == 2 and parts[0] == "hey" and parts[1] == "assistant":
+        # "hey assistant" — include phonetic variants that meeting STT
+        # commonly produces. Prefix is REQUIRED to prevent false positives
+        # on bare "assistant" or "assist" in normal speech.
+        prefix = r"(?:hey|he|hay|a|as|they|hi|both|but)[,.\s]+"
+        name = (
+            r"(?:assistant|assistance|assisted|assistent|"
+            r"a\s*sistant|a\s*system|a\s*distance|"
+            r"assists?|assess|assessing|assisting|"
+            r"assist\s*ten|assist\s*and|assist\s*in|"
+            r"insisted|instant|persistent)"
+        )
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
+    if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
+        # "nova" or "hey nova" — accepts both with phonetic variants.
+        prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
+        name = r"(?:nova|over|no\s*va|nora|noah|mova|rover)"
+        return re.compile(
+            rf"\b{prefix}{name}\b",
+            re.IGNORECASE,
+        )
     if len(parts) == 2 and parts[0] == "hey":
-        # "hey synth" → matches "hey synth", "hey, synth", or just "synth"
         name = re.escape(parts[1])
         return re.compile(
             rf"\b(?:hey[,\s]*)?{name}\b",
@@ -41,7 +79,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
 
 def detect(
     transcript_text: str,
-    wake_word: str = "hey synth",
+    wake_word: str = "nova",
 ) -> tuple[bool, str]:
     """Detect the wake word in transcript text and extract the question.
 
@@ -65,6 +103,19 @@ def detect(
         >>> detect("Let's discuss the budget next.")
         (False, "")
     """
+    # Fast path: exact case-insensitive match with word boundary check
+    ww_lower = wake_word.strip().lower()
+    text_lower = transcript_text.lower()
+    exact_pos = text_lower.find(ww_lower)
+    if exact_pos != -1:
+        # Verify word boundary: char after wake word must be non-alphanumeric
+        end_pos = exact_pos + len(ww_lower)
+        if end_pos >= len(text_lower) or not text_lower[end_pos].isalnum():
+            after = transcript_text[end_pos:]
+            question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+            return (True, question)
+
+    # Fuzzy path: phonetic variants for STT mishearings
     pattern = _build_pattern(wake_word)
     match = pattern.search(transcript_text)
     if match is None:
@@ -73,7 +124,8 @@ def detect(
     # Extract everything after the wake word match
     after = transcript_text[match.end():]
 
-    # Strip leading punctuation (commas, colons, etc.) and whitespace
-    question = re.sub(r"^[\s,;:!?\-]+", "", after).strip()
+    # Strip leading punctuation and STT artifact words (e.g. "ten" from "assist ten")
+    question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
+    question = re.sub(r"^(?:ten|and|in|the)\b[\s,;:!?.\-]*", "", question, flags=re.IGNORECASE).strip()
 
     return (True, question)

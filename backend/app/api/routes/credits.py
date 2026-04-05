@@ -3,8 +3,8 @@
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -34,8 +34,8 @@ async def get_balance(
 
 @router.get("/transactions", response_model=CreditTransactionListResponse)
 async def list_transactions(
-    page: int = 1,
-    per_page: int = 20,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -101,7 +101,10 @@ async def refund_meeting_credit(
         select(CreditTransaction).where(
             CreditTransaction.user_id == current_user.id,
             CreditTransaction.transaction_type == "refund",
-            CreditTransaction.description.contains(str(meeting_id)),
+            or_(
+                CreditTransaction.meeting_id == meeting_id,
+                CreditTransaction.description.contains(str(meeting_id)),
+            ),
         )
     )
     if existing_refund.scalar_one_or_none():
@@ -111,11 +114,21 @@ async def refund_meeting_credit(
         )
 
     credits_to_refund = meeting.credits_used
-    current_user.credits += credits_to_refund
-    new_balance = current_user.credits
+
+    # Atomic credit update: use SQL-level arithmetic to prevent race
+    # conditions from concurrent requests (OWASP A04:2021 - Insecure Design).
+    # The UPDATE happens in a single SQL statement, so no read-modify-write gap.
+    result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id)
+        .values(credits=User.credits + credits_to_refund)
+        .returning(User.credits)
+    )
+    new_balance = result.scalar_one()
 
     transaction = CreditTransaction(
         user_id=current_user.id,
+        meeting_id=meeting.id,
         amount=credits_to_refund,
         balance_after=new_balance,
         transaction_type="refund",
