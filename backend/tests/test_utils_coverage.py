@@ -88,7 +88,7 @@ class TestFillerManagerCoverage:
         )
         monkeypatch.setattr("app.utils.filler.random.choice", lambda phrases: phrases[0])
 
-        class FakeTTS:
+        class StubTTS:
             voice = "voice-a"
 
             def __init__(self) -> None:
@@ -99,7 +99,7 @@ class TestFillerManagerCoverage:
                 return phrase.encode("utf-8")
 
         manager = FillerManager()
-        tts = FakeTTS()
+        tts = StubTTS()
 
         manager.preload(tts)
         first_call_count = len(tts.calls)
@@ -126,13 +126,13 @@ class TestFillerManagerCoverage:
             staticmethod(lambda pcm: f"mp3:{pcm.decode('utf-8')}"),
         )
         monkeypatch.setattr("app.utils.filler.random.choice", lambda phrases: phrases[0])
-        class FakeTTS:
+        class StubTTS:
             voice = "voice-a"
 
             def synthesize(self, phrase: str) -> bytes:
                 return phrase.encode("utf-8")
 
-        manager.preload(FakeTTS())
+        manager.preload(StubTTS())
         phrase = manager.get_filler_for_category(QueryCategory.GENERAL)
 
         assert manager.get_filler_mp3_b64(QueryCategory.GENERAL, voice="missing") == f"mp3:{phrase}"
