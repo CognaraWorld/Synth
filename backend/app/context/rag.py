@@ -159,6 +159,62 @@ class RAGPipeline:
 
         return output
 
+    def hybrid_search(self, query: str, top_k: int = 8) -> list[dict[str, Any]]:
+        """Hybrid search combining semantic similarity and keyword matching.
+
+        Runs a standard semantic search plus keyword-based retrieval for
+        key terms extracted from the query. Results are deduplicated and
+        merged, with semantic results ranked first.
+
+        Args:
+            query: The search query text.
+            top_k: Number of top results to return.
+
+        Returns:
+            Deduplicated list of result dicts sorted by relevance.
+        """
+        # Semantic search
+        semantic_results = self.search(query=query, top_k=top_k)
+
+        # Extract key terms for keyword search (words > 3 chars, skip stopwords)
+        _stopwords = {
+            "what", "when", "where", "which", "that", "this", "with",
+            "from", "about", "have", "been", "were", "they", "their",
+            "will", "would", "could", "should", "does",
+        }
+        terms = [
+            w for w in query.lower().split()
+            if len(w) > 3 and w not in _stopwords
+        ]
+
+        # Keyword search via ChromaDB's where_document filter
+        keyword_results: list[dict[str, Any]] = []
+        seen_texts: set[str] = {r["text"][:100] for r in semantic_results}
+
+        for term in terms[:3]:  # limit to top 3 terms to avoid slow queries
+            try:
+                kw_hits = self._collection.get(
+                    where_document={"$contains": term},
+                    limit=top_k,
+                    include=["documents", "metadatas"],
+                )
+                docs = kw_hits.get("documents", []) or []
+                metas = kw_hits.get("metadatas", []) or []
+                for doc, meta in zip(docs, metas):
+                    if doc and doc[:100] not in seen_texts:
+                        seen_texts.add(doc[:100])
+                        keyword_results.append({
+                            "text": doc,
+                            "metadata": meta or {},
+                            "score": 0.8,  # synthetic score for keyword matches
+                        })
+            except Exception as exc:
+                logger.debug("Keyword search for '%s' failed: %s", term, exc)
+
+        # Merge: semantic first, then keyword results
+        merged = semantic_results + keyword_results
+        return merged[:top_k]
+
     def embed(self, text: str) -> list[float]:
         """Generate an embedding vector for a text string.
 

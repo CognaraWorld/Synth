@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -65,7 +66,7 @@ async def test_reset_for_new_share_allows_reprocessing_same_frame() -> None:
     )
 
     await manager.handle_screenshot(b"A")
-    manager.reset_for_new_share()
+    await manager.reset_for_new_share()
     result = await manager.handle_screenshot(b"A")
 
     assert result.outcome == CaptureOutcome.EXTRACTED
@@ -125,7 +126,7 @@ async def test_video_frame_handler_recovers_missing_session_mapping(monkeypatch:
 async def test_screenshare_event_handler_recovers_missing_session_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    capture = SimpleNamespace(reset_for_new_share=MagicMock())
+    capture = SimpleNamespace(reset_for_new_share=AsyncMock())
     session = SimpleNamespace(screen_capture=capture)
     engine = MagicMock()
     engine.get_or_recover_session = AsyncMock(return_value=session)
@@ -139,16 +140,17 @@ async def test_screenshare_event_handler_recovers_missing_session_mapping(
     await webhook._handle_screenshare_event("participant_events.screenshare_on", payload)
 
     engine.get_or_recover_session.assert_awaited_once_with("bot-2")
-    capture.reset_for_new_share.assert_called_once()
+    capture.reset_for_new_share.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_create_meeting_requires_gemini_key_when_recall_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(sys.modules, "pydub", SimpleNamespace(AudioSegment=object))
     from app.api.routes.meetings import create_meeting
 
-    current_user = MagicMock(id=uuid4(), credits=3)
+    current_user = MagicMock(id=uuid4(), credits=5)
     primary_agent = MagicMock(
         id=uuid4(),
         is_primary=True,
@@ -162,8 +164,10 @@ async def test_create_meeting_requires_gemini_key_when_recall_enabled(
     query_result = MagicMock()
     query_result.scalars.return_value.all.return_value = [primary_agent]
 
+    reserve_result = SimpleNamespace(rowcount=1)
+
     db = AsyncMock()
-    db.execute.return_value = query_result
+    db.execute = AsyncMock(side_effect=[reserve_result, query_result])
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()

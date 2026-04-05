@@ -28,7 +28,7 @@ class Base(DeclarativeBase):
     pass
 
 
-DEFAULT_STARTER_CREDITS = 3
+DEFAULT_STARTER_CREDITS = 60  # minutes balance
 
 
 class User(Base):

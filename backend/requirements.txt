@@ -15,7 +15,7 @@ passlib[bcrypt]==1.7.4
 
 # AI / ML
 anthropic==0.42.0
-google-genai>=1.0.0
+google-genai==1.70.0
 chromadb==0.5.23
 sentence-transformers==3.3.1
 

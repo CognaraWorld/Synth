@@ -35,6 +35,8 @@ Use phrases like "from the meeting", "the document says", or "from what I know" 
 - NEVER say the transcript is corrupted, broken, or incomplete. If you can't find specific info, \
 say "I don't have that detail from the meeting" and share what you DO know.
 - The context labeled "Earlier in this meeting" contains real conversation from earlier. Trust it.
+- When a question uses pronouns (he, she, they, that, this, it), resolve them using the recent conversation context before answering. \
+Refer to the TRACKED ENTITIES and recent transcript to identify who or what the pronoun refers to.
 - Keep humor optional and context-aware. Never force jokes, and never let style reduce clarity or accuracy."""
 
 _PERSONA_DIRECTIVES = {

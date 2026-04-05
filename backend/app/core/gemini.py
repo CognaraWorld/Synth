@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,6 +33,8 @@ class GeminiVisionClient:
     def _get_client(self):
         if self._client is not None:
             return self._client
+        if not (self._api_key or "").strip():
+            return None
         try:
             from google import genai
             self._client = genai.Client(api_key=self._api_key)
@@ -61,11 +62,10 @@ class GeminiVisionClient:
         try:
             from google import genai
 
-            b64_image = base64.b64encode(image_bytes).decode("utf-8")
             # Detect MIME type from magic bytes: JPEG starts with FF D8, PNG with 89 50 4E 47
             mime_type = "image/jpeg" if image_bytes[:2] == b"\xff\xd8" else "image/png"
             image_part = genai.types.Part.from_bytes(
-                data=base64.b64decode(b64_image),
+                data=image_bytes,
                 mime_type=mime_type,
             )
 

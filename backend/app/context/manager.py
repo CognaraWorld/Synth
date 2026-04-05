@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +21,17 @@ from app.context.raw_buffer import RawTranscriptBuffer
 from app.context.rolling_summary import RollingSummary
 
 logger = logging.getLogger(__name__)
+
+# Markers for entity extraction
+_DECISION_MARKERS = (
+    "we decided", "let's go with", "agreed to", "the decision is",
+    "we'll do", "final answer is",
+)
+_ACTION_MARKERS = (
+    "i will", "i'll", "we need to", "action item", "todo",
+    "follow up on", "assigned to",
+)
+_VAGUE_PRONOUNS = {"he", "she", "they", "that", "this", "it"}
 
 
 class ContextManager:
@@ -49,9 +61,16 @@ class ContextManager:
         """
         self.max_context_tokens = max_context_tokens
         self.rolling_summary: RollingSummary = RollingSummary()
-        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=5)
+        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=10)
         self.rag_pipeline: Any | None = None
         self.document_summaries: list[dict[str, str]] = []
+        self.past_meeting_summaries: list[dict[str, str]] = []
+        self._entities: dict[str, set[str]] = {
+            "people": set(),
+            "topics": set(),
+            "decisions": set(),
+            "action_items": set(),
+        }
         self._transcript_embed_buffer: list[tuple[datetime, str]] = []
         self._embed_chunk_target: int = 200  # words per RAG chunk
         self._embed_stale_seconds: float = 120.0  # force-flush if oldest entry > 2 min
@@ -93,6 +112,123 @@ class ContextManager:
             if len(self._screen_contents) > self._MAX_SCREEN_ENTRIES:
                 self._screen_contents.pop(0)
 
+    def add_past_meeting_summary(self, meeting_date: str, summary: str) -> None:
+        """Register a past meeting summary for cross-meeting memory.
+
+        Args:
+            meeting_date: ISO date or display string for the meeting.
+            summary: Summary text from the previous meeting.
+        """
+        if summary and summary.strip():
+            self.past_meeting_summaries.append(
+                {"meeting_date": meeting_date, "summary": summary.strip()}
+            )
+
+    def _extract_entities(self, text: str, speaker: str = "") -> None:
+        """Extract named entities and key phrases from transcript text.
+
+        Detects decisions, action items, and tracks speakers as people.
+
+        Args:
+            text: Transcript text to analyze.
+            speaker: Speaker name (added to people set).
+        """
+        if speaker and speaker.strip():
+            self._entities["people"].add(speaker.strip())
+
+        text_lower = text.lower()
+
+        for marker in _DECISION_MARKERS:
+            if marker in text_lower:
+                # Capture the sentence containing the marker
+                idx = text_lower.index(marker)
+                end = text.find(".", idx)
+                if end == -1:
+                    end = len(text)
+                decision = text[idx:end + 1].strip()
+                if len(decision) > 10:
+                    self._entities["decisions"].add(decision)
+                break
+
+        for marker in _ACTION_MARKERS:
+            if marker in text_lower:
+                idx = text_lower.index(marker)
+                end = text.find(".", idx)
+                if end == -1:
+                    end = len(text)
+                action = text[idx:end + 1].strip()
+                if len(action) > 10:
+                    self._entities["action_items"].add(action)
+                break
+
+    def _rewrite_query(self, question: str, recent_text: str) -> str:
+        """Resolve vague pronouns in a question using recent context.
+
+        Short questions (< 6 words) containing pronouns like he/she/they/
+        that/this/it are expanded with speaker names and recent topics from
+        the buffer so RAG retrieval finds relevant chunks.
+
+        Args:
+            question: The raw user question.
+            recent_text: Recent transcript buffer text for context.
+
+        Returns:
+            The expanded query, or the original if no expansion needed.
+        """
+        words = question.lower().split()
+        if len(words) >= 6:
+            return question
+
+        has_vague = any(w in _VAGUE_PRONOUNS for w in words)
+        if not has_vague:
+            return question
+
+        # Build expansion from recent context
+        expansions: list[str] = []
+
+        # Extract recent speakers from buffer lines in reverse (most recent first)
+        # rather than from the unordered set, preserving recency.
+        if recent_text:
+            seen_speakers: list[str] = []
+            for line in reversed(recent_text.strip().split("\n")):
+                if ": " in line:
+                    # Strip time-ago prefix like "[2m ago] Speaker: text"
+                    speaker_part = line.split(": ", 1)[0]
+                    # Remove leading "[Xm ago] " if present
+                    if "] " in speaker_part:
+                        speaker_part = speaker_part.rsplit("] ", 1)[-1]
+                    speaker_part = speaker_part.strip()
+                    if speaker_part and speaker_part not in seen_speakers:
+                        seen_speakers.append(speaker_part)
+                    if len(seen_speakers) >= 3:
+                        break
+            if seen_speakers:
+                expansions.append(" ".join(seen_speakers))
+        elif self._entities["people"]:
+            # Fallback: no recent_text available, use sorted entity set
+            recent_people = sorted(self._entities["people"])[-3:]
+            expansions.append(" ".join(recent_people))
+
+        # Add recent topics from the last few lines of buffer
+        if recent_text:
+            lines = recent_text.strip().split("\n")[-5:]
+            for line in lines:
+                # Extract the content part (after "Speaker: ")
+                if ": " in line:
+                    content = line.split(": ", 1)[1]
+                else:
+                    content = line
+                # Take nouns/key words (words > 4 chars)
+                for w in content.split():
+                    cleaned = re.sub(r"[^\w]", "", w)
+                    if len(cleaned) > 4 and cleaned.lower() not in _VAGUE_PRONOUNS:
+                        expansions.append(cleaned)
+
+        if expansions:
+            expansion = " ".join(expansions[:8])
+            return f"{question} (context: {expansion})"
+        return question
+
     # ------------------------------------------------------------------
     # Token helpers
     # ------------------------------------------------------------------
@@ -127,6 +263,12 @@ class ContextManager:
             text: Transcript text segment.
             timestamp: When the segment was captured. Defaults to now.
         """
+        # Extract entities from transcript (speaker detection from "Speaker: text" format)
+        speaker = ""
+        if ": " in text:
+            speaker = text.split(": ", 1)[0].strip()
+        self._extract_entities(text, speaker)
+
         # Append to buffer — returns entries evicted by overflow or age
         evicted = self.raw_buffer.append(text, timestamp=timestamp)
 
@@ -263,18 +405,20 @@ class ContextManager:
         """Build the full context string for an LLM query.
 
         Assembles context in priority order:
+        0. Past meeting summaries (cross-meeting memory)
         1. Rolling summary of the full conversation
-        2. Recent raw transcript (last ~5 minutes)
-        3. Document overviews (full-document understanding)
+        2. Recent raw transcript (last ~10 minutes)
+        3. Document summaries (full-document understanding)
         4. Shared screen content (Gemini-extracted from screenshare frames)
-        5. RAG-retrieved document chunks relevant to the question
+        5. RAG-retrieved chunks (specific passages) — PRIMARY SOURCE
 
         Token budget allocation (approximate):
+        - 10 % past meeting summaries
         - 15 % meeting summary
         - 25 % recent buffer
-        - 15 % document summaries (full-document understanding)
-        - 20 % shared screen content (screenshare frames via Gemini Vision)
-        - 25 % RAG chunks (specific document passages)
+        - 10 % document summaries
+        - 20 % shared screen content
+        - 20 % RAG chunks
 
         Args:
             question: The user's question, used to guide RAG retrieval.
@@ -285,18 +429,28 @@ class ContextManager:
             A formatted context string ready for inclusion in the
             LLM prompt, within the token budget.
         """
+        budget_past = int(self.max_context_tokens * 0.10)
         budget_summary = int(self.max_context_tokens * 0.15)
         budget_buffer = int(self.max_context_tokens * 0.25)
-        budget_doc_summaries = int(self.max_context_tokens * 0.15)
-        budget_rag = int(self.max_context_tokens * 0.25)
+        budget_doc_summaries = int(self.max_context_tokens * 0.10)
         budget_screen = int(self.max_context_tokens * 0.20)
+        budget_rag = int(self.max_context_tokens * 0.20)
+
+        # --- Section 0: Past meeting summaries (cross-meeting memory) ---
+        past_text = ""
+        if self.past_meeting_summaries:
+            parts = []
+            for past in self.past_meeting_summaries:
+                parts.append(f"[{past['meeting_date']}]:\n{past['summary']}")
+            past_text = "\n\n".join(parts)
+        past_text = self._truncate_from_beginning(past_text, budget_past)
 
         # --- Section 1: Rolling meeting summary ---
         summary_text = self.rolling_summary.get_summary()
         summary_text = self._truncate_from_beginning(summary_text, budget_summary)
 
         # --- Section 2: Recent raw transcript ---
-        recent_text = self.raw_buffer.get_recent(minutes=5)
+        recent_text = self.raw_buffer.get_recent(minutes=10)
         recent_text = self._truncate_from_beginning(recent_text, budget_buffer)
 
         # --- Section 3: Document summaries (full-document understanding) ---
@@ -318,10 +472,18 @@ class ContextManager:
 
         rag_text = ""
         if self.rag_pipeline is not None:
+            # Rewrite the query to resolve vague pronouns
+            expanded_query = self._rewrite_query(question, recent_text)
             try:
-                results: list[dict[str, Any]] = self.rag_pipeline.search(
-                    query=question, top_k=8
-                )
+                # Use hybrid search if available, otherwise fall back to standard search
+                if hasattr(self.rag_pipeline, "hybrid_search"):
+                    results: list[dict[str, Any]] = self.rag_pipeline.hybrid_search(
+                        query=expanded_query, top_k=8
+                    )
+                else:
+                    results = self.rag_pipeline.search(
+                        query=expanded_query, top_k=8
+                    )
                 chunks: list[str] = []
                 for result in results:
                     text_content = result.get("text", "")
@@ -357,13 +519,33 @@ class ContextManager:
         # --- Assemble (skip empty sections to avoid confusing the LLM) ---
         sections: list[str] = []
 
+        if past_text.strip():
+            sections.append("=== PAST MEETINGS ===")
+            sections.append(past_text)
+            sections.append("")
+
         if summary_text.strip():
             sections.append("=== MEETING SUMMARY ===")
             sections.append(summary_text)
             sections.append("")
 
+        # Entities section — give the LLM quick reference to tracked items
+        entity_parts: list[str] = []
+        if self._entities["people"]:
+            entity_parts.append(f"People: {', '.join(sorted(self._entities['people']))}")
+        if self._entities["decisions"]:
+            for d in sorted(self._entities["decisions"])[-3:]:
+                entity_parts.append(f"Decision: {d}")
+        if self._entities["action_items"]:
+            for a in sorted(self._entities["action_items"])[-3:]:
+                entity_parts.append(f"Action: {a}")
+        if entity_parts:
+            sections.append("=== TRACKED ENTITIES ===")
+            sections.append("\n".join(entity_parts))
+            sections.append("")
+
         if recent_text.strip():
-            sections.append("=== RECENT CONVERSATION (last 5 minutes) ===")
+            sections.append("=== RECENT CONVERSATION (last 10 minutes) ===")
             sections.append(recent_text)
             sections.append("")
 
@@ -378,7 +560,7 @@ class ContextManager:
             sections.append("")
 
         if rag_text.strip():
-            sections.append("=== RELEVANT DOCUMENT PASSAGES ===")
+            sections.append("=== PRIMARY SOURCE — use these first ===")
             sections.append(rag_text)
 
         if not sections:
@@ -428,3 +610,10 @@ class ContextManager:
         self.rag_pipeline = None
         self.document_summaries.clear()
         self._screen_contents.clear()
+        self.past_meeting_summaries.clear()
+        self._entities = {
+            "people": set(),
+            "topics": set(),
+            "decisions": set(),
+            "action_items": set(),
+        }

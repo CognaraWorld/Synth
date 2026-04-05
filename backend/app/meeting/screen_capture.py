@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Video detection: if this many distinct frames arrive within the window -> video
+# Video detection: if this many frame-to-frame hash changes arrive within the window -> video
 _VIDEO_CHANGE_COUNT = 4
 _VIDEO_WINDOW_SECONDS = 5.0
 
