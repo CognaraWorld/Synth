@@ -336,20 +336,20 @@ async def _stop_orphaned_bots():
     """Stop any Recall.ai bots left running after a server restart.
 
     Finds meetings stuck as 'active' in the DB and sends a leave
-    command to their Recall bots. This prevents billing leaks when
-    uvicorn --reload restarts the process.
+    command to their Recall bots, then reconciles the meeting records
+    to a terminal state. This prevents billing leaks when uvicorn
+    --reload restarts the process.
     """
     try:
-        from app.models.database import Meeting, AsyncSessionLocal
+        import math
+        from datetime import datetime, timezone
+        from app.models.database import Meeting, User, AsyncSessionLocal
         from app.meeting.recall_client import RecallClient
-        from sqlalchemy import select
+        from sqlalchemy import select, update
 
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(Meeting).where(
-                    Meeting.status == "active",
-                    Meeting.bot_id.isnot(None),
-                )
+                select(Meeting).where(Meeting.status == "active")
             )
             orphans = result.scalars().all()
 
@@ -358,15 +358,56 @@ async def _stop_orphaned_bots():
 
             logger.warning("Found %d orphaned active meetings on startup — stopping their bots", len(orphans))
             recall = RecallClient()
+            now = datetime.now(timezone.utc)
             try:
                 for m in orphans:
-                    try:
-                        await recall.stop_bot(m.bot_id)
-                        logger.info("Stopped orphaned bot %s for meeting %s", m.bot_id[:8], m.id)
-                    except Exception as exc:
-                        logger.debug("Orphaned bot %s already stopped: %s", m.bot_id[:8], exc)
+                    # Stop the Recall bot if one exists
+                    if m.bot_id:
+                        try:
+                            await recall.stop_bot(m.bot_id)
+                            logger.info("Stopped orphaned bot %s for meeting %s", m.bot_id[:8], m.id)
+                        except Exception as exc:
+                            logger.debug("Orphaned bot %s already stopped: %s", m.bot_id[:8], exc)
+
+                    # Reconcile DB state: transition to ended, set timestamps,
+                    # and run idempotent billing settlement
+                    duration_seconds = 0.0
+                    if m.started_at:
+                        duration_seconds = (now - m.started_at).total_seconds()
+                    minutes_used = max(1, math.ceil(duration_seconds / 60)) if duration_seconds > 0 else 0
+
+                    # Idempotent billing: only bill if credits_used is still 0
+                    bill_result = await db.execute(
+                        update(Meeting)
+                        .where(Meeting.id == m.id, Meeting.credits_used == 0)
+                        .values(
+                            status="ended",
+                            ended_at=now,
+                            duration_minutes=minutes_used,
+                            credits_used=minutes_used,
+                        )
+                    )
+
+                    if bill_result.rowcount == 1 and minutes_used > 0:
+                        # Settle against the 5-min reserve
+                        delta = minutes_used - 5
+                        await db.execute(
+                            update(User)
+                            .where(User.id == m.user_id)
+                            .values(credits=User.credits - delta)
+                        )
+                        logger.info("Orphan billing: meeting %s charged %d min (delta %d)", m.id, minutes_used, delta)
+                    else:
+                        # Already billed or no duration — just ensure terminal state
+                        m.status = "ended"
+                        if not m.ended_at:
+                            m.ended_at = now
+
+                    logger.info("Reconciled orphaned meeting %s to ended state", m.id)
             finally:
                 await recall.close()
+
+            await db.commit()
     except Exception as exc:
         logger.error("Orphaned bot cleanup failed: %s", exc)
 

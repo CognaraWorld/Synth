@@ -95,7 +95,7 @@ class MeetingSession:
         self.agent_config: dict[str, Any] = agent_config or {}
         self.state: SessionState = SessionState.PENDING
         self.context_manager: ContextManager = ContextManager(
-            meeting_id=self.session_id,
+            meeting_id=self.meeting_id,
             agent_id=self.agent_config.get("agent_id", ""),
             user_id=self.agent_config.get("user_id", ""),
         )

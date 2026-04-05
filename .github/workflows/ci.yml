@@ -117,7 +117,7 @@ jobs:
         run: npm run lint
 
       - name: Type check
-        run: npx tsc --noEmit || true
+        run: npx tsc --noEmit
 
       - name: Build
         run: npm run build
