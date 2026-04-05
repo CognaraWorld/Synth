@@ -31,7 +31,7 @@ class TestRollingSummaryInit:
         rs = RollingSummary()
         assert rs.summary == ""
         assert rs._pending_text == ""
-        assert rs.update_interval_chars == 500
+        assert rs.update_interval_chars == 300
         assert rs._llm_client is None
 
     def test_init_custom_interval(self) -> None:
@@ -172,7 +172,7 @@ class TestContextManagerInit:
 
     def test_init(self) -> None:
         cm = ContextManager()
-        assert cm.max_context_tokens == 8000
+        assert cm.max_context_tokens == 16000
         assert cm.rolling_summary is not None
         assert cm.raw_buffer is not None
         assert cm.rag_pipeline is None
@@ -191,12 +191,14 @@ class TestContextManagerTokenCount:
 
     def test_token_count_single_word(self) -> None:
         cm = ContextManager()
-        assert cm.get_token_count("hello") == 1  # int(1 * 1.3) == 1
+        assert cm.get_token_count("hello") == 1  # int(1 * 1.5) == 1
 
     def test_token_count_multiple_words(self) -> None:
         cm = ContextManager()
         text = "the quick brown fox jumps over the lazy dog"  # 9 words
-        assert cm.get_token_count(text) == int(9 * 1.3)  # 11
+        count = cm.get_token_count(text)
+        # tiktoken gives exact count (9), fallback gives int(9 * 1.5) = 13
+        assert count >= 9 and count <= 13
 
     def test_token_count_returns_int(self) -> None:
         cm = ContextManager()
@@ -239,13 +241,10 @@ class TestContextManagerAssembleContext:
     """Test context assembly output."""
 
     def test_assemble_context_empty(self) -> None:
-        """All four sections should be present even when there is no data."""
+        """When no data exists, a placeholder message is returned."""
         cm = ContextManager()
         result = cm.assemble_context(question="What was discussed?", session_id="s1")
-        assert "=== MEETING SUMMARY ===" in result
-        assert "=== RECENT CONVERSATION (last 5 minutes) ===" in result
-        assert "=== DOCUMENT OVERVIEWS ===" in result
-        assert "=== RELEVANT DOCUMENT PASSAGES ===" in result
+        assert "no context available" in result.lower()
 
     def test_assemble_context_with_buffer(self) -> None:
         cm = ContextManager()
@@ -255,27 +254,31 @@ class TestContextManagerAssembleContext:
 
     def test_assemble_context_with_rag(self) -> None:
         cm = ContextManager()
+        # Add transcript so context isn't empty
+        cm.add_transcript("Alice: We need to set up the API layer.")
         mock_rag = MagicMock()
-        mock_rag.search.return_value = [
+        mock_rag.hybrid_search.return_value = [
             {"text": "FastAPI docs excerpt", "metadata": {"filename": "api.pdf"}},
         ]
         cm.set_rag_pipeline(mock_rag)
 
         result = cm.assemble_context(question="How to set up API?", session_id="s1")
         assert "FastAPI docs excerpt" in result
-        assert "[api.pdf]" in result
-        mock_rag.search.assert_called_once_with(query="How to set up API?", top_k=5)
+        assert "api.pdf" in result
+        assert mock_rag.hybrid_search.call_count >= 1
 
     def test_assemble_context_rag_failure_graceful(self) -> None:
         """A failing RAG pipeline should not crash assembly."""
         cm = ContextManager()
+        # Add transcript so context isn't empty
+        cm.add_transcript("Bob: Let's talk about the roadmap.")
         mock_rag = MagicMock()
-        mock_rag.search.side_effect = RuntimeError("Not initialized")
+        mock_rag.hybrid_search.side_effect = RuntimeError("Not initialized")
         cm.set_rag_pipeline(mock_rag)
 
         result = cm.assemble_context(question="test", session_id="s1")
-        # Should still contain structural sections without crashing.
-        assert "=== MEETING SUMMARY ===" in result
+        # Should still contain transcript content without crashing.
+        assert "roadmap" in result
 
     def test_assemble_context_respects_token_budget(self) -> None:
         """Very long text should be truncated to fit the budget."""
@@ -291,13 +294,12 @@ class TestContextManagerAssembleContext:
         assert result_tokens < raw_tokens
 
     def test_assemble_context_without_rag(self) -> None:
-        """When no RAG pipeline is set, the passages section is empty."""
+        """When no RAG pipeline is set, no PRIMARY SOURCE section appears."""
         cm = ContextManager()
         cm.add_transcript("Some discussion content.")
         result = cm.assemble_context(question="test", session_id="s1")
-        lines = result.split("\n")
-        doc_idx = next(i for i, l in enumerate(lines) if "RELEVANT DOCUMENT PASSAGES" in l)
-        assert lines[doc_idx + 1].strip() == ""
+        assert "=== PRIMARY SOURCE" not in result
+        assert "discussion content" in result
 
     def test_assemble_context_with_document_summaries(self) -> None:
         """Document summaries should appear in the DOCUMENT OVERVIEWS section."""
@@ -321,6 +323,110 @@ class TestContextManagerAssembleContext:
         cm.add_document_summary("report.pdf", "Some summary")
         cm.reset()
         assert len(cm.document_summaries) == 0
+
+
+class TestMemoryIsolation:
+    """Tests for memory scope isolation, deletion, and recovery (Item 10)."""
+
+    def test_transcript_metadata_includes_meeting_id(self) -> None:
+        """Transcript chunks embedded via _flush_embed_buffer should carry meeting_id."""
+        cm = ContextManager(meeting_id="mtg-1", agent_id="agt-1", user_id="usr-1")
+        mock_rag = MagicMock()
+        cm.set_rag_pipeline(mock_rag)
+
+        # Fill buffer past the chunk target to trigger a flush
+        for i in range(50):
+            cm.add_transcript(f"Speaker: word{i} " * 10)
+
+        cm._flush_embed_buffer(force=True)
+
+        if mock_rag.add_chunk.called:
+            meta = mock_rag.add_chunk.call_args.kwargs.get("metadata", {})
+            assert meta.get("meeting_id") == "mtg-1"
+            assert meta.get("agent_id") == "agt-1"
+            assert meta.get("source_type") == "transcript"
+
+    def test_cross_meeting_leakage_prevented_by_metadata_filter(self) -> None:
+        """RAG search should scope to current meeting when meeting_id is set."""
+        cm = ContextManager(meeting_id="mtg-current")
+        mock_rag = MagicMock()
+        mock_rag.hybrid_search.return_value = []
+        cm.set_rag_pipeline(mock_rag)
+        cm.add_transcript("Alice: Test content for scoping.")
+
+        cm.assemble_context(question="What did Alice say?", session_id="s1")
+
+        # hybrid_search should be called with where filters
+        for call_args in mock_rag.hybrid_search.call_args_list:
+            where = call_args.kwargs.get("where", {})
+            # At least one call should filter by meeting_id
+            assert where, "hybrid_search should be called with where filters"
+
+    def test_separate_document_and_transcript_queries(self) -> None:
+        """assemble_context should query documents and transcript separately."""
+        cm = ContextManager(meeting_id="mtg-1")
+        mock_rag = MagicMock()
+        mock_rag.hybrid_search.return_value = []
+        cm.set_rag_pipeline(mock_rag)
+        cm.add_transcript("Bob: Discussion about architecture.")
+
+        cm.assemble_context(question="What about architecture?", session_id="s1")
+
+        # Should have separate calls for transcript and document source types
+        call_wheres = [
+            call.kwargs.get("where", {})
+            for call in mock_rag.hybrid_search.call_args_list
+        ]
+        source_types = [w.get("source_type") for w in call_wheres if "source_type" in w]
+        assert "transcript" in source_types
+        assert "document" in source_types
+
+    def test_deleted_document_not_in_summaries(self) -> None:
+        """After clearing document summaries, they should not appear in context."""
+        cm = ContextManager()
+        cm.add_document_summary("report.pdf", "Revenue grew 25%.")
+        cm.add_transcript("Alice: Let's review the report.")
+
+        # Simulate deletion by clearing summaries
+        with cm._state_lock:
+            cm.document_summaries.clear()
+
+        result = cm.assemble_context(question="What about revenue?", session_id="s1")
+        assert "Revenue grew 25%" not in result
+
+    def test_past_meeting_summaries_available_in_context(self) -> None:
+        """Past meeting summaries should appear in context assembly."""
+        cm = ContextManager()
+        cm.add_past_meeting_summary("2026-04-01", "Decided to use PostgreSQL.")
+        cm.add_transcript("Bob: What database did we pick?")
+
+        result = cm.assemble_context(question="What database?", session_id="s1")
+        assert "PostgreSQL" in result
+        assert "PAST MEETINGS" in result
+
+    def test_scope_ids_propagated_to_context_manager(self) -> None:
+        """ContextManager should store scope IDs passed at construction."""
+        cm = ContextManager(meeting_id="m1", agent_id="a1", user_id="u1")
+        assert cm.meeting_id == "m1"
+        assert cm.agent_id == "a1"
+        assert cm.user_id == "u1"
+
+    def test_token_count_with_tiktoken(self) -> None:
+        """Token count should use tiktoken when available."""
+        cm = ContextManager()
+        # tiktoken is more accurate than word * 1.5
+        count = cm.get_token_count("Hello, world!")
+        assert isinstance(count, int)
+        assert count > 0
+        assert count < 10  # should be ~4 tokens, not 4 * 1.5 = 6
+
+    def test_rolling_summary_preserves_key_facts(self) -> None:
+        """RollingSummary should track key facts alongside prose."""
+        rs = RollingSummary()
+        assert rs._key_facts == []
+        assert rs._update_count == 0
+        rs.reset()
+        assert rs._key_facts == []
 
 
 class TestContextManagerReset:

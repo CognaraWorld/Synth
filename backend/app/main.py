@@ -9,7 +9,7 @@ from sqlalchemy import inspect, text
 from app.config import get_settings
 from app.models.database import engine, Base, DEFAULT_STARTER_CREDITS
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
-from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook
+from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook, reports, usage
 from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,25 @@ def _run_migrations(connection):
                 "WHERE persona_id IS NOT NULL"
             )
         )
+
+    if inspector.has_table("meeting_summaries"):
+        summary_columns = _get_columns(inspector, "meeting_summaries")
+        for col_name, ddl in [
+            ("email_delivery_status", "ALTER TABLE meeting_summaries ADD COLUMN email_delivery_status VARCHAR(50) DEFAULT 'pending'"),
+            ("email_delivered_at", "ALTER TABLE meeting_summaries ADD COLUMN email_delivered_at TIMESTAMP"),
+            ("key_points", "ALTER TABLE meeting_summaries ADD COLUMN key_points TEXT"),
+            ("action_items", "ALTER TABLE meeting_summaries ADD COLUMN action_items TEXT"),
+            ("decisions", "ALTER TABLE meeting_summaries ADD COLUMN decisions TEXT"),
+            ("pdf_path", "ALTER TABLE meeting_summaries ADD COLUMN pdf_path VARCHAR(1024)"),
+            ("docx_path", "ALTER TABLE meeting_summaries ADD COLUMN docx_path VARCHAR(1024)"),
+        ]:
+            _add_column_if_missing(
+                connection=connection,
+                table_name="meeting_summaries",
+                columns=summary_columns,
+                column_name=col_name,
+                ddl=ddl,
+            )
 
     if inspector.has_table("credit_transactions"):
         credit_columns = _get_columns(inspector, "credit_transactions")
@@ -290,6 +309,12 @@ async def lifespan(app: FastAPI):
         # Backfill missing columns on existing tables
         await conn.run_sync(_run_migrations)
 
+    # Stop orphaned Recall bots left running after server restart.
+    # When --reload restarts the process, in-memory sessions are lost
+    # but Recall bots keep running (and billing). This finds any
+    # meetings still marked "active" in the DB and stops their bots.
+    await _stop_orphaned_bots()
+
     # Pre-load TTS + filler cache in background thread so first meeting
     # doesn't block for ~3s while Kokoro loads
     loop = asyncio.get_running_loop()
@@ -305,6 +330,45 @@ async def lifespan(app: FastAPI):
     with contextlib.suppress(asyncio.CancelledError):
         await cleanup_task
     await engine.dispose()
+
+
+async def _stop_orphaned_bots():
+    """Stop any Recall.ai bots left running after a server restart.
+
+    Finds meetings stuck as 'active' in the DB and sends a leave
+    command to their Recall bots. This prevents billing leaks when
+    uvicorn --reload restarts the process.
+    """
+    try:
+        from app.models.database import Meeting, AsyncSessionLocal
+        from app.meeting.recall_client import RecallClient
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Meeting).where(
+                    Meeting.status == "active",
+                    Meeting.bot_id.isnot(None),
+                )
+            )
+            orphans = result.scalars().all()
+
+            if not orphans:
+                return
+
+            logger.warning("Found %d orphaned active meetings on startup — stopping their bots", len(orphans))
+            recall = RecallClient()
+            try:
+                for m in orphans:
+                    try:
+                        await recall.stop_bot(m.bot_id)
+                        logger.info("Stopped orphaned bot %s for meeting %s", m.bot_id[:8], m.id)
+                    except Exception as exc:
+                        logger.debug("Orphaned bot %s already stopped: %s", m.bot_id[:8], exc)
+            finally:
+                await recall.close()
+    except Exception as exc:
+        logger.error("Orphaned bot cleanup failed: %s", exc)
 
 
 async def _cleanup_stale_bots():
@@ -469,6 +533,8 @@ app.include_router(documents.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(credits.router, prefix="/api")
 app.include_router(webhook.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
+app.include_router(usage.router, prefix="/api")
 app.include_router(ws_router, prefix="/api")
 
 

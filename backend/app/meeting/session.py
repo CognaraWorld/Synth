@@ -94,7 +94,11 @@ class MeetingSession:
         self.meeting_id: str = meeting_id
         self.agent_config: dict[str, Any] = agent_config or {}
         self.state: SessionState = SessionState.PENDING
-        self.context_manager: ContextManager = ContextManager()
+        self.context_manager: ContextManager = ContextManager(
+            meeting_id=self.session_id,
+            agent_id=self.agent_config.get("agent_id", ""),
+            user_id=self.agent_config.get("user_id", ""),
+        )
 
         # Screen capture manager — wired up by BotEngine after session creation
         self.screen_capture: "ScreenCaptureManager | None" = None

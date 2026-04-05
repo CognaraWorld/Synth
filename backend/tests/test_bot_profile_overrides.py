@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -120,24 +120,31 @@ class TestAgentPrimaryBehavior:
         deleted_agent = MagicMock(id=uuid4(), is_primary=True)
         replacement_agent = MagicMock(id=uuid4(), is_primary=False)
 
-        first_result = MagicMock()
-        first_result.scalar_one_or_none.return_value = deleted_agent
-        second_result = MagicMock()
-        second_result.scalars.return_value.first.return_value = replacement_agent
-        third_result = MagicMock()
-        third_result.scalars.return_value.all.return_value = [replacement_agent]
+        # 1st: agent lookup
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = deleted_agent
+        # 2nd: document list for cleanup (empty — no docs)
+        doc_result = MagicMock()
+        doc_result.scalars.return_value.all.return_value = []
+        # 3rd: replacement agent lookup
+        replacement_result = MagicMock()
+        replacement_result.scalars.return_value.first.return_value = replacement_agent
+        # 4th: mark_primary_agent query
+        mark_result = MagicMock()
+        mark_result.scalars.return_value.all.return_value = [replacement_agent]
 
         db = AsyncMock()
-        db.execute.side_effect = [first_result, second_result, third_result]
+        db.execute.side_effect = [agent_result, doc_result, replacement_result, mark_result]
         db.delete = AsyncMock()
         db.flush = AsyncMock()
         db.commit = AsyncMock()
 
-        await delete_agent(
-            agent_id=deleted_agent.id,
-            current_user=current_user,
-            db=db,
-        )
+        with patch("app.api.routes.documents._get_rag_pipeline", return_value=None):
+            await delete_agent(
+                agent_id=deleted_agent.id,
+                current_user=current_user,
+                db=db,
+            )
 
         assert replacement_agent.is_primary is True
 
@@ -244,32 +251,34 @@ class TestMeetingOverrides:
     async def test_create_meeting_uses_primary_agent_when_agent_id_missing(self) -> None:
         from app.api.routes.meetings import create_meeting
 
-        current_user = MagicMock(id=uuid4(), credits=3)
-        primary_agent = MagicMock(id=uuid4())
+        current_user = MagicMock(id=uuid4(), credits=60)
+        primary_agent = MagicMock(id=uuid4(), is_primary=True)
 
+        # 1st execute: atomic reserve (rowcount=1)
+        reserve_result = MagicMock(rowcount=1)
+        # 2nd execute: get_effective_primary_agent -> select agents by user
         agent_result = MagicMock()
         agent_result.scalars.return_value.all.return_value = [primary_agent]
 
         db = AsyncMock()
-        db.execute.return_value = agent_result
+        db.execute.side_effect = [reserve_result, agent_result]
         db.add = MagicMock()
         db.commit = AsyncMock()
         db.refresh = AsyncMock()
 
-        meeting = await create_meeting(
-            meeting_data=MeetingCreate(meeting_link="https://zoom.us/j/123456789"),
-            current_user=current_user,
-            db=db,
-        )
+        mock_settings = MagicMock(recall_api_key="", deepgram_api_key="")
+        with (
+            patch("app.api.routes.meetings.detect_platform", return_value="zoom"),
+            patch("app.api.routes.meetings.get_settings", return_value=mock_settings),
+        ):
+            meeting = await create_meeting(
+                meeting_data=MeetingCreate(meeting_link="https://zoom.us/j/123456789"),
+                current_user=current_user,
+                db=db,
+            )
 
-        created_meeting = next(
-            call.args[0]
-            for call in db.add.call_args_list
-            if hasattr(call.args[0], "agent_id")
-        )
+        created_meeting = db.add.call_args.args[0]
         assert created_meeting.agent_id == primary_agent.id
-        assert meeting is created_meeting
-        assert current_user.credits == 2
 
     @pytest.mark.asyncio
     async def test_create_meeting_with_unknown_explicit_agent_keeps_agent_not_found_message(self) -> None:

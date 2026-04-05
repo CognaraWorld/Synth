@@ -1,25 +1,38 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
-import { Providers } from "@/components/providers";
-import "@/app/globals.css";
+import localFont from "next/font/local";
+import "./globals.css";
 
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
+const inter = localFont({
+  src: [
+    { path: "../public/fonts/InterVariable.woff2", style: "normal" },
+  ],
+  variable: "--font-sans",
   display: "swap",
-  weight: ["300", "400", "500", "600", "700", "800"],
+  fallback: [
+    "system-ui",
+    "-apple-system",
+    "BlinkMacSystemFont",
+    "Segoe UI",
+    "Roboto",
+    "sans-serif",
+  ],
 });
 
 export const metadata: Metadata = {
-  title: "Meeting Bot — Control Center",
-  description: "AI meeting bot that joins, listens, and speaks in your meetings."
+  title: "Synth — AI Meeting Assistant",
+  description:
+    "Synth joins your meetings, takes notes, and provides intelligent summaries so you can focus on the conversation.",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
   return (
-    <html lang="en" className={inter.variable} suppressHydrationWarning>
-      <body className="font-sans">
-        <Providers>{children}</Providers>
+    <html lang="en" className={`${inter.variable} dark`}>
+      <body className="min-h-screen bg-background text-foreground antialiased">
+        {children}
       </body>
     </html>
   );

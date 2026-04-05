@@ -1,3 +1,5 @@
+import logging
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -5,8 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
-from app.models.database import Agent, User, get_db
+from app.config import get_settings
+from app.models.database import Agent, Document, Meeting, User, get_db
 from app.models.schemas import AgentCreate, AgentResponse, AgentUpdate
+from app.utils.storage import is_managed_path
 from app.utils.bot_profiles import (
     build_system_prompt,
     get_effective_primary_agent,
@@ -116,6 +120,9 @@ async def delete_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    logger = logging.getLogger(__name__)
+    settings = get_settings()
+
     result = await db.execute(
         select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
     )
@@ -123,10 +130,34 @@ async def delete_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    # 1. Clean up uploaded document files from disk
+    doc_result = await db.execute(
+        select(Document).where(Document.agent_id == agent_id)
+    )
+    for doc in doc_result.scalars().all():
+        if is_managed_path(Path(settings.upload_dir), doc.file_path):
+            file_path = Path(doc.file_path)
+            if file_path.exists():
+                file_path.unlink()
+
+    # 2. Clean up ChromaDB embeddings for this agent
+    try:
+        from app.api.routes.documents import _get_rag_pipeline, _rag_pipelines
+        rag = _get_rag_pipeline(str(agent_id))
+        if rag:
+            rag.clear()
+            # Remove from cache so it's not reused
+            _rag_pipelines.pop(str(agent_id), None)
+            logger.info("Cleared ChromaDB collection for agent %s", agent_id)
+    except Exception as exc:
+        logger.warning("Failed to clear ChromaDB for agent %s: %s", agent_id, exc)
+
+    # 3. Delete agent (cascades to documents + meetings via ORM)
     was_primary = agent.is_primary
     await db.delete(agent)
     await db.flush()
 
+    # 4. Reassign primary if needed
     if was_primary:
         replacement_result = await db.execute(
             select(Agent)
@@ -138,3 +169,4 @@ async def delete_agent(
             await mark_primary_agent(db, current_user.id, replacement)
 
     await db.commit()
+    logger.info("Agent %s deleted with all associated data", agent_id)

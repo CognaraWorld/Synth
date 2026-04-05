@@ -392,9 +392,15 @@ class BotEngine:
         # Flush remaining transcript chunks to RAG then cleanup
         session.context_manager.flush_remaining_embeddings()
 
-        # Save meeting summary to database for cross-meeting memory
+        # Save meeting summary + structured entities for cross-meeting memory
         if session.bot_id and summary:
-            _task = asyncio.create_task(self._save_meeting_summary(session.bot_id, summary))
+            with session.context_manager._state_lock:
+                entities_snapshot = {
+                    k: set(v) for k, v in session.context_manager._entities.items()
+                }
+            _task = asyncio.create_task(
+                self._save_meeting_summary(session.bot_id, summary, entities_snapshot)
+            )
             _task.add_done_callback(_log_task_exception)
 
         # Clean up all session resources
@@ -618,8 +624,13 @@ class BotEngine:
 
         logger.warning("WAKE WORD DETECTED session=%s question=%s", session_id, question)
 
-        # Step 5: Process the question
-        return await self._handle_question(session, question)
+        # Step 5: Process the question (acquire lock to prevent concurrent handling)
+        lock = self._processing_lock.get(session_id)
+        if lock is None:
+            self._ensure_session_tracking(session_id)
+            lock = self._processing_lock[session_id]
+        async with lock:
+            return await self._handle_question(session, question)
 
     async def _recover_session(self, bot_id: str) -> MeetingSession | None:
         """Recover a session for a bot_id by looking up the meeting in the DB."""
@@ -643,6 +654,7 @@ class BotEngine:
 
                 agent_config = {
                     "agent_id": str(meeting.agent_id),
+                    "user_id": str(meeting.user_id),
                     "agent_name": agent.name if agent else "Synth",
                     "mode": agent.mode if agent else "general",
                     "persona_id": getattr(agent, "persona_id", "general") if agent else "general",
@@ -693,10 +705,29 @@ class BotEngine:
                 for doc in doc_result.scalars().all():
                     session.context_manager.add_document_summary(doc.filename, doc.doc_summary)
 
-                # Wire up screen capture.
-                # State (_last_hash, _video_warned) starts fresh after a restart —
-                # the first frame of an ongoing share may produce one extra Gemini
-                # call, but capture is fully functional again immediately.
+                # Load past meeting summaries for cross-meeting memory
+                try:
+                    from sqlalchemy.orm import joinedload
+                    from app.models.database import MeetingSummary
+                    past_result = await db.execute(
+                        select(Meeting)
+                        .options(joinedload(Meeting.summary))
+                        .where(
+                            Meeting.agent_id == meeting.agent_id,
+                            Meeting.status == "ended",
+                            Meeting.id != meeting.id,
+                        )
+                        .order_by(Meeting.created_at.desc())
+                        .limit(3)
+                    )
+                    for pm in past_result.unique().scalars().all():
+                        if pm.summary and pm.summary.content:
+                            date_str = pm.created_at.strftime("%Y-%m-%d %H:%M") if pm.created_at else "unknown"
+                            session.context_manager.add_past_meeting_summary(date_str, pm.summary.content)
+                except Exception as past_exc:
+                    logger.warning("Failed to load past summaries during recovery: %s", past_exc)
+
+                # Wire up screen capture
                 self.wire_screen_capture(session)
 
                 session.transition(SessionState.JOINING)
@@ -771,11 +802,16 @@ class BotEngine:
             logger.info("Participant interrupted bot — stopped audio for session %s", sid[:8])
             return
 
-        # Stop phrase while audio is still playing (follow-up window)
-        if is_stop and session.bot_id:
-            _task = asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
-            _task.add_done_callback(_log_task_exception)
-            logger.info("Stop phrase detected — killed audio for session %s", session.session_id[:8])
+        # Stop phrase — kill audio AND close follow-up window so bot goes silent
+        if is_stop:
+            if session.bot_id:
+                _task = asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+                _task.add_done_callback(_log_task_exception)
+            # Close the follow-up window so bot stops listening for questions
+            self._last_response_time.pop(session.session_id, None)
+            self._followup_speakers.pop(session.session_id, None)
+            self._pending_question.pop(session.session_id, None)
+            logger.info("Stop phrase detected — killed audio + follow-up for session %s", session.session_id[:8])
             return
 
         # Echo prevention: ignore transcripts during cooldown after bot speaks
@@ -1023,9 +1059,10 @@ class BotEngine:
             category = classify_query(question)
             filler_duration = 0.0
             if session.bot_id:
+                persona_voice = get_persona_tts_voice(session.agent_config.get("persona_id"))
                 filler_phrase = self._filler_manager.get_filler_for_category(category)
-                filler_pcm = self._filler_manager._cache.get(filler_phrase, b"")
-                filler_b64 = self._filler_manager._mp3_cache.get(filler_phrase, "")
+                filler_pcm = self._filler_manager.get_filler_audio(category, voice=persona_voice)
+                filler_b64 = self._filler_manager.get_filler_mp3_b64(category, voice=persona_voice)
                 if filler_b64:
                     await self._recall_client.send_audio_b64(session.bot_id, filler_b64)
                     # Track filler for echo detection
@@ -1036,6 +1073,14 @@ class BotEngine:
                         filler_duration = len(filler_pcm) / 48000
             filler_sent_at = time.time()
 
+            # Rewrite the question with recent conversation context so both
+            # RAG search and web search include the right topic keywords.
+            # e.g. "give me good locations in Delhi" → "give me good locations
+            # in Delhi (context: restaurant India opportunities)"
+            recent_text = session.context_manager.raw_buffer.get_recent(minutes=5)
+            search_query = session.context_manager._rewrite_query(question, recent_text)
+            logger.debug("Search query: %s → %s", question, search_query)
+
             # Assemble context + web search in parallel (search runs speculatively)
             context_task = asyncio.get_running_loop().run_in_executor(
                 None,
@@ -1044,7 +1089,7 @@ class BotEngine:
                 session.session_id,
             )
             search_task = asyncio.create_task(
-                self._search_client.search_formatted(question)
+                self._search_client.search_formatted(search_query)
             )
 
             context = await context_task
@@ -1075,23 +1120,32 @@ class BotEngine:
             # Attach search results if available (ran in parallel, adds no latency)
             try:
                 search_results = await search_task
-                if search_results and search_results.strip():
+                if search_results and search_results.strip() and "No results found" not in search_results:
                     context = (
-                        f"{context}\n\n=== WEB SEARCH RESULTS (use only if relevant to the question) ===\n"
-                        f"{search_results}"
+                        f"{context}\n\n=== WEB SEARCH RESULTS ===\n"
+                        f"{search_results}\n"
+                        f"(Include relevant web search info in your answer. Combine it with "
+                        f"document and meeting context for a complete response.)"
                     )
             except Exception as exc:
                 logger.debug("Speculative search failed (non-blocking): %s", exc)
 
-            # Single LLM call with full context + search results
+            # Single LLM call with full context + search results (30s timeout)
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
 
-            response_text = await self._llm_client.async_query(
-                context=context,
-                question=question,
-                system_prompt=system_prompt,
-            )
+            try:
+                response_text = await asyncio.wait_for(
+                    self._llm_client.async_query(
+                        context=context,
+                        question=question,
+                        system_prompt=system_prompt,
+                    ),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM timed out after 30s for session %s", session.session_id[:8])
+                response_text = "I'm taking too long to think about that. Could you ask again?"
 
             # Skip non-answers
             cleaned = response_text.strip().strip("()[]").lower()
@@ -1121,10 +1175,14 @@ class BotEngine:
                     response_text[:100],
                 )
 
-                # Synthesize — hold TTS lock to prevent voice switch races across sessions
+                # Synthesize in thread executor to avoid blocking the event loop
+                # (Kokoro TTS is CPU-bound). Hold TTS lock for voice switch + synthesis.
                 async with self._tts_lock:
                     self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
-                    response_audio = self._tts.synthesize(response_text)
+                    loop = asyncio.get_running_loop()
+                    response_audio = await loop.run_in_executor(
+                        None, self._tts.synthesize, response_text
+                    )
                 if session.bot_id and response_audio:
                     # Wait for filler to finish playing
                     elapsed = time.time() - filler_sent_at
@@ -1155,6 +1213,14 @@ class BotEngine:
                             session.context_manager.add_transcript(partial)
                             break
                         await asyncio.sleep(0.3)  # check every 300ms
+
+            # Store bot's response in transcript buffer so follow-up
+            # questions have full conversational context (Q + A).
+            if response_text:
+                bot_name = session.agent_config.get("agent_name", "Nova")
+                session.context_manager.add_transcript(
+                    f"{bot_name}: {response_text.strip()}"
+                )
 
             # Track response text for echo detection
             if response_text:
@@ -1188,7 +1254,7 @@ class BotEngine:
                     logger.info("Processing queued question for session %s", session.session_id[:8])
                     # Route through _process_pending_question to acquire the processing lock
                     self._pending_question[session.session_id] = {
-                        "question": f"nova {q}",  # re-add wake word for detection
+                        "question": f"{wake_word_cfg} {q}",  # re-add wake word for detection
                         "speaker": queued.get("speaker", ""),
                         "timestamp": time.time(),
                     }
@@ -1222,14 +1288,25 @@ class BotEngine:
     # Cross-meeting memory
     # ------------------------------------------------------------------
 
-    async def _save_meeting_summary(self, bot_id: str, content: str) -> None:
-        """Persist meeting summary to the database for cross-meeting memory.
+    async def _save_meeting_summary(
+        self,
+        bot_id: str,
+        content: str,
+        entities: dict[str, set[str]] | None = None,
+    ) -> None:
+        """Persist meeting summary and structured entities to the database.
+
+        Saves both the prose summary (for cross-meeting context) and
+        structured entities (decisions, action items, people) as first-class
+        fields for production reuse (Item 5).
 
         Args:
             bot_id: The Recall.ai bot ID to look up the meeting record.
             content: The rolling summary content to save.
+            entities: Optional dict of entity sets from the context manager.
         """
         try:
+            import json
             from app.models.database import Meeting, MeetingSummary, AsyncSessionLocal
             from sqlalchemy import select
 
@@ -1242,7 +1319,6 @@ class BotEngine:
                     logger.warning("No meeting found for bot %s — summary not saved", bot_id[:8])
                     return
 
-                # Check if summary already exists
                 existing = await db.execute(
                     select(MeetingSummary).where(MeetingSummary.meeting_id == meeting.id)
                 )
@@ -1250,9 +1326,23 @@ class BotEngine:
                     logger.debug("Summary already exists for meeting %s", meeting.id)
                     return
 
+                # Build structured fields from entity tracker
+                key_points: list[str] = []
+                action_items: list[str] = []
+                decisions: list[str] = []
+                if entities:
+                    decisions = sorted(entities.get("decisions", set()))
+                    action_items = sorted(entities.get("action_items", set()))
+                    people = sorted(entities.get("people", set()))
+                    if people:
+                        key_points.append(f"Participants: {', '.join(people)}")
+
                 summary_record = MeetingSummary(
                     meeting_id=meeting.id,
                     content=content,
+                    key_points=json.dumps(key_points) if key_points else None,
+                    action_items=json.dumps(action_items) if action_items else None,
+                    decisions=json.dumps(decisions) if decisions else None,
                 )
                 db.add(summary_record)
                 await db.commit()

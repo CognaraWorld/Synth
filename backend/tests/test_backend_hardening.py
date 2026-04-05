@@ -84,6 +84,7 @@ class TestAuthRegistrationHardening:
     @pytest.mark.asyncio
     async def test_register_creates_starter_credit_transaction(self) -> None:
         from app.api.routes.auth import register
+        from app.models.database import DEFAULT_STARTER_CREDITS
 
         query_result = MagicMock()
         query_result.scalar_one_or_none.return_value = None
@@ -97,7 +98,7 @@ class TestAuthRegistrationHardening:
         async def flush_side_effect() -> None:
             user = db.add.call_args_list[0].args[0]
             user.id = uuid4()
-            user.credits = 3
+            user.credits = DEFAULT_STARTER_CREDITS
             user.created_at = datetime.now(timezone.utc)
 
         db.flush.side_effect = flush_side_effect
@@ -107,7 +108,7 @@ class TestAuthRegistrationHardening:
                 UserCreate(
                     email="user@example.com",
                     name="Test User",
-                    password="strong-pass-123",
+                    password="StrongPass123",
                     provider="email",
                 ),
                 db=db,
@@ -116,9 +117,9 @@ class TestAuthRegistrationHardening:
         added_objects = [call.args[0] for call in db.add.call_args_list]
         transaction = next(obj for obj in added_objects if isinstance(obj, CreditTransaction))
         assert transaction.transaction_type == "free_credit"
-        assert transaction.amount == 3
-        assert transaction.balance_after == 3
-        assert result.credits == 3
+        assert transaction.amount == DEFAULT_STARTER_CREDITS
+        assert transaction.balance_after == DEFAULT_STARTER_CREDITS
+        assert result.credits == DEFAULT_STARTER_CREDITS
 
 
 class TestStartupMigrations:
@@ -136,13 +137,14 @@ class TestStartupMigrations:
             if table_name == "users":
                 return [{"name": "id"}, {"name": "email"}, {"name": "hashed_password"}]
             if table_name == "credit_transactions":
+                # Simulate legacy schema missing balance_after and stripe_session_id
                 return [
                     {"name": "id", "nullable": False},
                     {"name": "user_id", "nullable": False},
                     {"name": "meeting_id", "nullable": False},
-                    {"name": "amount", "nullable": False},
-                    {"name": "transaction_type", "nullable": False},
-                    {"name": "description", "nullable": False},
+                    {"name": "amount", "nullable": True},
+                    {"name": "transaction_type", "nullable": True},
+                    {"name": "description", "nullable": True},
                     {"name": "created_at", "nullable": True},
                 ]
             raise AssertionError(f"Unexpected table lookup: {table_name}")
@@ -156,17 +158,17 @@ class TestStartupMigrations:
             _run_migrations(connection)
 
         executed_sql = [str(call.args[0]).strip() for call in connection.execute.call_args_list]
-        assert "ALTER TABLE users ADD COLUMN provider VARCHAR(50)" in executed_sql
-        assert "ALTER TABLE users ADD COLUMN credits INTEGER" in executed_sql
+        assert "ALTER TABLE users ADD COLUMN IF NOT EXISTS provider VARCHAR(50)" in executed_sql
+        assert "ALTER TABLE users ADD COLUMN IF NOT EXISTS credits INTEGER" in executed_sql
         assert "UPDATE users SET provider = 'email' WHERE provider IS NULL" in executed_sql
-        assert "UPDATE users SET credits = 3 WHERE credits IS NULL" in executed_sql
+        assert "UPDATE users SET credits = 60 WHERE credits IS NULL" in executed_sql
         assert "ALTER TABLE users ALTER COLUMN provider SET DEFAULT 'email'" in executed_sql
-        assert "ALTER TABLE users ALTER COLUMN credits SET DEFAULT 3" in executed_sql
+        assert "ALTER TABLE users ALTER COLUMN credits SET DEFAULT 60" in executed_sql
         assert "ALTER TABLE users ALTER COLUMN provider SET NOT NULL" in executed_sql
         assert "ALTER TABLE users ALTER COLUMN credits SET NOT NULL" in executed_sql
-        assert "ALTER TABLE credit_transactions ADD COLUMN balance_after INTEGER" in executed_sql
+        assert "ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS balance_after INTEGER" in executed_sql
         assert (
-            "ALTER TABLE credit_transactions ADD COLUMN stripe_session_id VARCHAR(255)"
+            "ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255)"
             in executed_sql
         )
         assert (
@@ -224,33 +226,32 @@ class TestStartupMigrations:
 
 class TestMeetingCreditAuditTrail:
     @pytest.mark.asyncio
-    async def test_create_meeting_records_credit_transaction(self) -> None:
+    async def test_create_meeting_reserves_5_minutes(self) -> None:
+        """create_meeting atomically reserves 5 minutes from user balance."""
         from app.api.routes.meetings import create_meeting
 
         user_id = uuid4()
         agent_id = uuid4()
-        current_user = MagicMock(id=user_id, credits=3)
+        current_user = MagicMock(id=user_id, credits=60)
         agent = MagicMock(id=agent_id, user_id=user_id)
 
-        query_result = MagicMock()
-        query_result.scalar_one_or_none.return_value = agent
+        # First call: atomic reserve (rowcount=1 means success)
+        reserve_result = MagicMock(rowcount=1)
+        # Second call: agent lookup
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
 
         db = AsyncMock()
-        db.execute.return_value = query_result
+        db.execute.side_effect = [reserve_result, agent_result]
         db.add = MagicMock()
         db.commit = AsyncMock()
         db.refresh = AsyncMock()
 
-        async def flush_side_effect() -> None:
-            for call in db.add.call_args_list:
-                obj = call.args[0]
-                if hasattr(obj, "meeting_link"):
-                    obj.id = uuid4()
-                    break
-
-        db.flush.side_effect = flush_side_effect
-
-        with patch("app.api.routes.meetings.detect_platform", return_value="zoom"):
+        mock_settings = MagicMock(recall_api_key="", deepgram_api_key="")
+        with (
+            patch("app.api.routes.meetings.detect_platform", return_value="zoom"),
+            patch("app.api.routes.meetings.get_settings", return_value=mock_settings),
+        ):
             meeting = await create_meeting(
                 MeetingCreate(
                     agent_id=agent_id,
@@ -260,14 +261,11 @@ class TestMeetingCreditAuditTrail:
                 db=db,
             )
 
-        added_objects = [call.args[0] for call in db.add.call_args_list]
-        transaction = next(obj for obj in added_objects if isinstance(obj, CreditTransaction))
-
-        assert current_user.credits == 2
-        assert transaction.transaction_type == "meeting_used"
-        assert transaction.amount == -1
-        assert transaction.balance_after == 2
-        assert transaction.meeting_id == meeting.id
+        # Meeting created with credits_used=0 (billing happens at stop)
+        created_meeting = db.add.call_args.args[0]
+        assert created_meeting.credits_used == 0
+        assert created_meeting.status == "pending"
+        assert created_meeting.agent_id == agent_id
 
     @pytest.mark.asyncio
     async def test_refund_meeting_credit_blocks_legacy_duplicate_refund(self) -> None:
@@ -301,13 +299,18 @@ class TestMeetingCreditAuditTrail:
         current_user = MagicMock(id=uuid4(), credits=2)
         meeting = MagicMock(id=meeting_id, user_id=current_user.id, status="failed", credits_used=2)
 
+        # 1st call: meeting lookup
         meeting_result = MagicMock()
         meeting_result.scalar_one_or_none.return_value = meeting
+        # 2nd call: existing refund check
         refund_result = MagicMock()
         refund_result.scalar_one_or_none.return_value = None
+        # 3rd call: atomic credit update with .returning() -> new balance
+        update_result = MagicMock()
+        update_result.scalar_one.return_value = 4  # new balance after refund
 
         db = AsyncMock()
-        db.execute.side_effect = [meeting_result, refund_result]
+        db.execute.side_effect = [meeting_result, refund_result, update_result]
         db.add = MagicMock()
         db.commit = AsyncMock()
         db.refresh = AsyncMock()
@@ -319,12 +322,10 @@ class TestMeetingCreditAuditTrail:
         )
 
         created_transaction = db.add.call_args.args[0]
-        assert current_user.credits == 4
         assert created_transaction.meeting_id == meeting_id
         assert created_transaction.amount == 2
         assert created_transaction.balance_after == 4
         assert created_transaction.transaction_type == "refund"
-        assert transaction is created_transaction
 
 
 class TestWebhookUuidHardening:

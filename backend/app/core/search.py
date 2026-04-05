@@ -170,11 +170,11 @@ class SearchClient:
         results = await self.search(query)
 
         if not results:
-            return f'Web Search Results for "{query}":\nNo results found.'
+            return ""
 
         lines = [f'Web Search Results for "{query}":']
         for idx, result in enumerate(results, start=1):
-            lines.append(f"{idx}. [{result.title}]({result.url}) — {result.snippet}")
+            lines.append(f"{idx}. {result.title}: {result.snippet}")
 
         return "\n".join(lines)
 

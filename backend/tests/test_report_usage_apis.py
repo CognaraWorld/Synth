@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from fastapi import BackgroundTasks
 
 
 class TestReportFinalization:
@@ -166,42 +165,47 @@ class TestReportsApi:
 
 class TestUsageApi:
     @pytest.mark.asyncio
-    async def test_stop_meeting_defers_report_finalization(self) -> None:
+    async def test_stop_meeting_ends_active_meeting(self) -> None:
         from app.api.routes.meetings import stop_meeting
-        from app.meeting.reporting import finalize_meeting_artifacts_for_meeting_id
 
         current_user = SimpleNamespace(id=uuid4(), email="owner@example.com")
         meeting = SimpleNamespace(
             id=uuid4(),
             user_id=current_user.id,
             status="active",
-            started_at=datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc),
+            bot_id=None,
+            started_at=datetime(2026, 4, 3, 10, 0),  # naive UTC to match code
             ended_at=None,
             duration_minutes=None,
+            credits_used=0,
         )
-        result = MagicMock()
-        result.scalar_one_or_none.return_value = meeting
+        # 1st execute: meeting lookup
+        lookup_result = MagicMock()
+        lookup_result.scalar_one_or_none.return_value = meeting
+        # 2nd execute: idempotent billing update (rowcount=1 means we won the race)
+        bill_result = MagicMock(rowcount=1)
+        # 3rd execute: settle credits
+        settle_result = MagicMock()
 
         db = AsyncMock()
-        db.execute.return_value = result
+        db.execute.side_effect = [lookup_result, bill_result, settle_result]
         db.commit = AsyncMock()
-        db.refresh = AsyncMock()
 
-        background_tasks = BackgroundTasks()
-        response = await stop_meeting(
-            meeting_id=meeting.id,
-            background_tasks=background_tasks,
-            current_user=current_user,
-            db=db,
-        )
+        async def refresh_side_effect(obj):
+            # Simulate DB refresh after SQL-level update
+            obj.status = "ended"
 
-        assert response is meeting
-        assert meeting.status == "ended"
-        assert len(background_tasks.tasks) == 1
-        scheduled_task = background_tasks.tasks[0]
-        assert scheduled_task.func is finalize_meeting_artifacts_for_meeting_id
-        assert scheduled_task.args[0] == meeting.id
-        assert scheduled_task.args[1] == current_user.email
+        db.refresh = AsyncMock(side_effect=refresh_side_effect)
+
+        with patch("app.api.routes.meetings.get_bot_engine") as mock_engine:
+            mock_engine.return_value._sessions_by_bot_id = {}
+            response = await stop_meeting(
+                meeting_id=meeting.id,
+                current_user=current_user,
+                db=db,
+            )
+
+        assert response.status == "ended"
 
     @pytest.mark.asyncio
     async def test_get_usage_summary_returns_month_totals(self) -> None:
