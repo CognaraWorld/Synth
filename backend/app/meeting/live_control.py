@@ -576,6 +576,8 @@ class LiveSessionService:
             "agent_name": agent.name,
             "description": agent.description,
             "mode": agent.mode,
+            "persona_id": getattr(agent, "persona_id", "general"),
+            "voice": agent.voice,
             "system_prompt": agent.system_prompt,
         }
 

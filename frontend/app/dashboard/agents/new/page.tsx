@@ -15,13 +15,59 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { createAgent } from "@/lib/api";
+import { createAgent, type PersonaId } from "@/lib/api";
+
+const PERSONA_OPTIONS: Array<{
+  id: PersonaId;
+  title: string;
+  description: string;
+  voice: "Female" | "Male";
+}> = [
+  {
+    id: "general",
+    title: "General",
+    description: "Inclusive and balanced for mixed audiences.",
+    voice: "Female",
+  },
+  {
+    id: "strategist",
+    title: "Strategist",
+    description: "Decision-first with tradeoffs and next-step options.",
+    voice: "Male",
+  },
+  {
+    id: "analyst",
+    title: "Analyst",
+    description: "Evidence-driven, precise, and assumption-aware.",
+    voice: "Female",
+  },
+  {
+    id: "challenger",
+    title: "Challenger",
+    description: "Politely stress-tests ideas and surfaces blind spots.",
+    voice: "Male",
+  },
+  {
+    id: "facilitator",
+    title: "Facilitator",
+    description: "Keeps alignment, clarity, and participation moving.",
+    voice: "Female",
+  },
+];
+
+const PRESET_DEFAULT_DESCRIPTIONS: Record<PersonaId, string> = {
+  general: "Inclusive, balanced meeting copilot for mixed audiences.",
+  strategist: "Outcome-focused strategist who highlights decisions, tradeoffs, and next actions.",
+  analyst: "Data-driven analyst who separates facts, assumptions, and conclusions clearly.",
+  challenger: "Constructive challenger who surfaces risks, edge cases, and alternatives.",
+  facilitator: "Facilitator who drives alignment, summarizes threads, and invites input across participants.",
+};
 
 export default function NewAgentPage() {
   const router = useRouter();
   const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [mode, setMode] = useState<"general" | "custom">("general");
+  const [personaId, setPersonaId] = useState<PersonaId>("general");
+  const [meetingContext, setMeetingContext] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,7 +77,15 @@ export default function NewAgentPage() {
     setSubmitting(true);
 
     try {
-      await createAgent({ name: name.trim(), description: description.trim(), mode });
+      const description =
+        meetingContext.trim() || PRESET_DEFAULT_DESCRIPTIONS[personaId];
+
+      await createAgent({
+        name: name.trim(),
+        description,
+        mode: "general",
+        persona_id: personaId,
+      });
       router.push("/dashboard/agents");
     } catch (err) {
       const message =
@@ -42,23 +96,24 @@ export default function NewAgentPage() {
     }
   }
 
-  const isFormValid = name.trim().length > 0 && description.trim().length > 0;
+  const isFormValid = name.trim().length > 0;
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
+    <div className="mx-auto max-w-3xl space-y-6">
       <div>
         <Button
           variant="ghost"
           size="sm"
           className="mb-4 gap-1.5"
-          nativeButton={false} render={<Link href="/dashboard/agents" />}
+          nativeButton={false}
+          render={<Link href="/dashboard/agents" />}
         >
           <ArrowLeft className="size-3.5" />
           Back to Agents
         </Button>
         <h1 className="text-2xl font-bold tracking-tight">Create New Agent</h1>
         <p className="text-sm text-muted-foreground">
-          Configure an agent to join your meetings.
+          Pick one of the 5 fixed personas. Voice is auto-assigned per persona.
         </p>
       </div>
 
@@ -66,7 +121,7 @@ export default function NewAgentPage() {
         <CardHeader>
           <CardTitle>Agent Details</CardTitle>
           <CardDescription>
-            Set up the name, description, and behavior mode for your agent.
+            Persona behavior and voice are fixed for consistency and clearer differentiation.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -81,7 +136,7 @@ export default function NewAgentPage() {
               <Label htmlFor="name">Agent Name</Label>
               <Input
                 id="name"
-                placeholder="e.g. Meeting Note Taker"
+                placeholder="e.g. Synth"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 disabled={submitting}
@@ -89,52 +144,45 @@ export default function NewAgentPage() {
               />
             </div>
 
+            <fieldset className="space-y-3" disabled={submitting}>
+              <legend className="text-sm font-medium">Persona</legend>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {PERSONA_OPTIONS.map((option) => (
+                  <label
+                    key={option.id}
+                    className={`flex cursor-pointer flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
+                      personaId === option.id
+                        ? "border-primary bg-primary/5"
+                        : "border-border hover:border-muted-foreground/25"
+                    } ${submitting ? "cursor-not-allowed opacity-50" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="persona"
+                      value={option.id}
+                      checked={personaId === option.id}
+                      onChange={() => setPersonaId(option.id)}
+                      disabled={submitting}
+                      className="sr-only"
+                    />
+                    <span className="text-sm font-medium">{option.title}</span>
+                    <span className="text-xs text-muted-foreground">{option.description}</span>
+                    <span className="pt-1 text-xs text-muted-foreground">Voice: {option.voice}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
             <div className="space-y-2">
-              <Label htmlFor="description">Description</Label>
+              <Label htmlFor="meeting-context">Optional Context</Label>
               <Textarea
-                id="description"
-                placeholder="Describe what this agent should focus on during meetings..."
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                id="meeting-context"
+                placeholder="Add team/company context to tailor this persona further..."
+                value={meetingContext}
+                onChange={(e) => setMeetingContext(e.target.value)}
                 disabled={submitting}
                 rows={3}
               />
-            </div>
-
-            <div className="space-y-3">
-              <Label>Mode</Label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setMode("general")}
-                  disabled={submitting}
-                  className={`flex flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
-                    mode === "general"
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:border-muted-foreground/25"
-                  }`}
-                >
-                  <span className="text-sm font-medium">General</span>
-                  <span className="text-xs text-muted-foreground">
-                    Works across all meeting types with balanced defaults.
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMode("custom")}
-                  disabled={submitting}
-                  className={`flex flex-col gap-1 rounded-lg border p-4 text-left transition-colors ${
-                    mode === "custom"
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:border-muted-foreground/25"
-                  }`}
-                >
-                  <span className="text-sm font-medium">Custom</span>
-                  <span className="text-xs text-muted-foreground">
-                    Fine-tuned with your documents and specific instructions.
-                  </span>
-                </button>
-              </div>
             </div>
 
             <div className="flex gap-3 pt-2">
@@ -152,7 +200,8 @@ export default function NewAgentPage() {
                 type="button"
                 variant="outline"
                 disabled={submitting}
-                nativeButton={false} render={<Link href="/dashboard/agents" />}
+                nativeButton={false}
+                render={<Link href="/dashboard/agents" />}
               >
                 Cancel
               </Button>

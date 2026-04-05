@@ -267,7 +267,6 @@ async def upsert_meeting_override(
 
     payload = override_data.model_dump(exclude_unset=True, exclude_none=True)
     payload.pop("voice", None)
-
     persona_inputs_changed = "mode" in payload or "persona_id" in payload
     if persona_inputs_changed:
         candidate_mode = payload.get("mode", override.mode or meeting_agent.mode or "general")

@@ -27,7 +27,6 @@ from app.meeting.session import MeetingSession, SessionState
 from app.utils.bot_profiles import get_persona_tts_voice
 from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_prompt_for_mode, resolve_persona_id
-from app.utils.query_router import needs_web_search
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
 from app.utils.wake_word import detect as detect_wake_word
 
@@ -97,6 +96,7 @@ class BotEngine:
         self._cooldown_seconds: float = 0.0  # no cooldown
         self._processing_lock: dict[str, asyncio.Lock] = {}  # session_id -> lock
         self._recovery_lock_by_bot_id: dict[str, asyncio.Lock] = {}  # bot_id -> lock
+        self._tts_lock: asyncio.Lock = asyncio.Lock()  # serializes TTS voice switch + synthesis across sessions
 
         # Lightweight services — safe to initialize at startup
         self._settings = get_settings()
@@ -1111,8 +1111,10 @@ class BotEngine:
                     response_text[:100],
                 )
 
-                # Synthesize and send as single audio
-                response_audio = self._tts.synthesize(response_text)
+                # Synthesize — hold TTS lock to prevent voice switch races across sessions
+                async with self._tts_lock:
+                    self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
+                    response_audio = self._tts.synthesize(response_text)
                 if session.bot_id and response_audio:
                     # Wait for filler to finish playing
                     elapsed = time.time() - filler_sent_at
