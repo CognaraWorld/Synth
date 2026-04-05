@@ -1,10 +1,11 @@
-"""Filler response manager.
+"""Context-aware filler response manager.
 
 Manages pre-synthesized filler audio responses that are played while
-the LLM processes a question. Reduces perceived latency by giving
-an immediate acknowledgment before the full answer is ready.
+the LLM processes a question. Selects the most relevant filler based
+on the question category (meeting recap, web search, technical, etc.)
+to sound more natural and human-like.
 
-Phase 3 implementation.
+Phase 3 implementation (expanded with smart category routing).
 """
 
 from __future__ import annotations
@@ -12,76 +13,98 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING
 
+from app.utils.query_router import QueryCategory
+
 if TYPE_CHECKING:
     from app.core.tts import TextToSpeech
 
 
-FILLER_PHRASES: list[str] = [
-    "Let me think about that for a moment.",
-    "That's a great question, give me a second.",
-    "One moment while I look into that.",
-    "Hmm, let me consider that.",
-    "Sure, let me pull that up.",
-    "Good question, let me check.",
-    "Bear with me for just a second.",
-    "Let me find that information for you.",
+_UNIVERSAL_FILLERS: list[str] = [
+    "Sure.",
+    "One sec.",
+    "Hmm.",
+    "Yeah.",
+    "Okay.",
+    "Got it.",
+    "Let me check.",
 ]
-"""Pre-defined filler phrases spoken while the LLM generates a response."""
+
+CATEGORY_FILLERS: dict[QueryCategory, list[str]] = {
+    cat: _UNIVERSAL_FILLERS for cat in QueryCategory
+}
 
 
 class FillerManager:
-    """Manages filler audio responses for latency masking.
+    """Manages context-aware filler audio for latency masking.
 
-    Pre-synthesizes filler phrases into audio when ``preload`` is called
-    so they can be played instantly when needed, without waiting for TTS.
+    Pre-synthesizes filler phrases for all categories into audio at
+    startup so they can be played instantly when needed.
 
     Attributes:
-        phrases: List of filler phrase strings.
-        cache: Pre-synthesized audio bytes keyed by phrase.
+        _cache: Pre-synthesized PCM audio keyed by phrase.
+        _mp3_cache: Pre-converted base64 MP3 keyed by phrase.
     """
 
     def __init__(self) -> None:
-        """Initialize the filler manager.
-
-        Sets up the phrase list and an empty audio cache. Call
-        ``preload(tts_engine)`` once a TTS instance is available to
-        pre-synthesize audio for all phrases.
-        """
-        self.phrases = FILLER_PHRASES
         self._cache: dict[str, bytes] = {}
+        self._mp3_cache: dict[str, str] = {}
 
-    def get_random_filler(self) -> str:
-        """Return a random filler phrase string.
-
-        Useful before TTS is available or when only the text is needed.
-
-        Returns:
-            A random filler phrase as a plain string.
-        """
-        return random.choice(self.phrases)
+    def _all_phrases(self) -> list[str]:
+        """Return all filler phrases across all categories."""
+        phrases: list[str] = []
+        for cat_phrases in CATEGORY_FILLERS.values():
+            phrases.extend(cat_phrases)
+        return phrases
 
     def preload(self, tts_engine: TextToSpeech) -> None:
-        """Pre-synthesize all filler phrases using the provided TTS engine.
+        """Pre-synthesize all filler phrases across all categories.
 
         Args:
-            tts_engine: An initialized TextToSpeech instance used to
-                convert each phrase into audio bytes.
+            tts_engine: An initialized TextToSpeech instance.
         """
-        for phrase in self.phrases:
-            self._cache[phrase] = tts_engine.synthesize(phrase)
+        from app.meeting.recall_client import RecallClient
+        for phrase in self._all_phrases():
+            if phrase not in self._cache:
+                pcm = tts_engine.synthesize(phrase)
+                self._cache[phrase] = pcm
+                self._mp3_cache[phrase] = RecallClient.pcm_to_mp3_b64(pcm)
 
-    def get_random_filler_audio(self) -> bytes:
-        """Return random pre-synthesized filler audio bytes.
+    def get_filler_for_category(self, category: QueryCategory) -> str:
+        """Return a random filler phrase for the given category."""
+        phrases = CATEGORY_FILLERS.get(category, CATEGORY_FILLERS[QueryCategory.GENERAL])
+        return random.choice(phrases)
 
-        Raises:
-            RuntimeError: If ``preload`` has not been called yet.
+    def get_filler_mp3_b64(self, category: QueryCategory) -> str:
+        """Return pre-synthesized base64 MP3 filler for a category.
+
+        Args:
+            category: The query category to match fillers against.
 
         Returns:
-            Raw audio bytes (PCM format) of a random filler phrase.
+            Base64-encoded MP3 string, ready to send to Recall.ai.
+            Empty string if cache is not loaded.
         """
+        if not self._mp3_cache:
+            return ""
+        phrase = self.get_filler_for_category(category)
+        return self._mp3_cache.get(phrase, "")
+
+    def get_filler_audio(self, category: QueryCategory) -> bytes:
+        """Return pre-synthesized PCM filler audio for a category."""
         if not self._cache:
-            raise RuntimeError(
-                "Filler audio not preloaded. Call preload(tts_engine) first."
-            )
-        phrase = random.choice(self.phrases)
-        return self._cache[phrase]
+            return b""
+        phrase = self.get_filler_for_category(category)
+        return self._cache.get(phrase, b"")
+
+    # Backward-compatible methods
+    def get_random_filler(self) -> str:
+        """Return a random filler phrase (general category)."""
+        return self.get_filler_for_category(QueryCategory.GENERAL)
+
+    def get_random_filler_mp3_b64(self) -> str:
+        """Return random pre-synthesized filler as base64 MP3."""
+        return self.get_filler_mp3_b64(QueryCategory.GENERAL)
+
+    def get_random_filler_audio(self) -> bytes:
+        """Return random pre-synthesized filler audio bytes (PCM)."""
+        return self.get_filler_audio(QueryCategory.GENERAL)

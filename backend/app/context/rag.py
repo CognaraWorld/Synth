@@ -10,11 +10,16 @@ Phase 4 implementation.
 
 from __future__ import annotations
 
+import logging
+import threading
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger(__name__)
 
 
 class RAGPipeline:
@@ -22,6 +27,9 @@ class RAGPipeline:
 
     Embeds document text into vectors and stores them in ChromaDB
     for efficient similarity search during meetings.
+
+    Thread-safe: a dedicated lock serializes all SentenceTransformer
+    encode calls (the model is not thread-safe).
 
     Attributes:
         collection_name: Name of the ChromaDB collection.
@@ -31,7 +39,7 @@ class RAGPipeline:
     def __init__(
         self,
         collection_name: str = "synth_documents",
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "BAAI/bge-large-en-v1.5",
     ) -> None:
         """Initialize the RAG pipeline.
 
@@ -42,11 +50,31 @@ class RAGPipeline:
         """
         self.collection_name = collection_name
         self.embedding_model = embedding_model
-        self._client = chromadb.EphemeralClient()
+
+        # Persist embeddings to disk so they survive restarts.
+        # Use an absolute path anchored to the project root so the
+        # directory is consistent regardless of the working directory.
+        persist_dir = Path(__file__).resolve().parent.parent.parent / "chroma_data"
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=str(persist_dir))
+
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
         )
         self._model = SentenceTransformer(self.embedding_model)
+        self._encode_lock = threading.Lock()
+
+    def _encode(self, texts: str | list[str]) -> list:
+        """Thread-safe wrapper around SentenceTransformer.encode.
+
+        Args:
+            texts: A single string or list of strings to embed.
+
+        Returns:
+            Embedding(s) as a list (single) or list-of-lists (batch).
+        """
+        with self._encode_lock:
+            return self._model.encode(texts).tolist()
 
     def add_chunk(self, text: str, metadata: dict[str, Any]) -> None:
         """Add a text chunk to the vector store.
@@ -56,13 +84,16 @@ class RAGPipeline:
             metadata: Associated metadata (e.g., document_id, filename,
                 chunk_index, page_number).
         """
-        embedding = self._model.encode(text).tolist()
-        self._collection.add(
-            ids=[str(uuid4())],
-            documents=[text],
-            metadatas=[metadata],
-            embeddings=[embedding],
-        )
+        try:
+            embedding = self._encode(text)
+            self._collection.add(
+                ids=[str(uuid4())],
+                documents=[text],
+                metadatas=[metadata],
+                embeddings=[embedding],
+            )
+        except Exception as exc:
+            logger.error("Failed to add chunk to ChromaDB: %s", exc)
 
     def add_chunks_batch(self, chunks: list[dict[str, Any]]) -> None:
         """Add multiple text chunks to the vector store in a single operation.
@@ -74,20 +105,26 @@ class RAGPipeline:
         if not chunks:
             return
 
-        texts = [c["text"] for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
-        ids = [str(uuid4()) for _ in chunks]
-        embeddings = self._model.encode(texts).tolist()
+        try:
+            texts = [c["text"] for c in chunks]
+            metadatas = [c["metadata"] for c in chunks]
+            ids = [str(uuid4()) for _ in chunks]
+            embeddings = self._encode(texts)
 
-        self._collection.add(
-            ids=ids,
-            documents=texts,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
+            self._collection.add(
+                ids=ids,
+                documents=texts,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
+        except Exception as exc:
+            logger.error("Failed to add batch of %d chunks to ChromaDB: %s", len(chunks), exc)
 
     def search(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
         """Search for the most relevant document chunks.
+
+        Filters out results with cosine distance > 1.0 (too irrelevant
+        to be useful).
 
         Args:
             query: The search query text (typically the user's question).
@@ -100,7 +137,7 @@ class RAGPipeline:
         if self._collection.count() == 0:
             return []
 
-        query_embedding = self._model.encode(query).tolist()
+        query_embedding = self._encode(query)
         results = self._collection.query(
             query_embeddings=[query_embedding],
             n_results=min(top_k, self._collection.count()),
@@ -111,14 +148,72 @@ class RAGPipeline:
         metadatas = results.get("metadatas", [[]])[0]
         distances = results.get("distances", [[]])[0]
 
-        for text, metadata, score in zip(documents, metadatas, distances):
+        for doc, meta, dist in zip(documents, metadatas, distances):
+            if dist > 1.0:  # too distant to be relevant for cosine
+                continue
             output.append({
-                "text": text,
-                "metadata": metadata,
-                "score": score,
+                "text": doc,
+                "metadata": meta,
+                "score": dist,
             })
 
         return output
+
+    def hybrid_search(self, query: str, top_k: int = 8) -> list[dict[str, Any]]:
+        """Hybrid search combining semantic similarity and keyword matching.
+
+        Runs a standard semantic search plus keyword-based retrieval for
+        key terms extracted from the query. Results are deduplicated and
+        merged, with semantic results ranked first.
+
+        Args:
+            query: The search query text.
+            top_k: Number of top results to return.
+
+        Returns:
+            Deduplicated list of result dicts sorted by relevance.
+        """
+        # Semantic search
+        semantic_results = self.search(query=query, top_k=top_k)
+
+        # Extract key terms for keyword search (words > 3 chars, skip stopwords)
+        _stopwords = {
+            "what", "when", "where", "which", "that", "this", "with",
+            "from", "about", "have", "been", "were", "they", "their",
+            "will", "would", "could", "should", "does",
+        }
+        terms = [
+            w for w in query.lower().split()
+            if len(w) > 3 and w not in _stopwords
+        ]
+
+        # Keyword search via ChromaDB's where_document filter
+        keyword_results: list[dict[str, Any]] = []
+        seen_texts: set[str] = {r["text"][:100] for r in semantic_results}
+
+        for term in terms[:3]:  # limit to top 3 terms to avoid slow queries
+            try:
+                kw_hits = self._collection.get(
+                    where_document={"$contains": term},
+                    limit=top_k,
+                    include=["documents", "metadatas"],
+                )
+                docs = kw_hits.get("documents", []) or []
+                metas = kw_hits.get("metadatas", []) or []
+                for doc, meta in zip(docs, metas):
+                    if doc and doc[:100] not in seen_texts:
+                        seen_texts.add(doc[:100])
+                        keyword_results.append({
+                            "text": doc,
+                            "metadata": meta or {},
+                            "score": 0.8,  # synthetic score for keyword matches
+                        })
+            except Exception as exc:
+                logger.debug("Keyword search for '%s' failed: %s", term, exc)
+
+        # Merge: semantic first, then keyword results
+        merged = semantic_results + keyword_results
+        return merged[:top_k]
 
     def embed(self, text: str) -> list[float]:
         """Generate an embedding vector for a text string.
@@ -129,7 +224,7 @@ class RAGPipeline:
         Returns:
             A list of floats representing the embedding vector.
         """
-        return self._model.encode(text).tolist()
+        return self._encode(text)
 
     def clear(self) -> None:
         """Delete the current collection and recreate it empty."""

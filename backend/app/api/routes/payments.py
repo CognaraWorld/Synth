@@ -3,7 +3,9 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -168,6 +170,12 @@ async def _handle_checkout_completed(
         logger.error("Webhook received unknown pack_id: %s", pack_id)
         return
 
+    try:
+        user_uuid = UUID(user_id)
+    except (TypeError, ValueError):
+        logger.error("Webhook received invalid user_id: %s", user_id)
+        return
+
     # Check for duplicate processing
     existing = await db.execute(
         select(CreditTransaction).where(
@@ -178,7 +186,7 @@ async def _handle_checkout_completed(
         logger.info("Duplicate webhook for session %s, skipping", stripe_session_id)
         return
 
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(select(User).where(User.id == user_uuid))
     user = result.scalar_one_or_none()
     if not user:
         logger.error("Webhook user not found: %s", user_id)
@@ -209,8 +217,8 @@ async def _handle_checkout_completed(
 
 @router.get("/history", response_model=CreditTransactionListResponse)
 async def payment_history(
-    page: int = 1,
-    per_page: int = 20,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):

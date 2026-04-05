@@ -13,10 +13,13 @@ import logging
 import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.context.manager import ContextManager
+
+if TYPE_CHECKING:
+    from app.meeting.screen_capture import ScreenCaptureManager
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +96,20 @@ class MeetingSession:
         self.state: SessionState = SessionState.PENDING
         self.context_manager: ContextManager = ContextManager()
 
+        # Screen capture manager — wired up by BotEngine after session creation
+        self.screen_capture: "ScreenCaptureManager | None" = None
+
         # Bot ID assigned by Recall.ai after deployment
         self.bot_id: str | None = None
+
+        # AI insights: corrections detected during passive listening
+        self.insights: list[dict[str, str]] = []
+
+        # Operator steering controls (used by live control endpoints)
+        self.operator_muted: bool = False
+        self.output_stop_requested: bool = False
+        self.last_instruction_at: datetime | None = None
+        self.operator_instructions: list[str] = []
 
         # Timestamps
         now = datetime.now(timezone.utc)
@@ -195,6 +210,11 @@ class MeetingSession:
             "created_at": self.created_at.isoformat(),
             "duration_seconds": round(self.get_duration(), 2),
             "is_active": self.is_active,
+            "operator_muted": self.operator_muted,
+            "output_stop_requested": self.output_stop_requested,
+            "last_instruction_at": (
+                self.last_instruction_at.isoformat() if self.last_instruction_at else None
+            ),
             "history": [
                 {"timestamp": ts, "state": state.value}
                 for ts, state in self._history

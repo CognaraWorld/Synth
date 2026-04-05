@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.security import OAuth2PasswordBearer
 
 from app.config import get_settings
+from app.models.credit_transaction import CreditTransaction
 from app.models.database import User, get_db
 from app.models.schemas import (
     LoginRequest,
@@ -21,6 +23,23 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 settings = get_settings()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+def _validate_password(password: str) -> str | None:
+    """Return an error message if password fails complexity requirements, None if OK.
+
+    Enforces OWASP password guidelines (A07:2021 - Identification and
+    Authentication Failures): minimum length, mixed case, and digits.
+    """
+    if len(password) < 8:
+        return "Password must be at least 8 characters"
+    if not re.search(r"[A-Z]", password):
+        return "Password must contain at least one uppercase letter"
+    if not re.search(r"[a-z]", password):
+        return "Password must contain at least one lowercase letter"
+    if not re.search(r"[0-9]", password):
+        return "Password must contain at least one digit"
+    return None
 
 
 def _get_jwt_secret() -> str:
@@ -55,11 +74,11 @@ async def get_current_user(
         user_uuid = UUID(user_id)
     except (JWTError, ValueError, TypeError):
         raise credentials_exception
-    except RuntimeError as exc:
+    except RuntimeError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
+            detail="Authentication service unavailable",
+        )
 
     result = await db.execute(select(User).where(User.id == user_uuid))
     user = result.scalar_one_or_none()
@@ -75,6 +94,18 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This endpoint only supports email/password registration.",
         )
+    password = (user_data.password or "").strip()
+    if not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is required for email/password registration.",
+        )
+    password_error = _validate_password(password)
+    if password_error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=password_error,
+        )
 
     result = await db.execute(select(User).where(User.email == user_data.email))
     if result.scalar_one_or_none():
@@ -83,10 +114,23 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     user = User(
         email=user_data.email,
         name=user_data.name,
-        hashed_password=pwd_context.hash(user_data.password or ""),
+        hashed_password=pwd_context.hash(password),
         provider=user_data.provider,
     )
     db.add(user)
+    await db.flush()
+
+    if user.credits:
+        db.add(
+            CreditTransaction(
+                user_id=user.id,
+                amount=user.credits,
+                balance_after=user.credits,
+                transaction_type="free_credit",
+                description="Starter credits granted on registration",
+            )
+        )
+
     await db.commit()
     await db.refresh(user)
     return user
@@ -104,11 +148,11 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
 
     try:
         token = create_access_token({"sub": str(user.id)})
-    except RuntimeError as exc:
+    except RuntimeError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
+            detail="Authentication service unavailable",
+        )
     return TokenResponse(access_token=token)
 
 

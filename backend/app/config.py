@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql://synth:synth@localhost:5432/synth"
 
+    # Environment: "development" or "production"
+    environment: str = "development"
+
     # Auth
     secret_key: str = "change-me-in-production"
     algorithm: str = "HS256"
@@ -16,8 +19,21 @@ class Settings(BaseSettings):
 
     # Recall.ai
     recall_api_key: str = ""
+    recall_region: str = "us-west-2"
+    webhook_base_url: str = ""
+    webhook_secret: str = ""
 
-    # SearXNG
+    # CORS
+    cors_origins: str = "http://localhost:3000"
+
+    # Gemini (fast path LLM)
+    gemini_api_key: str = ""
+
+    # Deepgram (transcription via Recall.ai)
+    deepgram_api_key: str = ""
+
+    # Web Search
+    serper_api_key: str = ""
     searxng_url: str = "http://localhost:8080"
 
     # File storage
@@ -42,6 +58,9 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     frontend_success_url: str = "http://localhost:3000/dashboard/settings?payment=success"
     frontend_cancel_url: str = "http://localhost:3000/dashboard/settings?payment=cancelled"
+
+    # Gemini (screen content extraction)
+    gemini_api_key: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

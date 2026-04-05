@@ -1,19 +1,28 @@
-"""Claude API client.
+"""LLM client with Gemini Flash (fast) and Claude Haiku (fallback).
 
-Provides a single-model interface to Claude Haiku 4.5 for all LLM
-operations: meeting Q&A, summarization, and system prompt generation.
-
-Phase 3 implementation.
+Gemini 2.5 Flash is the primary model for meeting Q&A — ~150ms response time.
+Claude Haiku 4.5 is the fallback for when Gemini is unavailable, and is used
+directly for heavy tasks like meeting summaries and document analysis.
 """
 
 from __future__ import annotations
 
+import logging
+import time
+
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 try:
     import anthropic
-except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+except ModuleNotFoundError:
     anthropic = None
+
+try:
+    from google import genai
+except ModuleNotFoundError:
+    genai = None
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Synth, an intelligent meeting assistant. You have access to "
@@ -25,33 +34,34 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 
 class LLMClient:
-    """Client for the Anthropic Claude API.
-
-    Uses Claude Haiku 4.5 for all queries — fast, cheap, and sufficient
-    for real-time meeting Q&A.
+    """Hybrid LLM client: Gemini Flash (fast) with Claude Haiku (fallback).
 
     Attributes:
-        api_key: Anthropic API key.
-        model: Model identifier.
+        gemini_client: Google GenAI client for fast Q&A.
+        claude_client: Anthropic client for fallback and heavy tasks.
     """
 
-    def __init__(self, model: str = "claude-haiku-4-5-20251001") -> None:
-        """Initialize the Claude API client.
-
-        Args:
-            model: Model ID to use for all queries.
-        """
+    def __init__(self, claude_model: str = "claude-haiku-4-5-20251001") -> None:
         self.settings = get_settings()
-        self.api_key = self.settings.anthropic_api_key
-        self.model = model
-        self.client = None
-        self._async_client = None
+        self.claude_model = claude_model
 
-        if anthropic is None or not self.api_key:
-            return
+        # Claude setup (fallback + heavy tasks)
+        self.claude_client = None
+        self._claude_async = None
+        if anthropic and self.settings.anthropic_api_key:
+            self.claude_client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
+            self._claude_async = anthropic.AsyncAnthropic(api_key=self.settings.anthropic_api_key)
 
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self._async_client = anthropic.AsyncAnthropic(api_key=self.api_key)
+        # Gemini setup (primary fast path)
+        self.gemini_client = None
+        self._gemini_model = "gemini-2.5-flash-lite"
+        if genai and self.settings.gemini_api_key:
+            self.gemini_client = genai.Client(api_key=self.settings.gemini_api_key)
+            logger.info("Gemini 2.5 Flash Lite configured as primary LLM")
+
+    # ------------------------------------------------------------------
+    # Primary query — tries Gemini first, falls back to Claude
+    # ------------------------------------------------------------------
 
     def query(
         self,
@@ -59,39 +69,30 @@ class LLMClient:
         question: str,
         system_prompt: str | None = None,
     ) -> str:
-        """Send a question to Claude with assembled context.
-
-        Args:
-            context: Assembled context string from the context manager,
-                including transcript, RAG results, and document excerpts.
-            question: The user's question extracted after wake word detection.
-            system_prompt: Optional override for the default system prompt.
-
-        Returns:
-            The model's response text.
-        """
-        if self.client is None:
-            raise RuntimeError(
-                "Anthropic SDK or API key is not configured for synchronous queries."
-            )
-
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
 
-        user_content = (
-            f"Context:\n{context}\n\n"
-            f"Question:\n{question}"
-        )
+        # Try Gemini first
+        if self.gemini_client:
+            try:
+                start = time.time()
+                response = self.gemini_client.models.generate_content(
+                    model=self._gemini_model,
+                    contents=user_content,
+                    config={
+                        "system_instruction": prompt,
+                        "max_output_tokens": 1024,
+                        "temperature": 0.7,
+                    },
+                )
+                elapsed = time.time() - start
+                logger.info("Gemini responded in %.0fms", elapsed * 1000)
+                return response.text
+            except Exception as exc:
+                logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=prompt,
-            messages=[
-                {"role": "user", "content": user_content},
-            ],
-        )
-
-        return response.content[0].text
+        # Fallback to Claude
+        return self._claude_query(context, question, system_prompt)
 
     async def async_query(
         self,
@@ -99,49 +100,143 @@ class LLMClient:
         question: str,
         system_prompt: str | None = None,
     ) -> str:
-        """Send a question to Claude asynchronously.
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
 
-        Args:
-            context: Assembled context string from the context manager.
-            question: The user's question text.
-            system_prompt: Optional override for the default system prompt.
+        # Try Gemini first (run sync SDK in executor to avoid blocking)
+        if self.gemini_client:
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                start = time.time()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: self.gemini_client.models.generate_content(
+                        model=self._gemini_model,
+                        contents=user_content,
+                        config={
+                            "system_instruction": prompt,
+                            "max_output_tokens": 1024,
+                            "temperature": 0.7,
+                        },
+                    ),
+                )
+                elapsed = time.time() - start
+                logger.info("Gemini responded in %.0fms", elapsed * 1000)
+                return response.text
+            except Exception as exc:
+                logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
-        Returns:
-            The model's response text.
-        """
-        if self._async_client is None:
-            raise RuntimeError(
-                "Anthropic SDK or API key is not configured for asynchronous queries."
-            )
+        # Fallback to Claude
+        return await self._claude_async_query(context, question, system_prompt)
+
+    # ------------------------------------------------------------------
+    # Claude-only methods (for summaries, complex tasks, fallback)
+    # ------------------------------------------------------------------
+
+    def _claude_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        if self.claude_client is None:
+            raise RuntimeError("No LLM configured (neither Gemini nor Claude)")
 
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
 
-        user_content = (
-            f"Context:\n{context}\n\n"
-            f"Question:\n{question}"
-        )
-
-        response = await self._async_client.messages.create(
-            model=self.model,
+        start = time.time()
+        response = self.claude_client.messages.create(
+            model=self.claude_model,
             max_tokens=4096,
             system=prompt,
-            messages=[
-                {"role": "user", "content": user_content},
-            ],
+            messages=[{"role": "user", "content": user_content}],
         )
-
+        elapsed = time.time() - start
+        logger.info("Claude responded in %.0fms", elapsed * 1000)
         return response.content[0].text
 
+    async def _claude_async_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        if self._claude_async is None:
+            raise RuntimeError("No LLM configured (neither Gemini nor Claude)")
+
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+
+        start = time.time()
+        response = await self._claude_async.messages.create(
+            model=self.claude_model,
+            max_tokens=4096,
+            system=prompt,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        elapsed = time.time() - start
+        logger.info("Claude responded in %.0fms", elapsed * 1000)
+        return response.content[0].text
+
+    def claude_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Force Claude for heavy tasks (summaries, document analysis)."""
+        return self._claude_query(context, question, system_prompt)
+
+    async def claude_async_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Force Claude async for heavy tasks."""
+        return await self._claude_async_query(context, question, system_prompt)
+
+    async def async_query_stream(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+    ):
+        """Stream a response from Claude, yielding complete sentences."""
+        if self._claude_async is None:
+            raise RuntimeError("Claude SDK not configured for streaming.")
+
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+
+        buffer = ""
+        async with self._claude_async.messages.stream(
+            model=self.claude_model,
+            max_tokens=4096,
+            system=prompt,
+            messages=[{"role": "user", "content": user_content}],
+        ) as stream:
+            async for text in stream.text_stream:
+                buffer += text
+                while True:
+                    best = -1
+                    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                        idx = buffer.find(sep)
+                        if idx != -1 and (best == -1 or idx < best):
+                            best = idx + len(sep)
+                    if best == -1:
+                        break
+                    sentence = buffer[:best].strip()
+                    buffer = buffer[best:]
+                    if sentence:
+                        yield sentence
+
+        if buffer.strip():
+            yield buffer.strip()
+
     def generate_system_prompt(self, description: str) -> str:
-        """Generate a system prompt from an agent description.
-
-        Args:
-            description: The agent's natural language description provided
-                by the user during agent creation.
-
-        Returns:
-            A formatted system prompt string for use in Claude API calls.
-        """
         return (
             f"You are a specialized meeting assistant with the following "
             f"role and expertise:\n\n"

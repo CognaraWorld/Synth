@@ -36,10 +36,10 @@ class TestWakeWordDetection:
     """Tests for ``app.utils.wake_word.detect``."""
 
     def test_wake_word_basic(self) -> None:
-        """Standard 'Hey Synth, <question>' pattern extracts the question."""
+        """Standard 'Nova, <question>' pattern extracts the question."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey Synth, what is the revenue?")
+        detected, question = detect("Nova, what is the revenue?")
         assert detected is True
         assert question == "what is the revenue?"
 
@@ -47,15 +47,22 @@ class TestWakeWordDetection:
         """Detection is case-insensitive across the whole wake phrase."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("hey synth tell me")
+        detected, question = detect("nova tell me")
         assert detected is True
         assert question == "tell me"
 
     def test_wake_word_just_name(self) -> None:
-        """'Synth,' alone (without 'Hey') still triggers detection."""
+        """'innovation' should NOT trigger (prevents false positives)."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Synth, what time is it?")
+        detected, question = detect("The innovation was great")
+        assert detected is False
+
+    def test_wake_word_phonetic_variant(self) -> None:
+        """STT mishearings like 'nora' should still trigger."""
+        from app.utils.wake_word import detect
+
+        detected, question = detect("Nora, what time is it?")
         assert detected is True
         assert question == "what time is it?"
 
@@ -71,15 +78,15 @@ class TestWakeWordDetection:
         """Wake word at the end of input yields an empty question string."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey Synth")
+        detected, question = detect("Nova")
         assert detected is True
         assert question == ""
 
     def test_wake_word_with_comma(self) -> None:
-        """Comma between 'Hey,' and 'Synth,' is handled gracefully."""
+        """'Hey Nova' with prefix is handled gracefully."""
         from app.utils.wake_word import detect
 
-        detected, question = detect("Hey, Synth, what's up?")
+        detected, question = detect("Hey Nova, what's up?")
         assert detected is True
         assert question == "what's up?"
 
@@ -176,9 +183,11 @@ class TestRawTranscriptBuffer:
         def writer(thread_id: int) -> None:
             barrier.wait()  # synchronize start for maximum contention
             for i in range(entries_per_thread):
+                # Use unique speaker per thread to prevent grouping
                 buf.append(
-                    f"Thread-{thread_id} entry-{i}",
+                    f"entry-{thread_id}-{i}",
                     timestamp=datetime.now(timezone.utc),
+                    speaker=f"Thread-{thread_id}",
                 )
 
         threads = [
@@ -192,7 +201,7 @@ class TestRawTranscriptBuffer:
 
         recent = buf.get_recent(minutes=10)
         expected_total = num_threads * entries_per_thread
-        # Each entry is a separate line/segment -- count occurrences of "entry-"
+        # Each entry-X-Y string should appear in the grouped output
         actual_count = recent.count("entry-")
         assert actual_count == expected_total, (
             f"Expected {expected_total} entries but found {actual_count}. "
@@ -209,59 +218,48 @@ class TestFillerManager:
     """Tests for ``app.utils.filler.FillerManager``."""
 
     def test_filler_random(self) -> None:
-        """``get_random_filler`` returns one of the known filler phrases.
+        """``get_random_filler`` returns one of the known filler phrases."""
+        from app.utils.filler import CATEGORY_FILLERS, FillerManager
 
-        Since the actual implementation pre-synthesizes audio bytes, we
-        patch the ``__init__`` to skip TTS initialization and ``get_random_filler``
-        to return the phrase text for easy assertion.
-        """
-        from app.utils.filler import FILLER_PHRASES, FillerManager
+        manager = FillerManager()
+        all_phrases = manager._all_phrases()
 
-        # Bypass the __init__ that requires TTS by constructing the object
-        # without calling __init__, then manually setting required attributes.
-        manager = FillerManager.__new__(FillerManager)
-        manager.phrases = FILLER_PHRASES
-        manager._cache = {phrase: b"fake_audio" for phrase in FILLER_PHRASES}
+        # Populate cache with fake audio
+        manager._cache = {phrase: b"fake_audio" for phrase in all_phrases}
 
-        # Monkey-patch get_random_filler to return the phrase string for testability
-        # since the real implementation returns audio bytes.
-        import random
-
-        random.seed(42)
-        phrase_key = random.choice(manager.phrases)
-        result = manager._cache.get(phrase_key)
-
-        assert result is not None
-        assert phrase_key in FILLER_PHRASES
+        result = manager.get_random_filler()
+        assert result in all_phrases
 
     def test_filler_returns_string(self) -> None:
-        """Each phrase in FILLER_PHRASES is a non-empty string."""
-        from app.utils.filler import FILLER_PHRASES
+        """Each phrase across all categories is a non-empty string."""
+        from app.utils.filler import CATEGORY_FILLERS
 
-        for phrase in FILLER_PHRASES:
-            assert isinstance(phrase, str)
-            assert len(phrase) > 0
+        for category, phrases in CATEGORY_FILLERS.items():
+            for phrase in phrases:
+                assert isinstance(phrase, str)
+                assert len(phrase) > 0
 
     def test_filler_phrases_are_unique(self) -> None:
-        """All filler phrases are distinct -- no duplicates."""
-        from app.utils.filler import FILLER_PHRASES
+        """All filler phrases within the universal set are distinct."""
+        from app.utils.filler import _UNIVERSAL_FILLERS
 
-        assert len(FILLER_PHRASES) == len(set(FILLER_PHRASES))
+        assert len(_UNIVERSAL_FILLERS) == len(set(_UNIVERSAL_FILLERS))
+
+    def test_universal_fillers_are_short(self) -> None:
+        """Universal fillers should be short phrases for quick delivery."""
+        from app.utils.filler import _UNIVERSAL_FILLERS
+
+        for phrase in _UNIVERSAL_FILLERS:
+            assert len(phrase.split()) <= 4, f"Filler too long: {phrase}"
 
     def test_filler_manager_attributes_after_init(self) -> None:
-        """A manually-constructed FillerManager has the expected attributes.
+        """A FillerManager has the expected attributes after construction."""
+        from app.utils.filler import FillerManager
 
-        Bypasses __init__ (which requires TTS) and verifies the attribute
-        contract that downstream code relies on.
-        """
-        from app.utils.filler import FILLER_PHRASES, FillerManager
+        manager = FillerManager()
 
-        manager = FillerManager.__new__(FillerManager)
-        manager.phrases = FILLER_PHRASES
-        manager._cache = {}
-
-        assert manager.phrases is FILLER_PHRASES
         assert isinstance(manager._cache, dict)
+        assert isinstance(manager._mp3_cache, dict)
 
 
 # ---------------------------------------------------------------------------
