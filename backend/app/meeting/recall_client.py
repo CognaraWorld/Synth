@@ -124,10 +124,6 @@ class RecallClient:
                     },
                 ],
             }
-            # Enable screen capture for OCR-based context enrichment
-            payload["output_media"] = {
-                "screen": {"kind": "jpeg", "size": {"width": 1280, "height": 720}},
-            }
 
         try:
             response = await self._client.post("/bot", json=payload)
