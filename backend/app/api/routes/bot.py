@@ -35,6 +35,7 @@ async def upsert_bot_profile(
     agent = await get_effective_primary_agent(db, current_user.id)
     persona_id = resolve_persona_id(profile_data.mode, profile_data.persona_id)
     mode = "general"
+    selected_voice = profile_data.voice or getattr(agent, "voice", None) or get_persona_voice_label(persona_id)
     system_prompt = profile_data.system_prompt or build_system_prompt(
         mode,
         profile_data.description,
@@ -49,7 +50,7 @@ async def upsert_bot_profile(
             system_prompt=system_prompt,
             mode=mode,
             persona_id=persona_id,
-            voice=get_persona_voice_label(persona_id),
+            voice=selected_voice,
             response_mode=profile_data.response_mode,
             is_primary=True,
         )
@@ -60,7 +61,7 @@ async def upsert_bot_profile(
         agent.system_prompt = system_prompt
         agent.mode = mode
         agent.persona_id = persona_id
-        agent.voice = get_persona_voice_label(persona_id)
+        agent.voice = selected_voice
         agent.response_mode = profile_data.response_mode
         agent.is_primary = True
 
