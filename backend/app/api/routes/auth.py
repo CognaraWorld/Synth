@@ -1,3 +1,4 @@
+import hmac
 import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -11,9 +12,10 @@ from fastapi.security import OAuth2PasswordBearer
 
 from app.config import get_settings
 from app.models.credit_transaction import CreditTransaction
-from app.models.database import User, get_db
+from app.models.database import DEFAULT_STARTER_CREDITS, User, get_db
 from app.models.schemas import (
     LoginRequest,
+    ServiceTokenRequest,
     TokenResponse,
     UserCreate,
     UserResponse,
@@ -153,6 +155,45 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication service unavailable",
         )
+    return TokenResponse(access_token=token)
+
+
+@router.post("/service-token", response_model=TokenResponse)
+async def service_token(req: ServiceTokenRequest, db: AsyncSession = Depends(get_db)):
+    """Service-to-service token exchange for BFF (NextAuth dashboard)."""
+    expected = settings.service_secret
+    if not expected or not hmac.compare_digest(req.service_secret, expected):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid service secret")
+
+    result = await db.execute(select(User).where(User.email == req.email))
+    user = result.scalar_one_or_none()
+
+    if not user:
+        user = User(email=req.email, name=req.name, provider="google")
+        db.add(user)
+        await db.flush()
+
+        db.add(
+            CreditTransaction(
+                user_id=user.id,
+                amount=DEFAULT_STARTER_CREDITS,
+                balance_after=DEFAULT_STARTER_CREDITS,
+                transaction_type="free_credit",
+                description="Starter credits on service registration",
+            )
+        )
+
+        await db.commit()
+        await db.refresh(user)
+
+    try:
+        token = create_access_token({"sub": str(user.id)})
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service unavailable",
+        )
+
     return TokenResponse(access_token=token)
 
 

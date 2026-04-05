@@ -53,6 +53,12 @@ class LoginRequest(BaseModel):
     password: Annotated[str, StringConstraints(min_length=1, max_length=128)]
 
 
+class ServiceTokenRequest(BaseModel):
+    email: EmailStr
+    name: NameField
+    service_secret: str
+
+
 # Agent
 class AgentCreate(BaseModel):
     name: NameField = "Synth"
@@ -92,6 +98,7 @@ class BotProfileUpsert(BaseModel):
     description: LongTextField
     mode: Literal["general"] = "general"
     persona_id: PersonaField = "general"
+    voice: Optional[VoiceField] = None
     response_mode: ResponseModeField = "name_only"
     system_prompt: Optional[PromptField] = None
 
@@ -175,6 +182,7 @@ class MeetingOverrideUpsert(BaseModel):
     mode: Optional[Literal["general"]] = None
     persona_id: Optional[PersonaField] = None
     system_prompt: Optional[PromptField] = None
+    voice: Optional[VoiceField] = None
     response_mode: Optional[ResponseModeField] = None
 
     @model_validator(mode="after")
@@ -186,6 +194,7 @@ class MeetingOverrideUpsert(BaseModel):
                 self.mode,
                 self.persona_id,
                 self.system_prompt,
+                self.voice,
                 self.response_mode,
             )
         ):
