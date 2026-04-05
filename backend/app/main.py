@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -291,12 +292,89 @@ async def lifespan(app: FastAPI):
 
     # Pre-load TTS + filler cache in background thread so first meeting
     # doesn't block for ~3s while Kokoro loads
-    import asyncio
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _preload_tts)
 
+    # Start background task to clean up stale bots
+    cleanup_task = asyncio.create_task(_cleanup_stale_bots())
+
     yield
+
+    cleanup_task.cancel()
     await engine.dispose()
+
+
+async def _cleanup_stale_bots():
+    """Background task that checks every 5 minutes for stale bots (> 2 hours) and kills them."""
+    import math
+    from datetime import datetime, timezone
+    from sqlalchemy import select, update
+    while True:
+        try:
+            await asyncio.sleep(300)  # every 5 minutes
+            from app.api.routes.webhook import get_bot_engine
+            from app.models.database import Meeting, User, AsyncSessionLocal
+            from app.meeting.recall_client import RecallClient
+
+            bot_engine = get_bot_engine()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            stale_ids = []
+
+            for sid, session in list(bot_engine.sessions.items()):
+                if session.get_duration() > 7200:  # 2 hours
+                    stale_ids.append(sid)
+
+            for sid in stale_ids:
+                try:
+                    await bot_engine.stop_meeting(sid)
+                    logger.info("Stale bot cleanup: stopped session %s (> 2 hours)", sid[:8])
+                except Exception as exc:
+                    logger.warning("Stale bot cleanup failed for session %s: %s", sid[:8], exc)
+
+            # Also check database for meetings stuck as "active" > 2 hours
+            async with AsyncSessionLocal() as db:
+                from datetime import timedelta
+                cutoff = now - timedelta(hours=2)
+                result = await db.execute(
+                    select(Meeting).where(
+                        Meeting.status == "active",
+                        Meeting.started_at.isnot(None),
+                        Meeting.started_at < cutoff,
+                    )
+                )
+                stale_meetings = result.scalars().all()
+                for m in stale_meetings:
+                    duration_seconds = (now - m.started_at).total_seconds()
+                    minutes_used = max(1, math.ceil(duration_seconds / 60))
+                    m.status = "ended"
+                    m.ended_at = now
+                    m.duration_minutes = minutes_used
+                    m.credits_used = minutes_used
+
+                    await db.execute(
+                        update(User)
+                        .where(User.id == m.user_id)
+                        .values(credits=User.credits - minutes_used)
+                    )
+
+                    # Try to stop the Recall bot
+                    if m.bot_id:
+                        try:
+                            recall = RecallClient()
+                            await recall.stop_bot(m.bot_id)
+                            await recall.close()
+                        except Exception:
+                            pass
+
+                    logger.info("Stale meeting cleanup: ended meeting %s (%d min)", m.id, minutes_used)
+
+                if stale_meetings:
+                    await db.commit()
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Stale bot cleanup error: %s", exc)
 
 
 def _preload_tts():
