@@ -1,101 +1,154 @@
 "use client";
 
-import { useMeetings } from "@/hooks/use-meetings";
-import { useTranscriptSocket } from "@/hooks/use-transcript-socket";
-import { PageHeader } from "@/components/page-header";
-import { MeetingCard } from "@/components/meeting-card";
-import { BotControlPanel } from "@/components/bot-control-panel";
-import { TranscriptFeed } from "@/components/transcript-feed";
-import { StartMeetingDialog } from "@/components/start-meeting-dialog";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Skeleton } from "@/components/ui/skeleton";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Video } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { MeetingsPageSkeleton } from "@/components/dashboard/loading-skeleton";
+import { getMeetings } from "@/lib/api";
+
+interface Meeting {
+  id: string;
+  agent_id: string;
+  platform: string;
+  meeting_link: string;
+  status: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_minutes: number | null;
+  created_at: string;
+}
+
+function EmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center gap-4 rounded-lg border border-dashed border-border py-16">
+      <div className="rounded-full bg-muted p-3">
+        <Video className="size-6 text-muted-foreground" />
+      </div>
+      <div className="text-center">
+        <p className="text-sm font-medium">No meetings yet</p>
+        <p className="text-sm text-muted-foreground">
+          Meetings will appear here once an agent joins a call.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 export default function MeetingsPage() {
-  const { data: meetings, isLoading } = useMeetings();
+  const router = useRouter();
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const upcoming = meetings?.filter((m) => m.status === "SCHEDULED") ?? [];
-  const live = meetings?.filter((m) => m.status === "LIVE") ?? [];
-  const past = meetings?.filter((m) => m.status === "COMPLETED") ?? [];
+  useEffect(() => {
+    async function fetchMeetings() {
+      try {
+        const data = await getMeetings();
+        setMeetings(Array.isArray(data) ? data : []);
+      } catch (err) {
+        setError("Failed to load meetings. Please try again.");
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchMeetings();
+  }, []);
 
-  const liveMeeting = live[0];
-  useTranscriptSocket(liveMeeting?.id ?? "");
+  if (loading) {
+    return <MeetingsPageSkeleton />;
+  }
 
-  if (isLoading) {
+  if (error) {
     return (
-      <div className="space-y-10">
-        <Skeleton className="h-24 w-full rounded-3xl" />
-        <Skeleton className="h-12 w-96 rounded-2xl" />
-        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-          {[1, 2, 3].map((i) => (
-            <Skeleton key={i} className="h-48 rounded-3xl" />
-          ))}
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Meetings</h1>
+          <p className="text-sm text-muted-foreground">
+            View transcripts and summaries from past meetings.
+          </p>
+        </div>
+        <div className="flex flex-col items-center justify-center gap-4 py-16">
+          <p className="text-sm text-destructive">{error}</p>
+          <Button variant="outline" size="sm" onClick={() => window.location.reload()}>
+            Retry
+          </Button>
         </div>
       </div>
     );
   }
 
+  const hasMeetings = meetings.length > 0;
+
   return (
-    <div className="space-y-10">
-      <PageHeader
-        eyebrow="Meetings"
-        title="Your meetings"
-        description="Manage upcoming, live, and past meetings."
-        actions={<StartMeetingDialog />}
-      />
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">Meetings</h1>
+        <p className="text-sm text-muted-foreground">
+          View transcripts and summaries from past meetings.
+        </p>
+      </div>
 
-      <Tabs defaultValue={live.length > 0 ? "live" : "upcoming"}>
-        <TabsList>
-          <TabsTrigger value="upcoming">Upcoming{upcoming.length > 0 ? ` (${upcoming.length})` : ""}</TabsTrigger>
-          <TabsTrigger value="live">Live{live.length > 0 ? ` (${live.length})` : ""}</TabsTrigger>
-          <TabsTrigger value="past">Past{past.length > 0 ? ` (${past.length})` : ""}</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="upcoming">
-          {upcoming.length === 0 ? (
-            <EmptyState message="No upcoming meetings. Add one or connect your calendar." />
-          ) : (
-            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-              {upcoming.map((meeting) => (
-                <MeetingCard key={meeting.id} meeting={meeting} />
+      {hasMeetings ? (
+        <div className="rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Meeting</TableHead>
+                <TableHead>Platform</TableHead>
+                <TableHead>Date</TableHead>
+                <TableHead>Duration</TableHead>
+                <TableHead className="text-right">Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {meetings.map((meeting) => (
+                <TableRow
+                  key={meeting.id}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/dashboard/meetings/${meeting.id}`)}
+                >
+                  <TableCell className="font-medium">
+                    {meeting.platform.charAt(0).toUpperCase() + meeting.platform.slice(1)} Meeting
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Video className="size-3.5" />
+                      {meeting.platform}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {new Date(meeting.created_at).toLocaleDateString()}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {meeting.duration_minutes ? `${Math.round(meeting.duration_minutes)} min` : "—"}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Badge
+                      variant={
+                        meeting.status === "ended" ? "secondary" : meeting.status === "active" ? "default" : "outline"
+                      }
+                    >
+                      {meeting.status}
+                    </Badge>
+                  </TableCell>
+                </TableRow>
               ))}
-            </div>
-          )}
-        </TabsContent>
-
-        <TabsContent value="live">
-          {live.length === 0 ? (
-            <EmptyState message="No live meetings right now." />
-          ) : (
-            <div className="space-y-6">
-              <MeetingCard meeting={liveMeeting} />
-              <div className="grid gap-6 lg:grid-cols-2">
-                <BotControlPanel meetingId={liveMeeting.id} />
-                <TranscriptFeed />
-              </div>
-            </div>
-          )}
-        </TabsContent>
-
-        <TabsContent value="past">
-          {past.length === 0 ? (
-            <EmptyState message="No past meetings yet." />
-          ) : (
-            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-              {past.map((meeting) => (
-                <MeetingCard key={meeting.id} meeting={meeting} />
-              ))}
-            </div>
-          )}
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
-
-function EmptyState({ message }: { message: string }) {
-  return (
-    <div className="rounded-3xl border border-dashed border-border p-12 text-center">
-      <p className="text-sm text-muted-foreground">{message}</p>
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <EmptyState />
+      )}
     </div>
   );
 }

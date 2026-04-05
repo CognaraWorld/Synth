@@ -56,9 +56,9 @@ class RawTranscriptBuffer:
         max_minutes: Maximum age in minutes for retained entries.
     """
 
-    def __init__(self, max_minutes: int = 5) -> None:
+    def __init__(self, max_minutes: int = 10) -> None:
         self.max_minutes = max_minutes
-        self._entries: deque[dict[str, Any]] = deque(maxlen=200)
+        self._entries: deque[dict[str, Any]] = deque(maxlen=400)
         self._lock = threading.Lock()
 
     def _prune(self) -> list[tuple[datetime, str]]:

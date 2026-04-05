@@ -115,16 +115,17 @@ class Meeting(Base):
     started_at = Column(DateTime, nullable=True)
     ended_at = Column(DateTime, nullable=True)
     duration_minutes = Column(Float, nullable=True)
-    credits_used = Column(Integer, default=1)
+    credits_used = Column(Integer, default=0)
     created_at = Column(DateTime, default=_utcnow)
 
     user = relationship("User", back_populates="meetings")
     agent = relationship("Agent", back_populates="meetings")
-    summary = relationship("MeetingSummary", back_populates="meeting", uselist=False)
+    summary = relationship("MeetingSummary", back_populates="meeting", uselist=False, cascade="all, delete-orphan")
     usage_record = relationship(
         "UsageRecord",
         back_populates="meeting",
         uselist=False,
+        cascade="all, delete-orphan",
     )
     live_session = relationship(
         "LiveSession",
@@ -137,7 +138,7 @@ class Meeting(Base):
         back_populates="meeting",
         cascade="all, delete-orphan",
     )
-    override = relationship("MeetingOverride", back_populates="meeting", uselist=False)
+    override = relationship("MeetingOverride", back_populates="meeting", uselist=False, cascade="all, delete-orphan")
 
 
 class MeetingSummary(Base):

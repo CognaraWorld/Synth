@@ -276,7 +276,7 @@ async def _handle_transcription(data: dict) -> None:
             common_short = {"yes", "no", "yeah", "okay", "ok", "sure", "right",
                            "thanks", "thank you", "stop", "enough", "got it"}
             wake_words = {"nova", "hey nova", "nora", "hey nora", "noah", "hey noah",
-                         "no va", "mova", "rover", "over"}
+                         "no va", "mova"}
             if text_lower not in common_short and text_lower not in wake_words:
                 logger.debug("Dropping short fragment: %s: %s", speaker, text)
                 return

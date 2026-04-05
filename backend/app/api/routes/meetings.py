@@ -121,6 +121,7 @@ async def create_meeting(
         engine = get_bot_engine()
         agent_config = {
             "agent_id": str(agent.id),
+            "user_id": str(current_user.id),
             "agent_name": agent.name or "Synth",
             "mode": agent.mode or "general",
             "persona_id": getattr(agent, "persona_id", "general"),

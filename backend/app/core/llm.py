@@ -7,6 +7,7 @@ directly for heavy tasks like meeting summaries and document analysis.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -70,7 +71,15 @@ class LLMClient:
         system_prompt: str | None = None,
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
+            f"Do NOT say who asked it. Just give the answer. "
+            f"Combine information from ALL available sources — documents, web search results, "
+            f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
+            f"Here is the meeting context you can reference:\n{context}"
+        )
 
         # Try Gemini first
         if self.gemini_client:
@@ -87,7 +96,10 @@ class LLMClient:
                 )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
-                return response.text
+                text = response.text
+                if not text:
+                    raise ValueError("Gemini returned empty/blocked response")
+                return text
             except Exception as exc:
                 logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
@@ -101,29 +113,44 @@ class LLMClient:
         system_prompt: str | None = None,
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
+            f"Do NOT say who asked it. Just give the answer. "
+            f"Combine information from ALL available sources — documents, web search results, "
+            f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
+            f"Here is the meeting context you can reference:\n{context}"
+        )
 
-        # Try Gemini first (run sync SDK in executor to avoid blocking)
+        # Try Gemini first (run sync SDK in executor with timeout)
         if self.gemini_client:
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 start = time.time()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: self.gemini_client.models.generate_content(
-                        model=self._gemini_model,
-                        contents=user_content,
-                        config={
-                            "system_instruction": prompt,
-                            "max_output_tokens": 1024,
-                            "temperature": 0.7,
-                        },
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: self.gemini_client.models.generate_content(
+                            model=self._gemini_model,
+                            contents=user_content,
+                            config={
+                                "system_instruction": prompt,
+                                "max_output_tokens": 1024,
+                                "temperature": 0.7,
+                            },
+                        ),
                     ),
+                    timeout=30.0,
                 )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
-                return response.text
+                text = response.text
+                if not text:
+                    raise ValueError("Gemini returned empty/blocked response")
+                return text
+            except asyncio.TimeoutError:
+                logger.warning("Gemini timed out after 30s, falling back to Claude")
             except Exception as exc:
                 logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
@@ -141,10 +168,19 @@ class LLMClient:
         system_prompt: str | None = None,
     ) -> str:
         if self.claude_client is None:
-            raise RuntimeError("No LLM configured (neither Gemini nor Claude)")
+            logger.error("No LLM configured (neither Gemini nor Claude)")
+            return "I'm having trouble processing right now. Please try again in a moment."
 
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
+            f"Do NOT say who asked it. Just give the answer. "
+            f"Combine information from ALL available sources — documents, web search results, "
+            f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
+            f"Here is the meeting context you can reference:\n{context}"
+        )
 
         start = time.time()
         response = self.claude_client.messages.create(
@@ -155,6 +191,8 @@ class LLMClient:
         )
         elapsed = time.time() - start
         logger.info("Claude responded in %.0fms", elapsed * 1000)
+        if not response.content:
+            raise ValueError("Claude returned empty content")
         return response.content[0].text
 
     async def _claude_async_query(
@@ -164,10 +202,19 @@ class LLMClient:
         system_prompt: str | None = None,
     ) -> str:
         if self._claude_async is None:
-            raise RuntimeError("No LLM configured (neither Gemini nor Claude)")
+            logger.error("No LLM configured (neither Gemini nor Claude)")
+            return "I'm having trouble processing right now. Please try again in a moment."
 
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
+            f"Do NOT say who asked it. Just give the answer. "
+            f"Combine information from ALL available sources — documents, web search results, "
+            f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
+            f"Here is the meeting context you can reference:\n{context}"
+        )
 
         start = time.time()
         response = await self._claude_async.messages.create(
@@ -178,6 +225,8 @@ class LLMClient:
         )
         elapsed = time.time() - start
         logger.info("Claude responded in %.0fms", elapsed * 1000)
+        if not response.content:
+            raise ValueError("Claude returned empty content")
         return response.content[0].text
 
     def claude_query(
