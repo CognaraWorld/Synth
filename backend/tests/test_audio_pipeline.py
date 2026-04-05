@@ -245,6 +245,13 @@ class TestFillerManager:
 
         assert len(_UNIVERSAL_FILLERS) == len(set(_UNIVERSAL_FILLERS))
 
+    def test_universal_fillers_are_short(self) -> None:
+        """Universal fillers should be short phrases for quick delivery."""
+        from app.utils.filler import _UNIVERSAL_FILLERS
+
+        for phrase in _UNIVERSAL_FILLERS:
+            assert len(phrase.split()) <= 4, f"Filler too long: {phrase}"
+
     def test_filler_manager_attributes_after_init(self) -> None:
         """A FillerManager has the expected attributes after construction."""
         from app.utils.filler import FillerManager

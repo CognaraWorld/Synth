@@ -23,7 +23,7 @@ class CreditTransaction(Base):
     )  # "purchase", "meeting_used", "refund", "free_credit"
     description = Column(String(500), nullable=False)
     stripe_session_id = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     user = relationship("User", back_populates="credit_transactions")
     meeting = relationship("Meeting")

@@ -68,11 +68,11 @@ class TestBuildGeneralPrompt:
         assert len(result) > 0
 
     def test_general_prompt_contains_role(self) -> None:
-        """The general prompt should reference the meeting participant role."""
+        """The general prompt should reference the meeting assistant role."""
         from app.utils.prompt_builder import build_general_prompt
 
         result = build_general_prompt()
-        assert "meeting participant" in result.lower()
+        assert "assistant in a meeting" in result.lower()
 
     def test_general_prompt_contains_guidelines(self) -> None:
         """The general prompt should include behavioral guidelines."""
