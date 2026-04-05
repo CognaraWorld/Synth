@@ -1,10 +1,10 @@
 """Screen share OCR and visual analysis.
 
 Extracts text content from screen share screenshots captured during
-meetings. Uses OCR to convert visual content (slides, documents, code)
-into text that can be included in the LLM context window.
+meetings. Uses Gemini Flash vision for cheap, fast OCR. Falls back
+to Claude vision if Gemini is unavailable.
 
-Phase 5 implementation.
+Phase 5 implementation (updated: Gemini primary).
 """
 
 from __future__ import annotations
@@ -14,60 +14,46 @@ import logging
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
+try:
+    from google import genai
+except ModuleNotFoundError:
+    genai = None
+
 try:
     import anthropic
-except ModuleNotFoundError:  # pragma: no cover - depends on local optional install
+except ModuleNotFoundError:
     anthropic = None
-
-logger = logging.getLogger(__name__)
 
 _VISION_PROMPT = (
     "Extract all visible text from this screenshot. "
-    "Return only the text content, preserving layout where possible."
+    "Preserve layout, tables, and structure where possible. "
+    "If there are charts or diagrams, describe what they show."
 )
-
-_VISION_MODEL = "claude-haiku-4-5-20251001"
 
 
 class VisionProcessor:
     """Processes screen share screenshots for text extraction.
 
-    Captures periodic screenshots from screen share streams and extracts
-    text content via OCR for inclusion in meeting context.
-
-    Attributes:
-        ocr_engine: The OCR backend to use for text extraction.
+    Uses Gemini Flash vision (primary) for cheap, fast OCR.
+    Falls back to Claude vision if Gemini is unavailable.
     """
 
-    def __init__(self, ocr_engine: str = "claude-vision") -> None:
-        """Initialize the vision processor.
+    def __init__(self) -> None:
+        settings = get_settings()
+        self._gemini_client = None
+        self._claude_async = None
 
-        Args:
-            ocr_engine: OCR backend identifier. Supported: "tesseract",
-                "claude-vision" (uses Claude's vision capabilities).
-        """
-        self.ocr_engine = ocr_engine
-        self._client = None
-        self._async_client = None
-
-        if self.ocr_engine == "claude-vision" and anthropic is not None:
-            settings = get_settings()
-            if settings.anthropic_api_key:
-                self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-                self._async_client = anthropic.AsyncAnthropic(
-                    api_key=settings.anthropic_api_key,
-                )
+        if genai and settings.gemini_api_key:
+            self._gemini_client = genai.Client(api_key=settings.gemini_api_key)
+            logger.info("VisionProcessor using Gemini Flash")
+        elif anthropic and settings.anthropic_api_key:
+            self._claude_async = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            logger.info("VisionProcessor using Claude vision (fallback)")
 
     def _detect_media_type(self, screenshot_bytes: bytes) -> str:
-        """Detect the image media type from its magic bytes.
-
-        Args:
-            screenshot_bytes: Raw image bytes.
-
-        Returns:
-            MIME type string (e.g. ``"image/png"``). Defaults to
-            ``"image/png"`` if the format cannot be determined.
-        """
+        """Detect image MIME type from magic bytes."""
         if screenshot_bytes[:8] == b"\x89PNG\r\n\x1a\n":
             return "image/png"
         if screenshot_bytes[:2] in (b"\xff\xd8",):
@@ -78,99 +64,61 @@ class VisionProcessor:
             return "image/gif"
         return "image/png"
 
-    def extract_text(self, screenshot_bytes: bytes) -> str:
-        """Extract text content from a screenshot image.
-
-        Args:
-            screenshot_bytes: Raw image bytes (PNG or JPEG format) from
-                a screen share capture.
-
-        Returns:
-            Extracted text content from the screenshot. Returns empty
-            string if no text is detected or on error.
-        """
-        if self.ocr_engine != "claude-vision" or self._client is None:
-            logger.warning("OCR engine %r is not supported", self.ocr_engine)
-            return ""
-
-        try:
-            encoded = base64.standard_b64encode(screenshot_bytes).decode("ascii")
-            media_type = self._detect_media_type(screenshot_bytes)
-
-            response = self._client.messages.create(
-                model=_VISION_MODEL,
-                max_tokens=4096,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": encoded,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": _VISION_PROMPT,
-                            },
-                        ],
-                    },
-                ],
-            )
-            return response.content[0].text
-        except Exception as exc:
-            logger.error("Vision text extraction failed: %s", exc)
-            return ""
-
     async def async_extract_text(self, screenshot_bytes: bytes) -> str:
-        """Extract text content from a screenshot asynchronously.
-
-        Behaves identically to ``extract_text`` but uses the async
-        Anthropic client, making it suitable for async request handlers.
+        """Extract text from a screenshot image.
 
         Args:
-            screenshot_bytes: Raw image bytes (PNG or JPEG format) from
-                a screen share capture.
+            screenshot_bytes: Raw image bytes (PNG/JPEG).
 
         Returns:
-            Extracted text content from the screenshot. Returns empty
-            string if no text is detected or on error.
+            Extracted text content. Empty string on error.
         """
-        if self.ocr_engine != "claude-vision" or self._async_client is None:
-            logger.warning("OCR engine %r is not supported", self.ocr_engine)
+        if not screenshot_bytes:
             return ""
 
-        try:
-            encoded = base64.standard_b64encode(screenshot_bytes).decode("ascii")
-            media_type = self._detect_media_type(screenshot_bytes)
+        encoded = base64.standard_b64encode(screenshot_bytes).decode("ascii")
+        media_type = self._detect_media_type(screenshot_bytes)
 
-            response = await self._async_client.messages.create(
-                model=_VISION_MODEL,
-                max_tokens=4096,
-                messages=[
-                    {
+        # Try Gemini first
+        if self._gemini_client:
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: self._gemini_client.models.generate_content(
+                        model="gemini-2.5-flash-lite",
+                        contents=[
+                            {
+                                "parts": [
+                                    {"inline_data": {"mime_type": media_type, "data": encoded}},
+                                    {"text": _VISION_PROMPT},
+                                ]
+                            }
+                        ],
+                        config={"max_output_tokens": 4096},
+                    ),
+                )
+                return response.text
+            except Exception as exc:
+                logger.warning("Gemini vision failed: %s", exc)
+
+        # Fallback to Claude
+        if self._claude_async:
+            try:
+                response = await self._claude_async.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=4096,
+                    messages=[{
                         "role": "user",
                         "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": encoded,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": _VISION_PROMPT,
-                            },
+                            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}},
+                            {"type": "text", "text": _VISION_PROMPT},
                         ],
-                    },
-                ],
-            )
-            return response.content[0].text
-        except Exception as exc:
-            logger.error("Async vision text extraction failed: %s", exc)
-            return ""
+                    }],
+                )
+                return response.content[0].text
+            except Exception as exc:
+                logger.error("Claude vision failed: %s", exc)
+
+        return ""

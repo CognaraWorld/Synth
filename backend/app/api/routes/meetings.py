@@ -42,23 +42,21 @@ async def create_meeting(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Atomic credit deduction (prevents double-spend from concurrent requests)
-    deduct_result = await db.execute(
-        update(User)
-        .where(User.id == current_user.id, User.credits >= 1)
-        .values(credits=User.credits - 1)
-    )
-    if deduct_result.rowcount == 0:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
+    # Check minimum balance (5 minutes) — actual usage deducted when meeting ends
+    if current_user.credits < 5:
+        raise HTTPException(status_code=402, detail="Insufficient minutes. Need at least 5 minutes to start a meeting.")
 
     platform = detect_platform(meeting_data.meeting_link)
 
+    from datetime import datetime, timezone
     meeting = Meeting(
         user_id=current_user.id,
         agent_id=meeting_data.agent_id,
         platform=platform,
         meeting_link=meeting_data.meeting_link,
         status="pending",
+        started_at=datetime.now(timezone.utc),
+        credits_used=0,
     )
     db.add(meeting)
 
@@ -138,6 +136,40 @@ async def create_meeting(
         except Exception as exc:
             logger.warning("Failed to load doc summaries: %s", exc)
 
+        # Load past meeting summaries for cross-meeting memory
+        try:
+            past_result = await db.execute(
+                select(Meeting)
+                .options(joinedload(Meeting.summary))
+                .where(
+                    Meeting.agent_id == agent.id,
+                    Meeting.status == "ended",
+                    Meeting.id != meeting.id,
+                )
+                .order_by(Meeting.created_at.desc())
+                .limit(3)
+            )
+            past_meetings = past_result.unique().scalars().all()
+            for pm in past_meetings:
+                if pm.summary and pm.summary.content:
+                    meeting_date = (
+                        pm.started_at.strftime("%Y-%m-%d %H:%M")
+                        if pm.started_at
+                        else pm.created_at.strftime("%Y-%m-%d %H:%M")
+                    )
+                    session.context_manager.add_past_meeting_summary(
+                        meeting_date=meeting_date,
+                        summary=pm.summary.content,
+                    )
+            if past_meetings:
+                loaded = sum(1 for pm in past_meetings if pm.summary and pm.summary.content)
+                if loaded:
+                    logger.info(
+                        "Loaded %d past meeting summaries for agent %s", loaded, agent.id
+                    )
+        except Exception as exc:
+            logger.warning("Failed to load past meeting summaries: %s", exc)
+
         # Set session states and register
         session.transition(SessionState.JOINING)
         session.transition(SessionState.LISTENING)
@@ -150,12 +182,6 @@ async def create_meeting(
     except RecallClientError as exc:
         logger.error("Failed to deploy bot for meeting %s: %s", meeting.id, exc)
         meeting.status = "failed"
-        # Atomic credit refund
-        await db.execute(
-            update(User)
-            .where(User.id == current_user.id)
-            .values(credits=User.credits + 1)
-        )
         await db.commit()
         raise HTTPException(status_code=502, detail="Failed to deploy meeting bot. Credit refunded.")
     finally:
@@ -229,6 +255,27 @@ async def stop_meeting(
             await recall.close()
 
     meeting.status = "ended"
+
+    # Calculate and deduct actual minutes used
+    if meeting.started_at and not meeting.ended_at:
+        from datetime import datetime, timezone
+        import math
+        now = datetime.now(timezone.utc)
+        meeting.ended_at = now
+        started = meeting.started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        duration = (now - started).total_seconds() / 60
+        minutes_used = max(1, math.ceil(duration))
+        meeting.duration_minutes = round(duration, 1)
+        meeting.credits_used = minutes_used
+
+        await db.execute(
+            update(User)
+            .where(User.id == current_user.id)
+            .values(credits=User.credits - minutes_used)
+        )
+        logger.info("Deducted %d minutes for meeting %s (%.1f min actual)", minutes_used, meeting.id, duration)
 
     await db.commit()
     await db.refresh(meeting)

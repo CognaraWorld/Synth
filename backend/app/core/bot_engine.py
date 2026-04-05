@@ -333,6 +333,19 @@ class BotEngine:
         # Flush remaining transcript chunks to RAG then cleanup
         session.context_manager.flush_remaining_embeddings()
 
+        # Persist final meeting summary to database
+        if session.bot_id and (summary or full_transcript):
+            try:
+                buffer_text = session.context_manager.raw_buffer.get_recent(minutes=60)
+                combined = (
+                    f"{summary}\n\nFinal minutes:\n{buffer_text}"
+                    if summary and buffer_text
+                    else summary or buffer_text
+                )
+                await self._save_meeting_summary(session.bot_id, combined)
+            except Exception as exc:
+                logger.warning("Failed to save meeting summary: %s", exc)
+
         # Clean up all session resources
         vad = self._vad_instances.pop(session_id, None)
         if vad is not None:
@@ -362,6 +375,44 @@ class BotEngine:
             "summary": summary,
             "duration_seconds": round(session.get_duration(), 2),
         }
+
+    async def _save_meeting_summary(self, bot_id: str, content: str) -> None:
+        """Persist a final meeting summary to the MeetingSummary table.
+
+        Looks up the Meeting row by bot_id to obtain the meeting UUID,
+        then creates a MeetingSummary row with the combined summary text.
+
+        Args:
+            bot_id: Recall.ai bot identifier for the meeting.
+            content: Combined summary text to persist.
+        """
+        from app.models.database import AsyncSessionLocal, Meeting, MeetingSummary
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Meeting).where(Meeting.bot_id == bot_id)
+            )
+            meeting = result.scalar_one_or_none()
+            if not meeting:
+                logger.warning("Cannot save summary — no meeting found for bot %s", bot_id)
+                return
+
+            # Avoid duplicates if summary already exists
+            existing = await db.execute(
+                select(MeetingSummary).where(MeetingSummary.meeting_id == meeting.id)
+            )
+            if existing.scalar_one_or_none():
+                logger.info("Summary already exists for meeting %s, skipping", meeting.id)
+                return
+
+            summary_row = MeetingSummary(
+                meeting_id=meeting.id,
+                content=content,
+            )
+            db.add(summary_row)
+            await db.commit()
+            logger.info("Saved meeting summary for meeting %s (%d chars)", meeting.id, len(content))
 
     async def get_status(self, session_id: str) -> dict[str, Any]:
         """Get the current status of a bot session.
@@ -904,16 +955,34 @@ class BotEngine:
                         filler_duration = len(filler_pcm) / 48000
             filler_sent_at = time.time()
 
-            # Assemble context + web search in parallel (search runs speculatively)
+            # Assemble context + web search in parallel
+            # Skip search for questions clearly about the meeting or conversation
+            _SKIP_SEARCH_MARKERS = (
+                "hear me", "just say", "said", "talking about", "discuss",
+                "summarize", "recap", "summary", "earlier", "remember",
+                "catch me up", "action item", "key point", "what did",
+                "who said", "repeat", "again", "document", "uploaded",
+                "thank", "stop", "yes", "no", "okay",
+            )
+            _FORCE_SEARCH_MARKERS = (
+                "search", "google", "look up", "find out", "research",
+                "internet", "online", "web",
+            )
+            q_lower = question.lower()
+            force_search = any(m in q_lower for m in _FORCE_SEARCH_MARKERS)
+            skip_search = not force_search and any(m in q_lower for m in _SKIP_SEARCH_MARKERS)
+
             context_task = asyncio.get_running_loop().run_in_executor(
                 None,
                 session.context_manager.assemble_context,
                 question,
                 session.session_id,
             )
-            search_task = asyncio.create_task(
-                self._search_client.search_formatted(question)
-            )
+            search_task = None
+            if not skip_search:
+                search_task = asyncio.create_task(
+                    self._search_client.search_formatted(question)
+                )
 
             context = await context_task
 
@@ -932,12 +1001,15 @@ class BotEngine:
             if mood and mood in ("positive", "negative", "neutral"):
                 context = f"{context}\n\n(Speaker mood: {mood}. Match your tone accordingly.)"
 
-            # Attach search results if available (ran in parallel, adds no latency)
+            # Attach search results if available
             try:
-                search_results = await search_task
+                search_results = await search_task if search_task else None
                 if search_results and search_results.strip():
                     context = (
-                        f"{context}\n\n=== WEB SEARCH RESULTS (use only if relevant to the question) ===\n"
+                        f"{context}\n\n=== WEB SEARCH RESULTS ===\n"
+                        f"(ONLY use these if the question asks about current events, prices, news, "
+                        f"or information NOT available in the meeting transcript or uploaded documents above. "
+                        f"ALWAYS prefer meeting context and document passages over web results.)\n"
                         f"{search_results}"
                     )
             except Exception as exc:

@@ -36,7 +36,7 @@ class User(Base):
     name = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=True)  # null if OAuth only
     provider = Column(String(50), default="email")  # email, google
-    credits = Column(Integer, default=3)  # start with 3 free credits
+    credits = Column(Integer, default=60)  # minutes balance (start with 60 free minutes)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 

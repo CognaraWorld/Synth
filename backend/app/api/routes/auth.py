@@ -127,7 +127,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
                 amount=user.credits,
                 balance_after=user.credits,
                 transaction_type="free_credit",
-                description="Starter credits granted on registration",
+                description="60 free minutes granted on registration",
             )
         )
 

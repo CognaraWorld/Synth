@@ -45,9 +45,16 @@ class ContextManager:
         """
         self.max_context_tokens = max_context_tokens
         self.rolling_summary: RollingSummary = RollingSummary()
-        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=5)
+        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=10)
         self.rag_pipeline: Any | None = None
         self.document_summaries: list[dict[str, str]] = []
+        self.past_meeting_summaries: list[dict[str, str]] = []
+        self._entities: dict[str, set[str]] = {
+            "people": set(),
+            "topics": set(),
+            "decisions": set(),
+            "action_items": set(),
+        }
         self._transcript_embed_buffer: list[tuple[datetime, str]] = []
         self._embed_chunk_target: int = 200  # words per RAG chunk
         self._embed_stale_seconds: float = 120.0  # force-flush if oldest entry > 2 min
@@ -73,6 +80,53 @@ class ContextManager:
             self.document_summaries.append(
                 {"filename": filename, "summary": summary}
             )
+
+    def add_past_meeting_summary(self, meeting_date: str, summary: str) -> None:
+        """Register a past meeting summary for cross-meeting memory.
+
+        Args:
+            meeting_date: Human-readable date/time of the past meeting.
+            summary: Summary text from the previous meeting.
+        """
+        if summary and summary.strip():
+            self.past_meeting_summaries.append(
+                {"date": meeting_date, "summary": summary}
+            )
+
+    def _extract_entities(self, text: str, speaker: str) -> None:
+        """Extract entities from transcript text.
+
+        Tracks people (from speaker labels), decisions, and action items
+        using fast keyword matching. No LLM call required.
+
+        Args:
+            text: The transcript text to scan.
+            speaker: Name of the speaker.
+        """
+        if speaker and speaker.lower() not in ("unknown", "", "bot"):
+            self._entities["people"].add(speaker)
+
+        t = text.lower()
+
+        # Decisions
+        decision_markers = (
+            "we decided", "let's go with", "agreed to",
+            "the decision is", "we'll do", "final answer is",
+        )
+        for marker in decision_markers:
+            if marker in t:
+                self._entities["decisions"].add(text.strip())
+                break
+
+        # Action items
+        action_markers = (
+            "i will", "i'll", "we need to", "action item",
+            "todo", "follow up on", "assigned to",
+        )
+        for marker in action_markers:
+            if marker in t:
+                self._entities["action_items"].add(text.strip())
+                break
 
     # ------------------------------------------------------------------
     # Token helpers
@@ -108,6 +162,17 @@ class ContextManager:
             text: Transcript text segment.
             timestamp: When the segment was captured. Defaults to now.
         """
+        # Extract speaker from "Speaker: text" format for entity tracking
+        speaker = ""
+        if ": " in text:
+            parts = text.split(": ", 1)
+            candidate = parts[0].strip()
+            words = candidate.split()
+            if 1 <= len(words) <= 3 and all(w[0].isupper() for w in words if w):
+                speaker = candidate
+
+        self._extract_entities(text, speaker)
+
         # Append to buffer — returns entries evicted by overflow or age
         evicted = self.raw_buffer.append(text, timestamp=timestamp)
 
@@ -220,6 +285,76 @@ class ContextManager:
                 break
             start = end - overlap
 
+    def _rewrite_query(self, question: str, recent_text: str) -> str:
+        """Rewrite vague queries by resolving pronouns and references.
+
+        Uses the recent transcript buffer to expand "he", "she", "that",
+        "it" into specific names and topics. No LLM call — pure heuristic.
+
+        Args:
+            question: The user's raw question.
+            recent_text: Recent conversation text from the buffer.
+
+        Returns:
+            Rewritten query optimized for RAG search.
+        """
+        q = question.lower().strip()
+
+        # If question is already specific (contains proper nouns or 5+ words), use as-is
+        if len(q.split()) >= 6:
+            return question
+
+        # Check if question has vague references that need resolving
+        vague_markers = ("he ", "she ", "they ", "him ", "her ", "that ", "this ", "it ",
+                         "he?", "she?", "they?", "that?", "this?", "it?",
+                         "what did", "who said", "just said", "was saying",
+                         " that", " this", " it")
+        if not any(m in q for m in vague_markers):
+            return question
+
+        # Extract recent speakers and their last statements from buffer
+        if not recent_text:
+            return question
+
+        lines = recent_text.strip().split("\n")
+        recent_speakers: list[tuple[str, str]] = []  # (speaker, text)
+        for line in reversed(lines):
+            # Format: "[2m ago] Speaker Name: text" or "Speaker Name: text"
+            if ": " in line:
+                parts = line.split(": ", 1)
+                speaker_part = parts[0].strip()
+                # Remove timestamp prefix like "[2m ago] "
+                if "]" in speaker_part:
+                    speaker_part = speaker_part.split("]", 1)[-1].strip()
+                if speaker_part and len(speaker_part.split()) <= 4:
+                    recent_speakers.append((speaker_part, parts[1].strip()))
+                    if len(recent_speakers) >= 5:
+                        break
+
+        if not recent_speakers:
+            return question
+
+        # Build expanded query
+        expanded = question
+        people = list(dict.fromkeys(s[0] for s in recent_speakers))  # unique, ordered
+        topics = " ".join(s[1][:50] for s in recent_speakers[:3])
+
+        # Replace pronouns with most recent speaker names
+        if any(m in q for m in ("he ", "him ", "he?")):
+            expanded = f"{question} (referring to {people[0] if people else 'previous speaker'})"
+        elif any(m in q for m in ("she ", "her ", "she?")):
+            expanded = f"{question} (referring to {people[0] if people else 'previous speaker'})"
+        elif any(m in q for m in ("they ", "they?")):
+            expanded = f"{question} (referring to {', '.join(people[:2])})"
+        elif any(m in q for m in ("that ", "this ", "it ", "that?", "this?", "it?")) or q.endswith(("that", "this", "it")):
+            # "that" / "this" / "it" refers to the recent topic
+            expanded = f"{question} (context: {topics[:100]})"
+        elif "just said" in q or "was saying" in q:
+            if recent_speakers:
+                expanded = f"{question} ({recent_speakers[0][0]} said: {recent_speakers[0][1][:80]})"
+
+        return expanded
+
     def _truncate_from_beginning(self, text: str, max_tokens: int) -> str:
         """Truncate *text* from the beginning to fit within *max_tokens*.
 
@@ -263,8 +398,9 @@ class ContextManager:
             A formatted context string ready for inclusion in the
             LLM prompt, within the token budget.
         """
-        budget_summary = int(self.max_context_tokens * 0.20)
-        budget_buffer = int(self.max_context_tokens * 0.30)
+        budget_past = int(self.max_context_tokens * 0.10)
+        budget_summary = int(self.max_context_tokens * 0.15)
+        budget_buffer = int(self.max_context_tokens * 0.25)
         budget_doc_summaries = int(self.max_context_tokens * 0.20)
         budget_rag = int(self.max_context_tokens * 0.30)
 
@@ -273,7 +409,7 @@ class ContextManager:
         summary_text = self._truncate_from_beginning(summary_text, budget_summary)
 
         # --- Section 2: Recent raw transcript ---
-        recent_text = self.raw_buffer.get_recent(minutes=5)
+        recent_text = self.raw_buffer.get_recent(minutes=10)
         recent_text = self._truncate_from_beginning(recent_text, budget_buffer)
 
         # --- Section 3: Document summaries (full-document understanding) ---
@@ -293,11 +429,17 @@ class ContextManager:
         if self.rag_pipeline is not None:
             self._flush_embed_buffer(force=True)
 
+        # Rewrite vague queries using recent conversation context.
+        # Resolves "he", "she", "that", "it" into specific names/topics
+        # so RAG search finds the right chunks.
+        search_query = self._rewrite_query(question, recent_text)
+
         rag_text = ""
         if self.rag_pipeline is not None:
             try:
-                results: list[dict[str, Any]] = self.rag_pipeline.search(
-                    query=question, top_k=8
+                search_fn = getattr(self.rag_pipeline, "hybrid_search", self.rag_pipeline.search)
+                results: list[dict[str, Any]] = search_fn(
+                    query=search_query, top_k=8
                 )
                 chunks: list[str] = []
                 for result in results:
@@ -314,8 +456,22 @@ class ContextManager:
 
         rag_text = self._truncate_from_beginning(rag_text, budget_rag)
 
+        # --- Section 5: Past meeting summaries ---
+        past_text = ""
+        if self.past_meeting_summaries:
+            parts = []
+            for pm in self.past_meeting_summaries:
+                parts.append(f"[{pm['date']}]:\n{pm['summary']}")
+            past_text = "\n\n".join(parts)
+        past_text = self._truncate_from_beginning(past_text, budget_past)
+
         # --- Assemble (skip empty sections to avoid confusing the LLM) ---
         sections: list[str] = []
+
+        if past_text.strip():
+            sections.append("=== PAST MEETINGS ===")
+            sections.append(past_text)
+            sections.append("")
 
         if summary_text.strip():
             sections.append("=== MEETING SUMMARY ===")
@@ -327,13 +483,29 @@ class ContextManager:
             sections.append(recent_text)
             sections.append("")
 
+        if any(self._entities.values()):
+            entity_parts = []
+            if self._entities["people"]:
+                entity_parts.append(
+                    f"People in meeting: {', '.join(sorted(self._entities['people']))}"
+                )
+            if self._entities["decisions"]:
+                recent_decisions = list(self._entities["decisions"])[-5:]
+                entity_parts.append(f"Decisions made: {'; '.join(recent_decisions)}")
+            if self._entities["action_items"]:
+                recent_actions = list(self._entities["action_items"])[-5:]
+                entity_parts.append(f"Action items: {'; '.join(recent_actions)}")
+            sections.append("=== MEETING ENTITIES ===")
+            sections.append("\n".join(entity_parts))
+            sections.append("")
+
         if doc_summary_text.strip():
             sections.append("=== DOCUMENT OVERVIEWS ===")
             sections.append(doc_summary_text)
             sections.append("")
 
         if rag_text.strip():
-            sections.append("=== RELEVANT DOCUMENT PASSAGES ===")
+            sections.append("=== RELEVANT DOCUMENT PASSAGES (PRIMARY SOURCE — use these first) ===")
             sections.append(rag_text)
 
         if not sections:
@@ -382,3 +554,6 @@ class ContextManager:
         self.raw_buffer.clear()
         self.rag_pipeline = None
         self.document_summaries.clear()
+        self.past_meeting_summaries.clear()
+        for v in self._entities.values():
+            v.clear()

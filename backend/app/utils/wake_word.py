@@ -61,7 +61,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
     if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
         # "nova" or "hey nova" — accepts both with phonetic variants.
         prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
-        name = r"(?:nova|over|no\s*va|nora|noah|mova|rover)"
+        name = r"(?:nova|no\s*va|nora|noah|mova|rover)"
         return re.compile(
             rf"\b{prefix}{name}\b",
             re.IGNORECASE,

@@ -65,7 +65,46 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _preload_tts)
 
+    # Start background task to kill stale bots (safety timeout)
+    async def _cleanup_stale_bots():
+        """Kill any bot running longer than 2 hours to prevent billing leaks."""
+        import asyncio
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select, update
+        while True:
+            await asyncio.sleep(300)  # check every 5 minutes
+            try:
+                from app.models.database import AsyncSessionLocal, Meeting
+                from app.meeting.recall_client import RecallClient
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(Meeting).where(
+                            Meeting.status == "active",
+                            Meeting.created_at < cutoff,
+                        )
+                    )
+                    stale = result.scalars().all()
+                    for m in stale:
+                        if m.bot_id:
+                            try:
+                                recall = RecallClient()
+                                await recall.stop_bot(m.bot_id)
+                                await recall.close()
+                            except Exception:
+                                pass
+                        m.status = "ended"
+                    if stale:
+                        await db.commit()
+                        logger.warning("Auto-killed %d stale bot(s) exceeding 2hr limit", len(stale))
+            except Exception as exc:
+                logger.debug("Stale bot cleanup error: %s", exc)
+
+    _cleanup_task = asyncio.get_running_loop().create_task(_cleanup_stale_bots())
+
     yield
+
+    _cleanup_task.cancel()
     await engine.dispose()
 
 

@@ -124,6 +124,13 @@ class RecallClient:
                     },
                 ],
             }
+            # Enable screen share capture for OCR
+            payload["output_media"] = {
+                "camera": {
+                    "kind": "jpeg",
+                    "output_video_tracks": "screen_share",
+                },
+            }
 
         try:
             response = await self._client.post("/bot", json=payload)
