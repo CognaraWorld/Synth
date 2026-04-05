@@ -146,7 +146,8 @@ class VisionProcessor:
     def extract_text(self, screenshot_bytes: bytes) -> str:
         """Extract text content from a screenshot image.
 
-        Tries Gemini first (fast), falls back to Claude (reliable).
+        Respects ``ocr_engine``: ``"gemini"`` skips Claude fallback,
+        ``"claude-vision"`` skips Gemini, ``"auto"`` tries both.
 
         Args:
             screenshot_bytes: Raw image bytes (PNG or JPEG format).
@@ -154,19 +155,23 @@ class VisionProcessor:
         Returns:
             Extracted text content from the screenshot. Empty string on error.
         """
-        # Try Gemini first
-        if self._gemini_client:
+        # If explicitly set to claude-vision, skip Gemini entirely
+        if self.ocr_engine != "claude-vision" and self._gemini_client:
             result = self._gemini_extract(screenshot_bytes)
             if result and result.strip():
                 return result
+            # If explicitly set to gemini, do not fall back to Claude
+            if self.ocr_engine == "gemini":
+                return ""
 
-        # Fallback to Claude
+        # Fallback (or primary when ocr_engine == "claude-vision")
         return self._claude_extract(screenshot_bytes)
 
     async def async_extract_text(self, screenshot_bytes: bytes) -> str:
         """Extract text content from a screenshot asynchronously.
 
-        Tries Gemini first (via executor), falls back to Claude async.
+        Respects ``ocr_engine``: ``"gemini"`` skips Claude fallback,
+        ``"claude-vision"`` skips Gemini, ``"auto"`` tries both.
 
         Args:
             screenshot_bytes: Raw image bytes (PNG or JPEG format).
@@ -174,8 +179,8 @@ class VisionProcessor:
         Returns:
             Extracted text content. Empty string on error.
         """
-        # Try Gemini first (sync SDK in executor)
-        if self._gemini_client:
+        # If explicitly set to claude-vision, skip Gemini entirely
+        if self.ocr_engine != "claude-vision" and self._gemini_client:
             try:
                 import asyncio
                 loop = asyncio.get_running_loop()
@@ -187,7 +192,11 @@ class VisionProcessor:
             except Exception as exc:
                 logger.warning("Gemini async vision failed: %s", exc)
 
-        # Fallback to Claude async
+            # If explicitly set to gemini, do not fall back to Claude
+            if self.ocr_engine == "gemini":
+                return ""
+
+        # Fallback (or primary when ocr_engine == "claude-vision")
         if self._claude_async is None:
             return ""
 

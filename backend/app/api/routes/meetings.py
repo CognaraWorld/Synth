@@ -48,8 +48,14 @@ async def create_meeting(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Check minutes balance (minimum 5 minutes required to start)
-    if current_user.credits < 5:
+    # Atomically reserve 5 minutes to prevent overdraw under concurrent requests.
+    # The WHERE guard ensures the UPDATE is a no-op when balance is too low.
+    reserve_result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.credits >= 5)
+        .values(credits=User.credits - 5)
+    )
+    if reserve_result.rowcount == 0:
         raise HTTPException(status_code=402, detail="Insufficient minutes balance (minimum 5 required)")
 
     agent = None
@@ -350,7 +356,7 @@ async def stop_meeting(
         finally:
             await recall.close()
 
-    # Calculate actual minutes used and deduct from user balance atomically
+    # Calculate actual minutes used
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     if meeting.started_at:
         duration_seconds = (now - meeting.started_at).total_seconds()
@@ -358,17 +364,33 @@ async def stop_meeting(
     else:
         minutes_used = 1
 
-    meeting.status = "ended"
-    meeting.ended_at = now
-    meeting.duration_minutes = minutes_used
-    meeting.credits_used = minutes_used
-
-    # Atomic deduction from user balance
-    await db.execute(
-        update(User)
-        .where(User.id == current_user.id)
-        .values(credits=User.credits - minutes_used)
+    # Idempotent billing: atomic UPDATE with credits_used = 0 guard prevents
+    # double-deduct when both the stop endpoint and the webhook fire.
+    bill_result = await db.execute(
+        update(Meeting)
+        .where(Meeting.id == meeting.id, Meeting.credits_used == 0)
+        .values(
+            status="ended",
+            ended_at=now,
+            duration_minutes=minutes_used,
+            credits_used=minutes_used,
+        )
     )
+
+    if bill_result.rowcount == 1:
+        # We won the race -- settle the balance.
+        # 5 minutes were reserved at start; refund/charge the difference.
+        delta = minutes_used - 5
+        await db.execute(
+            update(User)
+            .where(User.id == current_user.id)
+            .values(credits=User.credits - delta)
+        )
+    else:
+        # Already billed by webhook -- just ensure status is ended
+        meeting.status = "ended"
+        if not meeting.ended_at:
+            meeting.ended_at = now
 
     await db.commit()
     await db.refresh(meeting)

@@ -301,6 +301,9 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
+    import contextlib
+    with contextlib.suppress(asyncio.CancelledError):
+        await cleanup_task
     await engine.dispose()
 
 
@@ -346,16 +349,32 @@ async def _cleanup_stale_bots():
                 for m in stale_meetings:
                     duration_seconds = (now - m.started_at).total_seconds()
                     minutes_used = max(1, math.ceil(duration_seconds / 60))
-                    m.status = "ended"
-                    m.ended_at = now
-                    m.duration_minutes = minutes_used
-                    m.credits_used = minutes_used
 
-                    await db.execute(
-                        update(User)
-                        .where(User.id == m.user_id)
-                        .values(credits=User.credits - minutes_used)
+                    # Idempotent billing: only bill if credits_used is still 0
+                    bill_result = await db.execute(
+                        update(Meeting)
+                        .where(Meeting.id == m.id, Meeting.credits_used == 0)
+                        .values(
+                            status="ended",
+                            ended_at=now,
+                            duration_minutes=minutes_used,
+                            credits_used=minutes_used,
+                        )
                     )
+
+                    if bill_result.rowcount == 1:
+                        # Settle against the 5-min reserve
+                        delta = minutes_used - 5
+                        await db.execute(
+                            update(User)
+                            .where(User.id == m.user_id)
+                            .values(credits=User.credits - delta)
+                        )
+                    else:
+                        # Already billed -- just ensure status is ended
+                        m.status = "ended"
+                        if not m.ended_at:
+                            m.ended_at = now
 
                     # Try to stop the Recall bot
                     if m.bot_id:

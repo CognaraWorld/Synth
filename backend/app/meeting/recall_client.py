@@ -126,7 +126,7 @@ class RecallClient:
             }
             # Enable screen capture for OCR-based context enrichment
             payload["output_media"] = {
-                "camera": {"kind": "jpeg", "size": {"width": 1280, "height": 720}},
+                "screen": {"kind": "jpeg", "size": {"width": 1280, "height": 720}},
             }
 
         try:

@@ -60,6 +60,7 @@ def cleanup_bot_tracking(bot_id: str) -> None:
     """
     _greeted_bots.discard(bot_id)
     _recent_bot_output.pop(bot_id, None)
+    _pending_hey.pop(bot_id, None)
 
 
 @router.post("/recall")
@@ -111,7 +112,7 @@ async def recall_webhook(request: Request):
             handled = True
 
     if not handled and event and "screenshot" in event.lower():
-        _task = asyncio.create_task(_handle_screenshot(data))
+        _task = asyncio.create_task(_bounded_handle_screenshot(data))
         _task.add_done_callback(lambda t: logger.error("Webhook screenshot task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
         handled = True
 
@@ -134,6 +135,12 @@ async def _bounded_handle_status_change(data: dict) -> None:
     """Wrap _handle_status_change with concurrency limit."""
     async with _webhook_semaphore:
         await _handle_status_change(data)
+
+
+async def _bounded_handle_screenshot(data: dict) -> None:
+    """Wrap _handle_screenshot with concurrency limit."""
+    async with _webhook_semaphore:
+        await _handle_screenshot(data)
 
 
 async def _handle_transcription(data: dict) -> None:
@@ -331,25 +338,35 @@ async def _handle_status_change(data: dict) -> None:
             if meeting and meeting.status != new_status:
                 meeting.status = new_status
 
-                # Calculate and deduct actual minutes on terminal states
-                if new_status in ("ended", "failed") and meeting.started_at and meeting.credits_used == 0:
+                # Idempotent billing: atomic UPDATE with credits_used = 0 guard
+                # prevents double-deduct when both stop endpoint and webhook fire.
+                if new_status in ("ended", "failed") and meeting.started_at:
                     now = datetime.now(timezone.utc).replace(tzinfo=None)
                     duration_seconds = (now - meeting.started_at).total_seconds()
                     minutes_used = max(1, math.ceil(duration_seconds / 60))
-                    meeting.ended_at = now
-                    meeting.duration_minutes = minutes_used
-                    meeting.credits_used = minutes_used
 
-                    # Deduct from user balance
-                    await db.execute(
-                        update(User)
-                        .where(User.id == meeting.user_id)
-                        .values(credits=User.credits - minutes_used)
+                    bill_result = await db.execute(
+                        update(Meeting)
+                        .where(Meeting.id == meeting.id, Meeting.credits_used == 0)
+                        .values(
+                            ended_at=now,
+                            duration_minutes=minutes_used,
+                            credits_used=minutes_used,
+                        )
                     )
-                    logger.info(
-                        "Auto-billed %d minutes for meeting %s (bot %s)",
-                        minutes_used, meeting.id, bot_id[:8],
-                    )
+
+                    if bill_result.rowcount == 1:
+                        # We won the race -- settle against the 5-min reserve
+                        delta = minutes_used - 5
+                        await db.execute(
+                            update(User)
+                            .where(User.id == meeting.user_id)
+                            .values(credits=User.credits - delta)
+                        )
+                        logger.info(
+                            "Auto-billed %d minutes for meeting %s (bot %s)",
+                            minutes_used, meeting.id, bot_id[:8],
+                        )
 
                 await db.commit()
                 logger.info(
