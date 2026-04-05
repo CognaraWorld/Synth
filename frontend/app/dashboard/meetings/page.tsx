@@ -13,8 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { MeetingsPageSkeleton } from "@/components/dashboard/loading-skeleton";
-import { getMeetings } from "@/lib/api";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface Meeting {
   id: string;
@@ -53,7 +52,9 @@ export default function MeetingsPage() {
   useEffect(() => {
     async function fetchMeetings() {
       try {
-        const data = await getMeetings();
+        const res = await fetch("/api/meetings");
+        const json = await res.json();
+        const data = json.data?.meetings ?? json.data ?? [];
         setMeetings(Array.isArray(data) ? data : []);
       } catch (err) {
         setError("Failed to load meetings. Please try again.");
@@ -65,7 +66,12 @@ export default function MeetingsPage() {
   }, []);
 
   if (loading) {
-    return <MeetingsPageSkeleton />;
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-64" />
+      </div>
+    );
   }
 
   if (error) {
@@ -135,7 +141,7 @@ export default function MeetingsPage() {
                   <TableCell className="text-right">
                     <Badge
                       variant={
-                        meeting.status === "ended" ? "secondary" : meeting.status === "active" ? "default" : "outline"
+                        meeting.status === "ended" ? "secondary" : "default"
                       }
                     >
                       {meeting.status}
