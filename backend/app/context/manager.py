@@ -57,7 +57,7 @@ class ContextManager:
         """
         self.max_context_tokens = max_context_tokens
         self.rolling_summary: RollingSummary = RollingSummary()
-        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=5)
+        self.raw_buffer: RawTranscriptBuffer = RawTranscriptBuffer(max_minutes=10)
         self.rag_pipeline: Any | None = None
         self.document_summaries: list[dict[str, str]] = []
         self.past_meeting_summaries: list[dict[str, str]] = []
@@ -167,9 +167,27 @@ class ContextManager:
         # Build expansion from recent context
         expansions: list[str] = []
 
-        # Add known people
-        if self._entities["people"]:
-            recent_people = list(self._entities["people"])[-3:]
+        # Extract recent speakers from buffer lines in reverse (most recent first)
+        # rather than from the unordered set, preserving recency.
+        if recent_text:
+            seen_speakers: list[str] = []
+            for line in reversed(recent_text.strip().split("\n")):
+                if ": " in line:
+                    # Strip time-ago prefix like "[2m ago] Speaker: text"
+                    speaker_part = line.split(": ", 1)[0]
+                    # Remove leading "[Xm ago] " if present
+                    if "] " in speaker_part:
+                        speaker_part = speaker_part.rsplit("] ", 1)[-1]
+                    speaker_part = speaker_part.strip()
+                    if speaker_part and speaker_part not in seen_speakers:
+                        seen_speakers.append(speaker_part)
+                    if len(seen_speakers) >= 3:
+                        break
+            if seen_speakers:
+                expansions.append(" ".join(seen_speakers))
+        elif self._entities["people"]:
+            # Fallback: no recent_text available, use sorted entity set
+            recent_people = sorted(self._entities["people"])[-3:]
             expansions.append(" ".join(recent_people))
 
         # Add recent topics from the last few lines of buffer
@@ -477,10 +495,10 @@ class ContextManager:
         if self._entities["people"]:
             entity_parts.append(f"People: {', '.join(sorted(self._entities['people']))}")
         if self._entities["decisions"]:
-            for d in list(self._entities["decisions"])[-3:]:
+            for d in sorted(self._entities["decisions"])[-3:]:
                 entity_parts.append(f"Decision: {d}")
         if self._entities["action_items"]:
-            for a in list(self._entities["action_items"])[-3:]:
+            for a in sorted(self._entities["action_items"])[-3:]:
                 entity_parts.append(f"Action: {a}")
         if entity_parts:
             sections.append("=== TRACKED ENTITIES ===")
