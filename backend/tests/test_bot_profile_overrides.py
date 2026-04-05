@@ -32,6 +32,7 @@ class TestAgentPrimaryBehavior:
                 name="Synth",
                 description="Helpful meeting assistant",
                 mode="general",
+                persona_id="general",
                 voice="female",
                 response_mode="name_only",
             ),
@@ -66,6 +67,7 @@ class TestAgentPrimaryBehavior:
                 name="Synth",
                 description="Helpful meeting assistant",
                 mode="general",
+                persona_id="general",
                 voice="female",
                 response_mode="name_only",
             ),
@@ -77,6 +79,38 @@ class TestAgentPrimaryBehavior:
         assert primary_a.is_primary is True
         assert primary_b.is_primary is False
         assert created_agent.is_primary is False
+
+    @pytest.mark.asyncio
+    async def test_create_agent_uses_fixed_voice_for_persona(self) -> None:
+        from app.api.routes.agents import create_agent
+
+        current_user = MagicMock(id=uuid4())
+        primary_result = MagicMock()
+        primary_result.scalars.return_value.all.return_value = []
+
+        db = AsyncMock()
+        db.execute.return_value = primary_result
+        db.add = MagicMock()
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        await create_agent(
+            agent_data=MagicMock(
+                name="Synth",
+                description="Helpful meeting assistant",
+                mode="general",
+                persona_id="strategist",
+                voice="female",
+                response_mode="name_only",
+            ),
+            current_user=current_user,
+            db=db,
+        )
+
+        created_agent = db.add.call_args.args[0]
+        assert created_agent.persona_id == "strategist"
+        assert created_agent.mode == "general"
+        assert created_agent.voice == "male"
 
     @pytest.mark.asyncio
     async def test_delete_primary_agent_reassigns_new_primary(self) -> None:
@@ -186,8 +220,9 @@ class TestBotProfileRoutes:
             profile_data=BotProfileUpsert(
                 name="Synth",
                 description="Technical meeting copilot",
-                mode="custom",
-                voice="male",
+                mode="general",
+                persona_id="strategist",
+                voice="female",
                 response_mode="proactive",
             ),
             current_user=current_user,
@@ -197,6 +232,8 @@ class TestBotProfileRoutes:
         created_agent = db.add.call_args.args[0]
         assert created_agent.is_primary is True
         assert created_agent.voice == "male"
+        assert created_agent.mode == "general"
+        assert created_agent.persona_id == "strategist"
         assert created_agent.response_mode == "proactive"
         assert "Technical meeting copilot" in created_agent.system_prompt
         assert result is created_agent
@@ -269,7 +306,7 @@ class TestMeetingOverrides:
         with pytest.raises(HTTPException, match="before the meeting is active"):
             await upsert_meeting_override(
                 meeting_id=uuid4(),
-                override_data=MeetingOverrideUpsert(voice="male"),
+                override_data=MeetingOverrideUpsert(description="Test override"),
                 current_user=MagicMock(id=uuid4()),
                 db=db,
             )
@@ -282,7 +319,7 @@ class TestMeetingOverrides:
             id=uuid4(),
             status="pending",
             override=None,
-            agent=MagicMock(mode="general", description="Helpful assistant"),
+            agent=MagicMock(mode="general", persona_id="general", description="Helpful assistant"),
         )
         result = MagicMock()
         result.scalar_one_or_none.return_value = meeting
@@ -304,14 +341,14 @@ class TestMeetingOverrides:
             meeting_id=meeting.id,
             override_data=MeetingOverrideUpsert(
                 description="Answer like a concise finance analyst",
-                voice="female",
             ),
             current_user=MagicMock(id=uuid4()),
             db=db,
         )
 
         created_override = db.add.call_args.args[0]
-        assert created_override.mode == "custom"
+        assert created_override.mode == "general"
+        assert created_override.persona_id == "general"
         assert "concise finance analyst" in created_override.system_prompt
         assert override is created_override
 

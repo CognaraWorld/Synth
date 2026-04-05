@@ -30,9 +30,22 @@ interface Agent {
   id: string;
   name: string;
   description: string;
-  mode: "general" | "custom";
+  mode: "general";
+  persona_id?: "general" | "strategist" | "analyst" | "challenger" | "facilitator";
   created_at?: string;
   createdAt?: string;
+}
+
+function formatPersonaLabel(persona?: Agent["persona_id"]) {
+  const resolved = persona || "general";
+  const labels: Record<NonNullable<Agent["persona_id"]>, string> = {
+    general: "General",
+    strategist: "Strategist",
+    analyst: "Analyst",
+    challenger: "Challenger",
+    facilitator: "Facilitator",
+  };
+  return labels[resolved as NonNullable<Agent["persona_id"]>] || "General";
 }
 
 function EmptyState() {
@@ -158,10 +171,10 @@ export default function AgentsPage() {
                   <div className="flex items-center gap-2">
                     <Badge
                       variant={
-                        agent.mode === "custom" ? "default" : "secondary"
+                        (agent.persona_id || agent.mode) === "general" ? "secondary" : "default"
                       }
                     >
-                      {agent.mode}
+                      {formatPersonaLabel(agent.persona_id)}
                     </Badge>
                     <Dialog
                       open={deleteDialogOpen && agentToDelete?.id === agent.id}

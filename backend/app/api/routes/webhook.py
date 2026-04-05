@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.database import Meeting, AsyncSessionLocal
+from app.utils.bot_profiles import get_persona_tts_voice
 
 logger = logging.getLogger(__name__)
 
@@ -312,23 +313,41 @@ async def _send_greeting(bot_id: str) -> None:
         # Use centralized model initialization (thread-safe, double-checked)
         await engine._lazy_load_models()
 
-        # Pull agent name and wake word from the session config
+        # Pull agent name, wake word, and persona from the session config
         session_id = engine._sessions_by_bot_id.get(bot_id)
         session = engine.sessions.get(session_id) if session_id else None
         agent_name = "your AI assistant"
         wake_phrase = "Hey Nova"
+        persona_id = "general"
         if session:
             name = session.agent_config.get("agent_name", "")
             if name:
                 agent_name = name
             ww = session.agent_config.get("wake_word", "nova")
             wake_phrase = ww.title()
+            persona_id = session.agent_config.get("persona_id", "general")
 
         greeting = (
             f"Hi everyone, I'm {agent_name} for this meeting. "
             f"Ask me anything by saying {wake_phrase} followed by your question."
         )
-        audio = engine._tts.synthesize(greeting)
+        async with engine._tts_lock:
+            if not engine._tts:
+                from app.core.tts import TextToSpeech
+
+                engine._tts = TextToSpeech(
+                    voice=get_persona_tts_voice(persona_id),
+                    sample_rate=24000,
+                    speed=1.1,
+                )
+                engine._filler_manager.preload(engine._tts)
+                engine._models_loaded = True
+            else:
+                target_voice = get_persona_tts_voice(persona_id)
+                if engine._tts.voice != target_voice:
+                    engine._tts.voice = target_voice
+                    engine._filler_manager.preload(engine._tts)
+            audio = engine._tts.synthesize(greeting)
         if audio:
             await engine._recall_client.send_audio(bot_id, audio)
             # Track greeting text for echo detection
