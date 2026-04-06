@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { Video } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,8 +12,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { MeetingsPageSkeleton } from "@/components/dashboard/loading-skeleton";
-import { getMeetings } from "@/lib/api";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface Meeting {
   id: string;
@@ -45,7 +43,6 @@ function EmptyState() {
 }
 
 export default function MeetingsPage() {
-  const router = useRouter();
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +50,9 @@ export default function MeetingsPage() {
   useEffect(() => {
     async function fetchMeetings() {
       try {
-        const data = await getMeetings();
+        const res = await fetch("/api/meetings");
+        const json = await res.json();
+        const data = json.data?.meetings ?? json.data ?? [];
         setMeetings(Array.isArray(data) ? data : []);
       } catch (err) {
         setError("Failed to load meetings. Please try again.");
@@ -65,7 +64,12 @@ export default function MeetingsPage() {
   }, []);
 
   if (loading) {
-    return <MeetingsPageSkeleton />;
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-64" />
+      </div>
+    );
   }
 
   if (error) {
@@ -112,11 +116,7 @@ export default function MeetingsPage() {
             </TableHeader>
             <TableBody>
               {meetings.map((meeting) => (
-                <TableRow
-                  key={meeting.id}
-                  className="cursor-pointer"
-                  onClick={() => router.push(`/dashboard/meetings/${meeting.id}`)}
-                >
+                <TableRow key={meeting.id}>
                   <TableCell className="font-medium">
                     {meeting.platform.charAt(0).toUpperCase() + meeting.platform.slice(1)} Meeting
                   </TableCell>
@@ -135,7 +135,7 @@ export default function MeetingsPage() {
                   <TableCell className="text-right">
                     <Badge
                       variant={
-                        meeting.status === "ended" ? "secondary" : meeting.status === "active" ? "default" : "outline"
+                        meeting.status === "ended" ? "secondary" : "default"
                       }
                     >
                       {meeting.status}

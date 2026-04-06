@@ -5,8 +5,8 @@ export default function LandingPage() {
   return (
     <div className="relative flex min-h-screen flex-col items-center justify-center px-4">
       <div className="absolute top-0 right-0 p-4">
-        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/login" />}>
-          Sign In
+        <Button variant="ghost" size="sm" asChild>
+          <Link href="/api/auth/signin" as any>Sign In</Link>
         </Button>
       </div>
       <div className="mx-auto flex max-w-2xl flex-col items-center gap-8 text-center">
@@ -20,11 +20,11 @@ export default function LandingPage() {
           </p>
         </div>
         <div className="flex gap-4">
-          <Button size="lg" nativeButton={false} render={<Link href="/login" />}>
-            Get Started
+          <Button size="lg" asChild>
+            <Link href="/api/auth/signin" as any>Get Started</Link>
           </Button>
-          <Button variant="outline" size="lg" nativeButton={false} render={<Link href="/register" />}>
-            Create Account
+          <Button variant="outline" size="lg" asChild>
+            <Link href="/onboarding">Create Account</Link>
           </Button>
         </div>
       </div>

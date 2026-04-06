@@ -238,7 +238,7 @@ class TestBotProfileRoutes:
 
         created_agent = db.add.call_args.args[0]
         assert created_agent.is_primary is True
-        assert created_agent.voice == "male"
+        assert created_agent.voice == "female"
         assert created_agent.mode == "general"
         assert created_agent.persona_id == "strategist"
         assert created_agent.response_mode == "proactive"
