@@ -31,19 +31,9 @@ class QueryCategory(str, Enum):
 _MEETING_ONLY_KEYWORDS: tuple[str, ...] = (
     "what did",
     "who said",
-    "summarize",
-    "summary",
-    "recap",
-    "action items",
     "what was discussed",
     "meeting so far",
-    "earlier",
     "just said",
-    "what happened",
-    "catch me up",
-    "what were the",
-    "key points",
-    "takeaways",
     "we discussed",
     "we talked about",
     "we just",
@@ -63,9 +53,56 @@ _MEETING_ONLY_KEYWORDS: tuple[str, ...] = (
     "the team decided",
     "minutes ago",
     "from earlier",
-    "earlier in",
-    "recap the",
-    "summarize the",
+    "earlier in the meeting",
+    "earlier in this meeting",
+    "earlier in the call",
+    "earlier in this call",
+)
+
+# Generic recap phrases are only meeting-only when paired with explicit
+# meeting/call context. This avoids false negatives such as
+# "Summarize the French Revolution" or "Earlier in 2022, who won...".
+_MEETING_RECAP_KEYWORDS: tuple[str, ...] = (
+    "summarize",
+    "summary",
+    "recap",
+    "action items",
+    "what happened",
+    "catch me up",
+    "what were the",
+    "key points",
+    "takeaways",
+)
+
+_MEETING_CONTEXT_KEYWORDS: tuple[str, ...] = (
+    "meeting",
+    "this call",
+    "our call",
+    "our discussion",
+    "this discussion",
+    "our conversation",
+    "this conversation",
+    "we discussed",
+    "we talked about",
+    "we just",
+    "so far",
+    "minutes ago",
+    "from earlier",
+    "just said",
+)
+
+# Preserve short meeting shorthand without making topic-specific questions
+# like "What are the action items for launching a startup?" skip search.
+_STANDALONE_MEETING_QUESTIONS: tuple[str, ...] = (
+    "action items",
+    "what are the action items",
+    "what were the action items",
+    "key points",
+    "what are the key points",
+    "takeaways",
+    "what are the takeaways",
+    "catch me up",
+    "what happened",
 )
 
 _TECHNICAL_KEYWORDS: tuple[str, ...] = (
@@ -170,6 +207,27 @@ _WEB_SEARCH_KEYWORDS: tuple[str, ...] = (
 )
 
 
+def _normalize_question(question: str) -> str:
+    """Normalize question text for keyword matching."""
+    return question.lower().strip().rstrip("?!.,")
+
+
+def _is_meeting_query(question: str) -> bool:
+    """Return True when the question is clearly about the active meeting."""
+    q = _normalize_question(question)
+
+    if q in _STANDALONE_MEETING_QUESTIONS:
+        return True
+
+    for kw in _MEETING_ONLY_KEYWORDS:
+        if kw in q:
+            return True
+
+    has_recap_keyword = any(kw in q for kw in _MEETING_RECAP_KEYWORDS)
+    has_meeting_context = any(kw in q for kw in _MEETING_CONTEXT_KEYWORDS)
+    return has_recap_keyword and has_meeting_context
+
+
 def classify_query(question: str) -> QueryCategory:
     """Classify a question by type using keyword matching.
 
@@ -188,11 +246,10 @@ def classify_query(question: str) -> QueryCategory:
     Returns:
         The best-matching QueryCategory.
     """
-    q = question.lower()
+    q = _normalize_question(question)
 
-    for kw in _MEETING_ONLY_KEYWORDS:
-        if kw in q:
-            return QueryCategory.MEETING_RECAP
+    if _is_meeting_query(q):
+        return QueryCategory.MEETING_RECAP
 
     for kw in _DOCUMENT_KEYWORDS:
         if kw in q:
@@ -235,12 +292,11 @@ def needs_web_search(question: str) -> bool:
         True if the question should be sent to web search,
         False if the question is clearly meeting-only or document-only.
     """
-    question_lower = question.lower()
+    question_lower = _normalize_question(question)
 
     # Skip search for questions clearly about the current/past meetings
-    for keyword in _MEETING_ONLY_KEYWORDS:
-        if keyword in question_lower:
-            return False
+    if _is_meeting_query(question_lower):
+        return False
 
     # Skip search for questions clearly about uploaded documents
     for keyword in _DOCUMENT_KEYWORDS:

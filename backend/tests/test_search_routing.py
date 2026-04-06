@@ -144,6 +144,24 @@ class TestNeedsWebSearch:
 
         assert needs_web_search("What time is it in Tokyo?") is True
 
+    def test_generic_summarize_query_still_searches(self) -> None:
+        """Generic recap verbs alone must not suppress web lookup."""
+        from app.utils.query_router import needs_web_search
+
+        assert needs_web_search("Summarize the French Revolution") is True
+
+    def test_earlier_with_calendar_context_still_searches(self) -> None:
+        """Bare temporal words like 'earlier' are not enough to imply meeting context."""
+        from app.utils.query_router import needs_web_search
+
+        assert needs_web_search("Earlier in 2022, who won the World Cup?") is True
+
+    def test_topic_specific_action_items_still_searches(self) -> None:
+        """Short meeting shorthand should not swallow topic-specific questions."""
+        from app.utils.query_router import needs_web_search
+
+        assert needs_web_search("What are the action items for launching a startup?") is True
+
     # --- Edge cases ---
 
     def test_empty_question_defaults_to_search(self) -> None:
