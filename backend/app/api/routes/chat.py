@@ -1,6 +1,7 @@
+import asyncio
+import json as _json
 import logging
 from datetime import datetime, timezone
-from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -22,6 +23,7 @@ _llm = None
 # Per-user rate limit: max requests per minute.
 _CHAT_RATE_LIMIT = 20
 _rate_limit_buckets: dict[str, list[float]] = {}
+_rate_limit_lock = asyncio.Lock()
 
 
 def _get_llm():
@@ -32,20 +34,21 @@ def _get_llm():
     return _llm
 
 
-def _check_rate_limit(user_id: str) -> None:
-    """Simple in-memory sliding window rate limiter."""
+async def _check_rate_limit(user_id: str) -> None:
+    """Async-safe in-memory sliding window rate limiter."""
     now = datetime.now(timezone.utc).timestamp()
     window = 60.0  # 1 minute
 
-    bucket = _rate_limit_buckets.get(user_id, [])
-    bucket = [t for t in bucket if now - t < window]
-    if len(bucket) >= _CHAT_RATE_LIMIT:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Chat rate limit exceeded. Max {_CHAT_RATE_LIMIT} messages per minute.",
-        )
-    bucket.append(now)
-    _rate_limit_buckets[user_id] = bucket
+    async with _rate_limit_lock:
+        bucket = _rate_limit_buckets.get(user_id, [])
+        bucket = [t for t in bucket if now - t < window]
+        if len(bucket) >= _CHAT_RATE_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Chat rate limit exceeded. Max {_CHAT_RATE_LIMIT} messages per minute.",
+            )
+        bucket.append(now)
+        _rate_limit_buckets[user_id] = bucket
 
 
 _CHAT_MODE_SUFFIX = (
@@ -73,6 +76,17 @@ async def _get_meeting_or_raise(
     return meeting
 
 
+def _format_summary_field(value: str) -> str:
+    """Deserialize JSON-encoded summary fields into readable bullet points."""
+    try:
+        items = _json.loads(value)
+        if isinstance(items, list):
+            return "\n".join(f"- {item}" for item in items)
+    except (ValueError, TypeError):
+        pass
+    return value
+
+
 async def _build_chat_context(meeting: Meeting, chat_history: list[ChatMessage], db: AsyncSession) -> str:
     parts: list[str] = []
 
@@ -91,11 +105,11 @@ async def _build_chat_context(meeting: Meeting, chat_history: list[ChatMessage],
     if summary:
         parts.append(f"## Meeting Summary\n{summary.content}")
         if summary.key_points:
-            parts.append(f"## Key Points\n{summary.key_points}")
+            parts.append(f"## Key Points\n{_format_summary_field(summary.key_points)}")
         if summary.action_items:
-            parts.append(f"## Action Items\n{summary.action_items}")
+            parts.append(f"## Action Items\n{_format_summary_field(summary.action_items)}")
         if summary.decisions:
-            parts.append(f"## Decisions\n{summary.decisions}")
+            parts.append(f"## Decisions\n{_format_summary_field(summary.decisions)}")
 
     if meeting.agent and meeting.agent.documents:
         document_blocks = []
@@ -122,7 +136,7 @@ async def send_chat_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    _check_rate_limit(str(current_user.id))
+    await _check_rate_limit(str(current_user.id))
 
     meeting = await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
@@ -214,6 +228,9 @@ async def get_chat_history(
     )
 
     if before is not None:
+        # Normalize to naive UTC — DB stores naive UTC timestamps.
+        if before.tzinfo is not None:
+            before = before.astimezone(timezone.utc).replace(tzinfo=None)
         query = query.where(ChatMessage.created_at < before)
 
     # Fetch newest N by ordering DESC then reverse for chronological render.

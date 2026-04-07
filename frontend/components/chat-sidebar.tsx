@@ -15,7 +15,7 @@ interface ChatSidebarProps {
 }
 
 export function ChatSidebar({ meetingId, isOpen, onClose }: ChatSidebarProps) {
-  const { messages, sendMessage, isLoading } = useChat(meetingId);
+  const { messages, sendMessage, isLoading, error } = useChat(meetingId);
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -38,7 +38,7 @@ export function ChatSidebar({ meetingId, isOpen, onClose }: ChatSidebarProps) {
 
   return (
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-[400px] p-0 sm:w-[440px]">
+      <SheetContent className="flex h-full w-[400px] flex-col p-0 sm:w-[440px]">
         <SheetHeader className="border-b px-6 py-4">
           <SheetTitle>Chat with Cognara</SheetTitle>
         </SheetHeader>
@@ -55,6 +55,11 @@ export function ChatSidebar({ meetingId, isOpen, onClose }: ChatSidebarProps) {
                 <div className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground/40 [animation-delay:0ms]" />
                 <div className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground/40 [animation-delay:150ms]" />
                 <div className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground/40 [animation-delay:300ms]" />
+              </div>
+            ) : null}
+            {error ? (
+              <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {error}
               </div>
             ) : null}
             <div ref={scrollRef} />

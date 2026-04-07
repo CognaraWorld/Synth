@@ -21,7 +21,6 @@ from app.config import get_settings
 from app.context.manager import ContextManager
 from app.core.llm import LLMClient
 from app.core.search import SearchClient
-from app.core.vision import VisionProcessor
 from app.meeting.recall_client import RecallClient, RecallClientError
 from app.meeting.session import MeetingSession, SessionState
 from app.utils.bot_profiles import get_persona_tts_voice
@@ -103,7 +102,6 @@ class BotEngine:
         self._recall_client: RecallClient = RecallClient()
         self._llm_client: LLMClient = LLMClient()
         self._search_client: SearchClient = SearchClient()
-        self._vision_processor: VisionProcessor = VisionProcessor()
         self._filler_manager: FillerManager = FillerManager()
 
         # Heavy model references — populated by _lazy_load_models()
@@ -713,6 +711,7 @@ class BotEngine:
                         select(Meeting)
                         .options(joinedload(Meeting.summary))
                         .where(
+                            Meeting.user_id == meeting.user_id,
                             Meeting.agent_id == meeting.agent_id,
                             Meeting.status == "ended",
                             Meeting.id != meeting.id,
@@ -726,6 +725,15 @@ class BotEngine:
                             session.context_manager.add_past_meeting_summary(date_str, pm.summary.content)
                 except Exception as past_exc:
                     logger.warning("Failed to load past summaries during recovery: %s", past_exc)
+
+                # Restore context checkpoint if available (crash recovery)
+                if meeting.context_checkpoint:
+                    try:
+                        import json
+                        checkpoint = json.loads(meeting.context_checkpoint)
+                        session.context_manager.restore_from_checkpoint(checkpoint)
+                    except Exception as ckpt_exc:
+                        logger.warning("Failed to restore context checkpoint: %s", ckpt_exc)
 
                 # Wire up screen capture
                 self.wire_screen_capture(session)
@@ -1055,7 +1063,7 @@ class BotEngine:
         try:
             self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
             # Classify question and send context-aware filler immediately
-            from app.utils.query_router import classify_query
+            from app.utils.query_router import classify_query, needs_web_search
             category = classify_query(question)
             filler_duration = 0.0
             if session.bot_id:
@@ -1081,16 +1089,28 @@ class BotEngine:
             search_query = session.context_manager._rewrite_query(question, recent_text)
             logger.debug("Search query: %s → %s", question, search_query)
 
-            # Assemble context + web search in parallel (search runs speculatively)
+            # Assemble context + web search in parallel (search runs speculatively).
+            # Search is gated: skip Serper for questions clearly bound to meeting
+            # or document context. Defaults to searching otherwise — recall over
+            # precision so we never miss a needed lookup.
             context_task = asyncio.get_running_loop().run_in_executor(
                 None,
                 session.context_manager.assemble_context,
                 question,
                 session.session_id,
             )
-            search_task = asyncio.create_task(
-                self._search_client.search_formatted(search_query)
-            )
+            if needs_web_search(question):
+                search_task = asyncio.create_task(
+                    self._search_client.search_formatted(search_query)
+                )
+                t_search_started = time.time()
+            else:
+                search_task = None
+                t_search_started = None
+                logger.debug(
+                    "Skipping web search for meeting/document question: %s",
+                    question[:60],
+                )
 
             context = await context_task
 
@@ -1117,18 +1137,25 @@ class BotEngine:
             if mood and mood in ("positive", "negative", "neutral"):
                 context = f"{context}\n\n(Speaker mood: {mood}. Match your tone accordingly.)"
 
-            # Attach search results if available (ran in parallel, adds no latency)
-            try:
-                search_results = await search_task
-                if search_results and search_results.strip() and "No results found" not in search_results:
-                    context = (
-                        f"{context}\n\n=== WEB SEARCH RESULTS ===\n"
-                        f"{search_results}\n"
-                        f"(Include relevant web search info in your answer. Combine it with "
-                        f"document and meeting context for a complete response.)"
-                    )
-            except Exception as exc:
-                logger.debug("Speculative search failed (non-blocking): %s", exc)
+            # Attach search results if the search was actually fired (ran in parallel,
+            # adds no latency). Skipped entirely when needs_web_search() returned False.
+            if search_task is not None:
+                try:
+                    search_results = await search_task
+                    if search_results and search_results.strip() and "No results found" not in search_results:
+                        context = (
+                            f"{context}\n\n=== WEB SEARCH RESULTS ===\n"
+                            f"{search_results}\n"
+                            f"(Include relevant web search info in your answer. Combine it with "
+                            f"document and meeting context for a complete response.)"
+                        )
+                    if t_search_started is not None:
+                        logger.debug(
+                            "Web search took %.0fms",
+                            (time.time() - t_search_started) * 1000,
+                        )
+                except Exception as exc:
+                    logger.debug("Speculative search failed (non-blocking): %s", exc)
 
             # Single LLM call with full context + search results (30s timeout)
             system_prompt = session.agent_config.get("system_prompt", "")
