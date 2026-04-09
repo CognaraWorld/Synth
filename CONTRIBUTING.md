@@ -112,7 +112,7 @@ Use GitHub branch protection or rulesets to make this workflow enforceable inste
 4. Require all conversations to be resolved before merge.
 5. Enable Copilot code review automatically when available, or require contributors to request Copilot as a reviewer manually.
 6. Add `CODEOWNERS` later if Cognara World wants explicit ownership by area.
-7. If org policy does not allow private-fork `pull_request` workflows, keep any fork-PR CI fallback restricted to trusted collaborators, read-only token permissions, and no secrets exposure.
+7. If org policy does not allow private-fork `pull_request` workflows, keep any fork-PR CI fallback in a separate workflow with a distinct name, restricted to trusted collaborators, read-only token permissions, and no secrets exposure.
 
 ## Review Expectations
 
