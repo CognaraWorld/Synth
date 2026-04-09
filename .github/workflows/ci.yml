@@ -1,24 +1,44 @@
 name: CI
 
+# The current org policy does not allow normal pull_request workflows from
+# private forks, so trusted fork PRs use a constrained pull_request_target
+# fallback. Keep token scope read-only and do not widen the trusted list
+# without re-evaluating the security tradeoff.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   backend-lint:
     name: Backend Lint
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.fork == true &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association))
     defaults:
       run:
         working-directory: backend
     steps:
       - uses: actions/checkout@v6
+        with:
+          # pull_request_target runs on the base ref; use the PR merge ref to validate contributor changes.
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -31,6 +51,12 @@ jobs:
   backend-tests:
     name: Backend Tests
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.fork == true &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association))
     needs: backend-lint
 
     services:
@@ -54,6 +80,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -78,11 +107,20 @@ jobs:
   backend-security:
     name: Security Check
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.fork == true &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association))
     defaults:
       run:
         working-directory: backend
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -96,6 +134,12 @@ jobs:
   frontend-build:
     name: Frontend Lint + Type Check + Build
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.fork == true &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association))
 
     defaults:
       run:
@@ -103,6 +147,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v6
         with:
@@ -125,6 +172,12 @@ jobs:
   schema-check:
     name: Schema Drift Check
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.fork == true &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association))
     needs: backend-lint
 
     services:
@@ -148,6 +201,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
