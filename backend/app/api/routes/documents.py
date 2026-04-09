@@ -92,6 +92,10 @@ async def _process_document_background(document_id: UUID, file_path: str, ext: s
                 rag_pipeline=rag,
                 llm_client=llm_client,
             )
+            # Pass scope metadata for chunk isolation (Item 1)
+            processor._current_document_id = str(document_id)
+            processor._current_agent_id = agent_id
+            processor._current_user_id = ""  # populated by caller if needed
 
             # Run sync processing in a thread to avoid blocking the event loop
             result = await anyio.to_thread.run_sync(
@@ -238,6 +242,12 @@ async def delete_document(
         file_path = Path(document.file_path)
         if file_path.exists():
             file_path.unlink()
+
+    # Remove document embeddings from ChromaDB (Item 2)
+    agent_id = str(document.agent_id)
+    rag = _get_rag_pipeline(agent_id)
+    if rag and hasattr(rag, "delete_by_metadata"):
+        rag.delete_by_metadata(document_id=str(document_id))
 
     await db.delete(document)
     await db.commit()

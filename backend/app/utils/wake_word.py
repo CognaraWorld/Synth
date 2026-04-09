@@ -61,7 +61,7 @@ def _build_pattern(wake_word: str) -> re.Pattern:
     if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
         # "nova" or "hey nova" — accepts both with phonetic variants.
         prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
-        name = r"(?:nova|over|no\s*va|nora|noah|mova|rover)"
+        name = r"(?:nova|no\s*va|nora|noah|mova)"
         return re.compile(
             rf"\b{prefix}{name}\b",
             re.IGNORECASE,
@@ -108,9 +108,12 @@ def detect(
     text_lower = transcript_text.lower()
     exact_pos = text_lower.find(ww_lower)
     if exact_pos != -1:
-        # Verify word boundary: char after wake word must be non-alphanumeric
+        # Verify word boundaries on both sides to prevent
+        # "supernova" or "innova" from matching bare "nova"
         end_pos = exact_pos + len(ww_lower)
-        if end_pos >= len(text_lower) or not text_lower[end_pos].isalnum():
+        leading_ok = exact_pos == 0 or not text_lower[exact_pos - 1].isalnum()
+        trailing_ok = end_pos >= len(text_lower) or not text_lower[end_pos].isalnum()
+        if leading_ok and trailing_ok:
             after = transcript_text[end_pos:]
             question = re.sub(r"^[\s,;:!?.\-]+", "", after).strip()
             return (True, question)

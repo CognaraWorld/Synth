@@ -219,30 +219,14 @@ class MeetingOverrideResponse(BaseModel):
 
 # Chat
 class ChatSendRequest(BaseModel):
-    message: LongTextField
-
-
-class CitationReference(BaseModel):
-    type: str
-    timestamp: str | None = None
-    filename: str | None = None
-    page: int | None = None
-    raw: str
-
-
-class ToolCallInfo(BaseModel):
-    tool_name: str
-    input: dict
-    output_summary: str
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000)]
 
 
 class ChatMessageResponse(BaseModel):
     id: UUID
-    role: str
+    role: Literal["user", "assistant"]
     content: str
     created_at: datetime
-    citations: list[CitationReference] | None = None
-    tool_calls: list[ToolCallInfo] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -250,7 +234,6 @@ class ChatMessageResponse(BaseModel):
 class ChatResponse(BaseModel):
     user_message: ChatMessageResponse
     assistant_message: ChatMessageResponse
-    follow_ups: list[str] | None = None
 
 
 class ChatHistoryResponse(BaseModel):

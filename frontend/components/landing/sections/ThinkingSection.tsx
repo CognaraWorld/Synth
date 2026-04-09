@@ -13,6 +13,72 @@ const PIPELINE_NODES = [
   { icon: MessageSquare, label: 'Voice Response', sub: 'Kokoro TTS' },
 ]
 
+function PipelineNode({
+  node,
+  index,
+  progress,
+  isLast,
+}: {
+  node: (typeof PIPELINE_NODES)[number]
+  index: number
+  progress: MotionValue<number>
+  isLast: boolean
+}) {
+  const start = 0.1 + index * 0.13
+  const end = start + 0.1
+  const nodeOpacity = useTransform(progress, [start, end], [0.2, 1])
+  const nodeScale = useTransform(progress, [start, end], [0.95, 1])
+  const glowIntensity = useTransform(progress, [start, end], [0, 1])
+  const boxShadow = useTransform(
+    glowIntensity,
+    (v) => `0 0 ${v * 30}px rgba(13, 148, 136, ${v * 0.12})`
+  )
+  const borderColor = useTransform(
+    glowIntensity,
+    (v) => (v === 0 ? '#EAE8E4' : `rgba(13, 148, 136, ${0.08 + v * 0.17})`)
+  )
+  const bgColor = useTransform(
+    glowIntensity,
+    (v) => `rgba(13, 148, 136, ${0.06 + v * 0.09})`
+  )
+  const connectorBg = useTransform(progress, [start + 0.06, end + 0.06], [
+    '#EAE8E4',
+    'rgba(13,148,136,0.5)',
+  ])
+  const Icon = node.icon
+
+  return (
+    <div className="flex flex-col items-center">
+      <motion.div
+        className="relative flex items-center gap-4 px-6 py-4 rounded-2xl border border-[#EAE8E4] bg-white shadow-[0_1px_3px_rgba(26,21,15,0.04)]"
+        style={{ opacity: nodeOpacity, scale: nodeScale, boxShadow, borderColor }}
+      >
+        <motion.div
+          className="w-12 h-12 rounded-xl flex items-center justify-center"
+          style={{ backgroundColor: bgColor }}
+        >
+          <Icon
+            size={24}
+            className="text-warm-amber"
+            style={{ filter: 'drop-shadow(0 0 4px rgba(13,148,136,0.22))' }}
+          />
+        </motion.div>
+        <div>
+          <p className="text-base font-semibold text-[#1D1D1F]">{node.label}</p>
+          <p className="text-sm text-[#6E6E73]">{node.sub}</p>
+        </div>
+      </motion.div>
+
+      {!isLast && (
+        <motion.div
+          className="w-px h-6 md:h-8"
+          style={{ background: connectorBg }}
+        />
+      )}
+    </div>
+  )
+}
+
 function Content({ progress }: { progress: MotionValue<number> }) {
   const titleOpacity = useTransform(progress, [0, 0.1], [0, 1])
 
@@ -47,67 +113,15 @@ function Content({ progress }: { progress: MotionValue<number> }) {
 
         {/* Right pipeline */}
         <div className="flex flex-col items-center gap-0">
-          {PIPELINE_NODES.map((node, i) => {
-            const start = 0.1 + i * 0.13
-            const end = start + 0.1
-            const nodeOpacity = useTransform(progress, [start, end], [0.2, 1])
-            const nodeScale = useTransform(progress, [start, end], [0.95, 1])
-            const glowIntensity = useTransform(progress, [start, end], [0, 1])
-            const Icon = node.icon
-
-            return (
-              <div key={i} className="flex flex-col items-center">
-                <motion.div
-                  className="relative flex items-center gap-4 px-6 py-4 rounded-2xl border border-[#EAE8E4] bg-white shadow-[0_1px_3px_rgba(26,21,15,0.04)]"
-                  style={{
-                    opacity: nodeOpacity,
-                    scale: nodeScale,
-                    boxShadow: useTransform(
-                      glowIntensity,
-                      (v) => `0 0 ${v * 30}px rgba(13, 148, 136, ${v * 0.12})`
-                    ),
-                    borderColor: useTransform(
-                      glowIntensity,
-                      (v) => (v === 0 ? '#EAE8E4' : `rgba(13, 148, 136, ${0.08 + v * 0.17})`)
-                    ),
-                  }}
-                >
-                  <motion.div
-                    className="w-12 h-12 rounded-xl flex items-center justify-center"
-                    style={{
-                      backgroundColor: useTransform(
-                        glowIntensity,
-                        (v) => `rgba(13, 148, 136, ${0.06 + v * 0.09})`
-                      ),
-                    }}
-                  >
-                    <Icon
-                      size={24}
-                      className="text-warm-amber"
-                      style={{ filter: 'drop-shadow(0 0 4px rgba(13,148,136,0.22))' }}
-                    />
-                  </motion.div>
-                  <div>
-                    <p className="text-base font-semibold text-[#1D1D1F]">{node.label}</p>
-                    <p className="text-sm text-[#6E6E73]">{node.sub}</p>
-                  </div>
-                </motion.div>
-
-                {/* Connector */}
-                {i < PIPELINE_NODES.length - 1 && (
-                  <motion.div
-                    className="w-px h-6 md:h-8"
-                    style={{
-                      background: useTransform(progress, [start + 0.06, end + 0.06], [
-                        '#EAE8E4',
-                        'rgba(13,148,136,0.5)',
-                      ]),
-                    }}
-                  />
-                )}
-              </div>
-            )
-          })}
+          {PIPELINE_NODES.map((node, i) => (
+            <PipelineNode
+              key={i}
+              node={node}
+              index={i}
+              progress={progress}
+              isLast={i === PIPELINE_NODES.length - 1}
+            />
+          ))}
         </div>
       </div>
     </div>

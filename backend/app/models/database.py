@@ -54,11 +54,6 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
-    chat_messages = relationship(
-        "ChatMessage",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
     operator_instructions = relationship(
         "OperatorInstruction",
         back_populates="user",
@@ -121,21 +116,28 @@ class Meeting(Base):
     started_at = Column(DateTime, nullable=True)
     ended_at = Column(DateTime, nullable=True)
     duration_minutes = Column(Float, nullable=True)
-    credits_used = Column(Integer, default=1)
+    credits_used = Column(Integer, default=0)
+    context_checkpoint = Column(Text, nullable=True)  # JSON snapshot for crash recovery
     created_at = Column(DateTime, default=_utcnow)
 
     user = relationship("User", back_populates="meetings")
     agent = relationship("Agent", back_populates="meetings")
-    summary = relationship("MeetingSummary", back_populates="meeting", uselist=False)
+    summary = relationship("MeetingSummary", back_populates="meeting", uselist=False, cascade="all, delete-orphan")
     usage_record = relationship(
         "UsageRecord",
         back_populates="meeting",
         uselist=False,
+        cascade="all, delete-orphan",
     )
     live_session = relationship(
         "LiveSession",
         back_populates="meeting",
         uselist=False,
+        cascade="all, delete-orphan",
+    )
+    operator_instructions = relationship(
+        "OperatorInstruction",
+        back_populates="meeting",
         cascade="all, delete-orphan",
     )
     chat_messages = relationship(
@@ -144,12 +146,7 @@ class Meeting(Base):
         order_by="ChatMessage.created_at",
         cascade="all, delete-orphan",
     )
-    operator_instructions = relationship(
-        "OperatorInstruction",
-        back_populates="meeting",
-        cascade="all, delete-orphan",
-    )
-    override = relationship("MeetingOverride", back_populates="meeting", uselist=False)
+    override = relationship("MeetingOverride", back_populates="meeting", uselist=False, cascade="all, delete-orphan")
 
 
 class MeetingSummary(Base):
@@ -233,24 +230,6 @@ class OperatorInstruction(Base):
     live_session = relationship("LiveSession", back_populates="instructions")
 
 
-class ChatMessage(Base):
-    __tablename__ = "chat_messages"
-    __table_args__ = (
-        Index("ix_chat_messages_meeting_created_at", "meeting_id", "created_at"),
-    )
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=False, index=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    role = Column(String(16), nullable=False)
-    content = Column(Text, nullable=False)
-    message_metadata = Column("metadata", Text, nullable=True)
-    created_at = Column(DateTime, default=_utcnow)
-
-    meeting = relationship("Meeting", back_populates="chat_messages")
-    user = relationship("User", back_populates="chat_messages")
-
-
 class MeetingOverride(Base):
     __tablename__ = "meeting_overrides"
 
@@ -266,6 +245,24 @@ class MeetingOverride(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     meeting = relationship("Meeting", back_populates="override")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        Index("ix_chat_messages_meeting_created", "meeting_id", "created_at"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=False)
+    message_metadata = Column("metadata", Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    meeting = relationship("Meeting", back_populates="chat_messages")
+    user = relationship("User")
 
 
 # Database engine setup

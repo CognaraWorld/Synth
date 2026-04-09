@@ -58,13 +58,10 @@ async def create_meeting(
     if reserve_result.rowcount == 0:
         raise HTTPException(status_code=402, detail="Insufficient minutes balance (minimum 5 required)")
 
-    settings = get_settings()
-    if not (settings.gemini_api_key or "").strip():
-        raise HTTPException(
-            status_code=503,
-            detail="GEMINI_API_KEY is required for screenshare capture.",
-        )
-
+    # Validate the agent BEFORE the Gemini config check so that a malformed
+    # request (bad agent_id) always fails fast with 404 — independent of
+    # server-side config state. The Gemini key check below is a server-config
+    # error and should only fire for otherwise-valid requests.
     agent = None
     if meeting_data.agent_id is None:
         agent = await get_effective_primary_agent(db, current_user.id)
@@ -76,6 +73,13 @@ async def create_meeting(
         agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+
+    settings = get_settings()
+    if not (settings.gemini_api_key or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY is required for screenshare capture.",
+        )
 
     platform = detect_platform(meeting_data.meeting_link)
 
@@ -121,6 +125,7 @@ async def create_meeting(
         engine = get_bot_engine()
         agent_config = {
             "agent_id": str(agent.id),
+            "user_id": str(current_user.id),
             "agent_name": agent.name or "Synth",
             "mode": agent.mode or "general",
             "persona_id": getattr(agent, "persona_id", "general"),

@@ -27,6 +27,29 @@ _SUMMARY_PROMPT = (
 )
 
 
+def _clean_cell(text: str) -> str:
+    """Clean garbled PDF table cell text.
+
+    Some PDFs produce interleaved characters when text layers overlap.
+    This heuristic detects garbled cells (high ratio of single-char
+    words or excessive spaces) and returns them as-is since we can't
+    reliably reconstruct the original text. Clean cells pass through
+    unchanged.
+    """
+    if not text or len(text) < 3:
+        return text
+    words = text.split()
+    if not words:
+        return text
+    # If >50% of "words" are single characters, the cell is likely garbled
+    single_char_ratio = sum(1 for w in words if len(w) <= 1) / len(words)
+    if single_char_ratio > 0.5:
+        # Try to salvage by removing single-char noise
+        salvaged = " ".join(w for w in words if len(w) > 1)
+        return salvaged if salvaged else text
+    return text
+
+
 class ChunkEmbeddingPipeline(Protocol):
     def add_chunks_batch(self, chunks: list[dict[str, object]]) -> None:
         """Persist a batch of embedded document chunks."""
@@ -80,6 +103,9 @@ class DocumentProcessor:
     def parse_pdf(self, file_path: str) -> str:
         """Extract text content from a PDF file.
 
+        Handles both regular text and tables. Tables are extracted as
+        pipe-delimited rows so the LLM can understand the structure.
+
         Args:
             file_path: Absolute path to the PDF file.
 
@@ -98,14 +124,52 @@ class DocumentProcessor:
         pages_text: list[str] = []
         try:
             with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        pages_text.append(text)
+                for page_num, page in enumerate(pdf.pages, 1):
+                    page_parts: list[str] = []
+
+                    # Extract tables first (structured data)
+                    tables = page.extract_tables() or []
+                    table_text_parts: list[str] = []
+                    for table in tables:
+                        rows: list[str] = []
+                        for row in table:
+                            cells = [
+                                _clean_cell((cell or "").strip().replace("\n", " "))
+                                for cell in row
+                            ]
+                            if any(cells):
+                                rows.append(" | ".join(cells))
+                        if rows:
+                            table_text_parts.append("\n".join(rows))
+
+                    if table_text_parts:
+                        page_parts.append("\n\n".join(table_text_parts))
+
+                    # Extract regular text (non-table content)
+                    text = page.extract_text() or ""
+                    # Remove text that was already captured in tables
+                    # to avoid duplication (best-effort dedup)
+                    if text.strip() and table_text_parts:
+                        # Keep text lines not found in table output
+                        table_content = " ".join(table_text_parts)
+                        unique_lines: list[str] = []
+                        for line in text.split("\n"):
+                            stripped = line.strip()
+                            if stripped and stripped not in table_content:
+                                unique_lines.append(stripped)
+                        if unique_lines:
+                            page_parts.append("\n".join(unique_lines))
+                    elif text.strip():
+                        page_parts.append(text)
+
+                    if page_parts:
+                        pages_text.append(
+                            f"[Page {page_num}]\n" + "\n\n".join(page_parts)
+                        )
         except Exception as exc:
             raise ValueError(f"Failed to parse PDF: {exc}") from exc
 
-        return "\n".join(pages_text)
+        return "\n\n".join(pages_text)
 
     def parse_docx(self, file_path: str) -> str:
         """Extract text content from a DOCX file.
@@ -168,10 +232,12 @@ class DocumentProcessor:
         return Path(file_path).read_text(encoding="utf-8")
 
     def chunk_text(self, text: str, chunk_size: int = 200) -> list[str]:
-        """Split text into overlapping chunks for embedding.
+        """Split text into structure-aware chunks for embedding.
 
-        Uses a word-based sliding window with ~10% overlap to create
-        chunks that preserve context at boundaries.
+        Splits on paragraph/page boundaries first, then groups paragraphs
+        into chunks that don't exceed *chunk_size* words. This keeps
+        table rows and logical sections together instead of blindly
+        splitting mid-sentence.
 
         Args:
             text: The full text to chunk.
@@ -180,23 +246,57 @@ class DocumentProcessor:
         Returns:
             List of text chunks suitable for embedding.
         """
-        words = text.split()
-        if not words:
+        if not text.strip():
             return []
 
-        overlap = chunk_size // 10
+        # Split on double-newlines (paragraph/page/table boundaries)
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if not paragraphs:
+            return [text.strip()]
+
         chunks: list[str] = []
-        start = 0
+        current_parts: list[str] = []
+        current_words = 0
 
-        while start < len(words):
-            end = start + chunk_size
-            chunk = " ".join(words[start:end])
-            chunks.append(chunk)
+        for para in paragraphs:
+            para_words = len(para.split())
 
-            if end >= len(words):
-                break
+            # If a single paragraph exceeds chunk_size, split it by lines
+            if para_words > chunk_size:
+                # Flush current buffer first
+                if current_parts:
+                    chunks.append("\n\n".join(current_parts))
+                    current_parts = []
+                    current_words = 0
 
-            start = end - overlap
+                # Split large paragraph by lines (preserves table rows)
+                lines = para.split("\n")
+                line_buffer: list[str] = []
+                line_words = 0
+                for line in lines:
+                    lw = len(line.split())
+                    if line_words + lw > chunk_size and line_buffer:
+                        chunks.append("\n".join(line_buffer))
+                        line_buffer = []
+                        line_words = 0
+                    line_buffer.append(line)
+                    line_words += lw
+                if line_buffer:
+                    chunks.append("\n".join(line_buffer))
+                continue
+
+            # Would this paragraph push us over the limit?
+            if current_words + para_words > chunk_size and current_parts:
+                chunks.append("\n\n".join(current_parts))
+                current_parts = []
+                current_words = 0
+
+            current_parts.append(para)
+            current_words += para_words
+
+        # Flush remaining
+        if current_parts:
+            chunks.append("\n\n".join(current_parts))
 
         return chunks
 
@@ -279,14 +379,22 @@ class DocumentProcessor:
         filename = os.path.basename(file_path)
 
         if self.rag_pipeline is not None:
+            # Include scope metadata for isolation and deletion (Items 1, 2)
+            doc_id = getattr(self, "_current_document_id", "")
+            agent_id = getattr(self, "_current_agent_id", "")
+            user_id = getattr(self, "_current_user_id", "")
             batch = [
                 {
                     "text": chunk,
                     "metadata": {
+                        "source_type": "document",
                         "source": "document",
                         "filename": filename,
                         "chunk_index": idx,
                         "file_type": file_type_lower,
+                        "document_id": doc_id,
+                        "agent_id": agent_id,
+                        "user_id": user_id,
                     },
                 }
                 for idx, chunk in enumerate(chunks)

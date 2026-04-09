@@ -59,26 +59,35 @@ class FillerManager:
     def preload(self, tts_engine: TextToSpeech) -> None:
         """Pre-synthesize all filler phrases across all categories.
 
+        Caches by (phrase, voice) so persona voice switches produce
+        correct audio instead of reusing the first voice's cache.
+
         Args:
             tts_engine: An initialized TextToSpeech instance.
         """
         from app.meeting.recall_client import RecallClient
+        voice = getattr(tts_engine, "voice", "default")
         for phrase in self._all_phrases():
-            if phrase not in self._cache:
+            cache_key = f"{phrase}:{voice}"
+            if cache_key not in self._cache:
                 pcm = tts_engine.synthesize(phrase)
+                self._cache[cache_key] = pcm
+                self._mp3_cache[cache_key] = RecallClient.pcm_to_mp3_b64(pcm)
+                # Also keep plain phrase key pointing to latest voice for backward compat
                 self._cache[phrase] = pcm
-                self._mp3_cache[phrase] = RecallClient.pcm_to_mp3_b64(pcm)
+                self._mp3_cache[phrase] = self._mp3_cache[cache_key]
 
     def get_filler_for_category(self, category: QueryCategory) -> str:
         """Return a random filler phrase for the given category."""
         phrases = CATEGORY_FILLERS.get(category, CATEGORY_FILLERS[QueryCategory.GENERAL])
         return random.choice(phrases)
 
-    def get_filler_mp3_b64(self, category: QueryCategory) -> str:
+    def get_filler_mp3_b64(self, category: QueryCategory, voice: str = "") -> str:
         """Return pre-synthesized base64 MP3 filler for a category.
 
         Args:
             category: The query category to match fillers against.
+            voice: TTS voice name for persona-correct audio lookup.
 
         Returns:
             Base64-encoded MP3 string, ready to send to Recall.ai.
@@ -87,13 +96,21 @@ class FillerManager:
         if not self._mp3_cache:
             return ""
         phrase = self.get_filler_for_category(category)
+        if voice:
+            result = self._mp3_cache.get(f"{phrase}:{voice}", "")
+            if result:
+                return result
         return self._mp3_cache.get(phrase, "")
 
-    def get_filler_audio(self, category: QueryCategory) -> bytes:
+    def get_filler_audio(self, category: QueryCategory, voice: str = "") -> bytes:
         """Return pre-synthesized PCM filler audio for a category."""
         if not self._cache:
             return b""
         phrase = self.get_filler_for_category(category)
+        if voice:
+            result = self._cache.get(f"{phrase}:{voice}", b"")
+            if result:
+                return result
         return self._cache.get(phrase, b"")
 
     # Backward-compatible methods
