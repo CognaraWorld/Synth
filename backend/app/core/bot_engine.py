@@ -19,6 +19,7 @@ import numpy as np
 
 from app.config import get_settings
 from app.context.manager import ContextManager
+from app.core.insight_publisher import publish as publish_insight
 from app.core.llm import LLMClient
 from app.core.search import SearchClient
 from app.core.vision import VisionProcessor
@@ -983,6 +984,28 @@ class BotEngine:
             )
             if result:
                 session.insights.append(result)
+                if session.bot_id:
+                    try:
+                        from sqlalchemy import select
+                        from app.models.database import AsyncSessionLocal, Meeting
+
+                        async with AsyncSessionLocal() as db:
+                            meeting_result = await db.execute(
+                                select(Meeting.id).where(Meeting.bot_id == session.bot_id)
+                            )
+                            meeting_id = meeting_result.scalar_one_or_none()
+                        if meeting_id is not None:
+                            await publish_insight(
+                                str(meeting_id),
+                                {
+                                    "type": "insight",
+                                    "speaker": result.get("speaker", ""),
+                                    "claim": result.get("claim", ""),
+                                    "correction": result.get("correction", ""),
+                                },
+                            )
+                    except Exception as publish_exc:
+                        logger.debug("Insight publish failed: %s", publish_exc)
                 logger.warning(
                     "INSIGHT STORED session=%s: %s",
                     session.session_id[:8], result["correction"],

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -50,6 +51,11 @@ class User(Base):
     )
     usage_records = relationship(
         "UsageRecord",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    chat_messages = relationship(
+        "ChatMessage",
         back_populates="user",
         cascade="all, delete-orphan",
     )
@@ -130,6 +136,12 @@ class Meeting(Base):
         "LiveSession",
         back_populates="meeting",
         uselist=False,
+        cascade="all, delete-orphan",
+    )
+    chat_messages = relationship(
+        "ChatMessage",
+        back_populates="meeting",
+        order_by="ChatMessage.created_at",
         cascade="all, delete-orphan",
     )
     operator_instructions = relationship(
@@ -219,6 +231,24 @@ class OperatorInstruction(Base):
     user = relationship("User", back_populates="operator_instructions")
     meeting = relationship("Meeting", back_populates="operator_instructions")
     live_session = relationship("LiveSession", back_populates="instructions")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        Index("ix_chat_messages_meeting_created_at", "meeting_id", "created_at"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meeting_id = Column(UUID(as_uuid=True), ForeignKey("meetings.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=False)
+    message_metadata = Column("metadata", Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    meeting = relationship("Meeting", back_populates="chat_messages")
+    user = relationship("User", back_populates="chat_messages")
 
 
 class MeetingOverride(Base):

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440  # 24 hours
     service_secret: str = Field(default="cognara-service-secret-dev", alias="BACKEND_SERVICE_SECRET")
+    redis_url: str | None = Field(default=None, alias="REDIS_URL")
 
     # Claude API
     anthropic_api_key: str = ""

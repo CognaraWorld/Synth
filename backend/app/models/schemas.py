@@ -217,6 +217,53 @@ class MeetingOverrideResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# Chat
+class ChatSendRequest(BaseModel):
+    message: LongTextField
+
+
+class CitationReference(BaseModel):
+    type: str
+    timestamp: str | None = None
+    filename: str | None = None
+    page: int | None = None
+    raw: str
+
+
+class ToolCallInfo(BaseModel):
+    tool_name: str
+    input: dict
+    output_summary: str
+
+
+class ChatMessageResponse(BaseModel):
+    id: UUID
+    role: str
+    content: str
+    created_at: datetime
+    citations: list[CitationReference] | None = None
+    tool_calls: list[ToolCallInfo] | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ChatResponse(BaseModel):
+    user_message: ChatMessageResponse
+    assistant_message: ChatMessageResponse
+    follow_ups: list[str] | None = None
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: list[ChatMessageResponse]
+    meeting_id: UUID
+    total: int
+
+
+class CrossMeetingChatRequest(BaseModel):
+    message: LongTextField
+    meeting_ids: list[UUID] | None = None
+
+
 # Payments
 class CheckoutRequest(BaseModel):
     pack_id: str = Field(
