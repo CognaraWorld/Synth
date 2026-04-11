@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.config import get_settings
-from app.context.manager import ContextManager
 from app.core.llm import LLMClient
 from app.core.search import SearchClient
 from app.meeting.recall_client import RecallClient, RecallClientError
@@ -571,6 +570,39 @@ class BotEngine:
                 return await loop.run_in_executor(None, tts.synthesize, text)
         return await loop.run_in_executor(None, tts.synthesize, text)
 
+    @staticmethod
+    def _enqueue_playback_chunk(
+        total_playback: float,
+        playback_started_at: float | None,
+        audio_bytes: bytes,
+        *,
+        sample_rate: int = 24000,
+        now: float | None = None,
+    ) -> tuple[float, float | None]:
+        """Track queued playback from the moment audio is first sent."""
+        if not audio_bytes:
+            return total_playback, playback_started_at
+
+        if playback_started_at is None:
+            playback_started_at = time.time() if now is None else now
+
+        chunk_duration = len(audio_bytes) / (sample_rate * 2)
+        return total_playback + chunk_duration, playback_started_at
+
+    @staticmethod
+    def _remaining_playback_time(
+        total_playback: float,
+        playback_started_at: float | None,
+        *,
+        now: float | None = None,
+    ) -> float:
+        """Return queued playback time still expected to be audible."""
+        if playback_started_at is None or total_playback <= 0:
+            return 0.0
+
+        current_time = time.time() if now is None else now
+        return max(0.0, total_playback - (current_time - playback_started_at))
+
     async def _recover_session(self, bot_id: str) -> MeetingSession | None:
         """Recover a session for a bot_id by looking up the meeting in the DB."""
         try:
@@ -647,7 +679,6 @@ class BotEngine:
                 # Load past meeting summaries for cross-meeting memory
                 try:
                     from sqlalchemy.orm import joinedload
-                    from app.models.database import MeetingSummary
                     past_result = await db.execute(
                         select(Meeting)
                         .options(joinedload(Meeting.summary))
@@ -1165,7 +1196,7 @@ class BotEngine:
             # from the LLM, cutting perceived latency by 60-70%.
             response_parts: list[str] = []
             total_playback = 0.0
-            playback_start = time.time()
+            playback_started_at: float | None = None
             stream_timed_out = False
 
             try:
@@ -1209,8 +1240,11 @@ class BotEngine:
                             )
                             if session.bot_id and sentence_audio:
                                 await self._recall_client.send_audio(session.bot_id, sentence_audio)
-                                chunk_duration = len(sentence_audio) / (24000 * 2)
-                                total_playback += chunk_duration
+                                total_playback, playback_started_at = self._enqueue_playback_chunk(
+                                    total_playback,
+                                    playback_started_at,
+                                    sentence_audio,
+                                )
 
             except TimeoutError:
                 stream_timed_out = True
@@ -1231,6 +1265,11 @@ class BotEngine:
                         )
                         if fallback_audio:
                             await self._recall_client.send_audio(session.bot_id, fallback_audio)
+                            total_playback, playback_started_at = self._enqueue_playback_chunk(
+                                total_playback,
+                                playback_started_at,
+                                fallback_audio,
+                            )
 
             response_text = " ".join(response_parts)
 
@@ -1262,7 +1301,10 @@ class BotEngine:
                 )
 
                 # Wait for remaining playback to finish (interruption check)
-                playback_remaining = total_playback - (time.time() - playback_start)
+                playback_remaining = self._remaining_playback_time(
+                    total_playback,
+                    playback_started_at,
+                )
                 while playback_remaining > 0:
                     if self._should_cancel_output(session):
                         logger.info("Interrupted during playback — stopping for session %s", session.session_id[:8])
@@ -1270,7 +1312,10 @@ class BotEngine:
                             await self._recall_client.stop_audio(session.bot_id)
                         break
                     await asyncio.sleep(min(0.3, playback_remaining))
-                    playback_remaining = total_playback - (time.time() - playback_start)
+                    playback_remaining = self._remaining_playback_time(
+                        total_playback,
+                        playback_started_at,
+                    )
 
             if response_text:
                 bot_name = session.agent_config.get("agent_name", "Nova")

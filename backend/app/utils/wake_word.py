@@ -87,6 +87,9 @@ _DIRECTED_AT_OTHER_PATTERN = re.compile(
 _GENERIC_ADDRESSEES = frozenset({
     "everyone", "guys", "team", "folks", "all", "people", "somebody", "someone",
 })
+_NON_NAME_ADDRESSEES = frozenset({
+    "what", "who", "where", "when", "why", "how", "which",
+})
 
 
 def is_directed_at_other(
@@ -103,13 +106,17 @@ def is_directed_at_other(
     - The addressee is a generic group word ("everyone", "team")
     - No directed-at pattern is found
     """
-    match = _DIRECTED_AT_OTHER_PATTERN.match(text.strip())
+    stripped_text = text.strip()
+    match = _DIRECTED_AT_OTHER_PATTERN.match(stripped_text)
     if not match:
         return False
 
     addressee = match.group(1).lower()
 
     if addressee in _GENERIC_ADDRESSEES:
+        return False
+
+    if addressee in _NON_NAME_ADDRESSEES:
         return False
 
     for bot_name in bot_names:
@@ -124,8 +131,8 @@ def is_directed_at_other(
                 return True
 
     # Addressee is a proper name (capitalized in original text) — likely a person
-    original_word = text.strip().split(",")[0].split()[-1] if "," in text else ""
-    if original_word and original_word[0].isupper():
+    original_addressee = stripped_text[match.start(1):match.end(1)]
+    if original_addressee and original_addressee[0].isupper():
         return True
 
     return False

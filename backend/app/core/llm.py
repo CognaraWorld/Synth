@@ -497,6 +497,7 @@ class LLMClient:
                 if should_cancel and should_cancel():
                     stop_worker.set()
                     cancelled = True
+                    break
                 continue
             if token is None:
                 break
@@ -516,6 +517,15 @@ class LLMClient:
 
         if not cancelled and buffer.strip():
             yield buffer.strip()
+
+        if cancelled:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            except asyncio.TimeoutError:
+                logger.debug("Gemini sync worker still blocked after cancellation")
+            except Exception:
+                pass
+            return
 
         await task
 

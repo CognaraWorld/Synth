@@ -191,7 +191,12 @@ class SummaryGenerator:
                     system_prompt=_SUMMARY_SYSTEM_PROMPT,
                 )
                 result = self._parse_llm_response(raw_response, transcript)
-                if result.get("content") and "LLM could not be reached" not in result["content"]:
+                key_points = result.get("key_points") or []
+                parse_failed = any(
+                    isinstance(point, str) and "LLM could not be reached" in point
+                    for point in key_points
+                )
+                if result.get("content") and not parse_failed:
                     return result
                 raise ValueError("LLM returned unparseable summary")
             except Exception as exc:
@@ -348,7 +353,7 @@ class SummaryGenerator:
         return bytes(pdf.output())
 
     @staticmethod
-    def _pdf_section(pdf: FPDF, title: str, body: str) -> None:
+    def _pdf_section(pdf: Any, title: str, body: str) -> None:
         """Render a titled text section in the PDF."""
         pdf.set_font("Helvetica", "B", 14)
         pdf.set_text_color(30, 30, 46)
@@ -364,7 +369,7 @@ class SummaryGenerator:
         pdf.ln(6)
 
     @staticmethod
-    def _pdf_list_section(pdf: FPDF, title: str, items: list[str]) -> None:
+    def _pdf_list_section(pdf: Any, title: str, items: list[str]) -> None:
         """Render a titled bullet-list section in the PDF."""
         pdf.set_font("Helvetica", "B", 14)
         pdf.set_text_color(30, 30, 46)

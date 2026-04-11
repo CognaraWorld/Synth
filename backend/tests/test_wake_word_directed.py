@@ -39,3 +39,12 @@ def test_no_directed_pattern() -> None:
         "What do you think about the budget?",
         bot_names=("Nova",),
     )
+
+
+def test_directed_at_capitalized_name_without_comma() -> None:
+    from app.utils.wake_word import is_directed_at_other
+
+    assert is_directed_at_other(
+        "Sarah what do you think about the budget?",
+        bot_names=("Nova",),
+    )

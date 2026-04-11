@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -61,4 +63,34 @@ async def test_async_query_stream_cancelled_sync_gemini_does_not_fallback_to_cla
     ):
         chunks.append(chunk)
 
+    assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_sync_stream_cancel_returns_promptly_when_worker_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.llm import LLMClient
+
+    client = LLMClient()
+    client.gemini_client = object()
+
+    loop = asyncio.get_running_loop()
+    pending_worker = loop.create_future()
+
+    def _never_finishing_executor(_executor, _func):
+        return pending_worker
+
+    monkeypatch.setattr(loop, "run_in_executor", _never_finishing_executor)
+
+    chunks = []
+    async def _collect() -> None:
+        async for chunk in client._gemini_stream(
+            "prompt",
+            "content",
+            should_cancel=lambda: True,
+        ):
+            chunks.append(chunk)
+
+    await asyncio.wait_for(_collect(), timeout=0.5)
     assert chunks == []

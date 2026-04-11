@@ -135,6 +135,29 @@ async def test_generate_with_llm_bad_json(generator: SummaryGenerator) -> None:
     assert "words" in result["content"].lower()
 
 
+@pytest.mark.asyncio
+async def test_generate_retries_after_unparseable_summary(
+    generator: SummaryGenerator,
+) -> None:
+    """Fallback-shaped parse results should still consume retry budget."""
+    mock_client = MagicMock()
+    mock_client.async_query = AsyncMock(
+        side_effect=[
+            "This is not JSON at all.",
+            SAMPLE_LLM_JSON,
+        ]
+    )
+
+    result = await generator.generate(
+        SAMPLE_TRANSCRIPT,
+        llm_client=mock_client,
+        max_retries=1,
+    )
+
+    assert result["content"].startswith("The team held")
+    assert mock_client.async_query.await_count == 2
+
+
 def test_summary_dict_keys(generator: SummaryGenerator) -> None:
     """The fallback summary always contains the required four keys."""
     result = generator._fallback_summary(SAMPLE_TRANSCRIPT)
