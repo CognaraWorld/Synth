@@ -1,0 +1,45 @@
+name: Trusted Fork CI
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-fork-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Trusted Fork Guard
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.evaluate.outputs.should_run }}
+      checkout_ref: ${{ steps.evaluate.outputs.checkout_ref }}
+    steps:
+      - name: Evaluate trusted fork policy
+        id: evaluate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          IS_TRUSTED_ASSOCIATION: ${{ contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.pull_request.author_association) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${IS_FORK}" = "true" ] && [ "${IS_TRUSTED_ASSOCIATION}" = "true" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=refs/pull/${PR_NUMBER}/merge" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: guard
+    if: needs.guard.outputs.should_run == 'true'
+    uses: ./.github/workflows/ci-jobs.yml
+    with:
+      checkout_ref: ${{ needs.guard.outputs.checkout_ref }}
+      persist_credentials: false
