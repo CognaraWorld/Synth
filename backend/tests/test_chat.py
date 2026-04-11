@@ -102,6 +102,7 @@ class TestSendChatMessage:
         meeting = _make_meeting(user_id=owner.id, agent=agent, transcript="Alice: Let's ship Monday.")
 
         db = AsyncMock()
+        db.add = MagicMock()
         # _get_meeting_or_raise
         meeting_result = MagicMock()
         meeting_result.scalar_one_or_none.return_value = meeting
@@ -118,7 +119,7 @@ class TestSendChatMessage:
 
         with (
             patch("app.api.routes.chat._get_llm") as mock_get_llm,
-            patch("app.api.routes.chat._check_rate_limit"),
+            patch("app.api.routes.chat._check_rate_limit", new_callable=AsyncMock),
         ):
             mock_llm = MagicMock()
             mock_llm.async_query = AsyncMock(return_value="The team decided to ship on Monday.")
@@ -150,6 +151,7 @@ class TestSendChatMessage:
         meeting = _make_meeting(user_id=owner.id, agent=agent)
 
         db = AsyncMock()
+        db.add = MagicMock()
         meeting_result = MagicMock()
         meeting_result.scalar_one_or_none.return_value = meeting
         history_result = MagicMock()
@@ -162,7 +164,7 @@ class TestSendChatMessage:
 
         with (
             patch("app.api.routes.chat._get_llm") as mock_get_llm,
-            patch("app.api.routes.chat._check_rate_limit"),
+            patch("app.api.routes.chat._check_rate_limit", new_callable=AsyncMock),
         ):
             mock_llm = MagicMock()
             mock_llm.async_query = AsyncMock(side_effect=RuntimeError("LLM down"))
@@ -265,7 +267,8 @@ class TestChatHistory:
 class TestRateLimit:
     """Verify rate limiting on chat endpoint."""
 
-    def test_rate_limit_rejects_after_threshold(self) -> None:
+    @pytest.mark.asyncio
+    async def test_rate_limit_rejects_after_threshold(self) -> None:
         from app.api.routes.chat import _check_rate_limit, _rate_limit_buckets, _CHAT_RATE_LIMIT
 
         user_id = str(uuid4())
@@ -274,11 +277,11 @@ class TestRateLimit:
 
         # Fill the bucket to the limit
         for _ in range(_CHAT_RATE_LIMIT):
-            _check_rate_limit(user_id)
+            await _check_rate_limit(user_id)
 
         # Next call should raise 429
         with pytest.raises(HTTPException) as exc_info:
-            _check_rate_limit(user_id)
+            await _check_rate_limit(user_id)
         assert exc_info.value.status_code == 429
 
         # Cleanup

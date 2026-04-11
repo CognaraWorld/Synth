@@ -54,6 +54,7 @@ class TestServiceTokenEndpoint:
         from app.api.routes.auth import service_token
 
         db = AsyncMock()
+        db.add = MagicMock()
         fake_result = MagicMock()
         fake_result.scalar_one_or_none.return_value = None  # user not found
         db.execute.return_value = fake_result
@@ -119,6 +120,7 @@ class TestServiceTokenEndpoint:
         from app.models.database import DEFAULT_STARTER_CREDITS
 
         db = AsyncMock()
+        db.add = MagicMock()
         fake_result = MagicMock()
         fake_result.scalar_one_or_none.return_value = None
         db.execute.return_value = fake_result

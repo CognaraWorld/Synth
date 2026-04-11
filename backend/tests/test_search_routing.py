@@ -203,6 +203,8 @@ class TestWebSearchGate:
         engine._recall_client.send_audio = AsyncMock()
         engine._recall_client.send_audio_b64 = AsyncMock()
         engine._recall_client.stop_audio = AsyncMock()
+        # Avoid pydub/ffmpeg in unit tests (CI and dev machines may lack ffmpeg).
+        engine._recall_client.pcm_to_mp3_b64 = MagicMock(return_value="Zm9v")
         engine._models_loaded = True
 
         session = MeetingSession(

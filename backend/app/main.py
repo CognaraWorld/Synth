@@ -2,7 +2,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
@@ -612,3 +612,14 @@ app.include_router(ws_router, prefix="/api")
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "service": "synth-api"}
+
+
+@app.get("/api/health/meeting-latency")
+async def meeting_latency_metrics():
+    """Rolling p50/p95 for meeting Q&A stage deltas (in-process only)."""
+    settings = get_settings()
+    if settings.environment != "development" and not settings.expose_meeting_latency_metrics:
+        raise HTTPException(status_code=404, detail="Not found")
+    from app.observability.meeting_latency_store import snapshot_percentiles
+
+    return snapshot_percentiles()

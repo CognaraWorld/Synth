@@ -35,10 +35,16 @@ Synth joins your meetings and participates like a real team member:
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.12+ (3.11+ works locally; CI uses 3.12)
 - Node.js 22+
 - Docker & Docker Compose
 - PostgreSQL (or use Docker)
+- **ffmpeg** on the server that runs the backend — required for Recall.ai bot audio (PCM→MP3 via pydub) and some export paths. Install with `apt install ffmpeg`, `brew install ffmpeg`, or ship it in your container image.
+
+### Meeting latency metrics (optional)
+
+- In-process **p50 / p95** rollups for Q&A stage gaps are recorded automatically; every 50 completed turns the backend logs a compact JSON line: `meeting_latency_rollup {...}`.
+- **GET `/api/health/meeting-latency`** returns the current snapshot when `ENVIRONMENT=development`, or in production when **`EXPOSE_MEETING_LATENCY_METRICS=true`** (maps to `expose_meeting_latency_metrics` in `Settings`).
 
 ### Setup
 

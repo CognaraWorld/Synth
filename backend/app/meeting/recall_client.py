@@ -275,6 +275,11 @@ class RecallClient:
     @staticmethod
     def pcm_to_mp3_b64(audio_bytes: bytes) -> str:
         """Convert raw PCM audio to base64-encoded MP3."""
+        # int16 mono: byte length must be a multiple of (sample_width * channels)
+        if len(audio_bytes) % 2:
+            audio_bytes = audio_bytes[:-1]
+        if not audio_bytes:
+            return ""
         audio_seg = AudioSegment(
             data=audio_bytes,
             sample_width=2,
@@ -282,7 +287,12 @@ class RecallClient:
             channels=1,
         )
         mp3_buf = io.BytesIO()
-        audio_seg.export(mp3_buf, format="mp3", bitrate="64k")
+        try:
+            audio_seg.export(mp3_buf, format="mp3", bitrate="64k")
+        except FileNotFoundError:
+            # pydub invokes ffmpeg; missing binary should not crash callers
+            logger.warning("ffmpeg not available; skipping PCM→MP3 conversion")
+            return ""
         return base64.b64encode(mp3_buf.getvalue()).decode("ascii")
 
     async def send_audio(self, bot_id: str, audio_bytes: bytes) -> None:
@@ -293,6 +303,9 @@ class RecallClient:
             audio_bytes: Raw audio bytes (PCM int16, 24kHz mono).
         """
         b64_audio = self.pcm_to_mp3_b64(audio_bytes)
+        if not b64_audio:
+            logger.debug("Skipping empty audio payload for bot %s", bot_id)
+            return
 
         try:
             response = await self._client.post(
@@ -320,6 +333,9 @@ class RecallClient:
 
     async def send_audio_b64(self, bot_id: str, b64_audio: str) -> None:
         """Send pre-encoded base64 MP3 audio into the meeting."""
+        if not b64_audio:
+            logger.debug("Skipping empty pre-encoded audio payload for bot %s", bot_id)
+            return
         try:
             response = await self._client.post(
                 f"/bot/{bot_id}/output_audio",

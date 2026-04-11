@@ -85,6 +85,63 @@ class TestReportFinalization:
         assert usage_record.minutes_used == 42.0
         assert usage_record.meeting_id == meeting.id
 
+    @pytest.mark.asyncio
+    async def test_finalize_skips_when_already_emailed(
+        self, tmp_path: Path
+    ) -> None:
+        """Duplicate finalize calls must not regenerate after a successful send."""
+        from app.meeting.reporting import finalize_meeting_artifacts
+
+        pdf = tmp_path / "done.pdf"
+        docx = tmp_path / "done.docx"
+        pdf.write_bytes(b"%PDF")
+        docx.write_bytes(b"PK")
+
+        prior = SimpleNamespace(
+            email_delivery_status="sent",
+            pdf_path=str(pdf),
+            docx_path=str(docx),
+            content="Existing narrative from first run.",
+        )
+        meeting = SimpleNamespace(
+            id=uuid4(),
+            user_id=uuid4(),
+            meeting_link="https://zoom.us/j/1",
+            platform="zoom",
+            transcript="Alice: Done.",
+            started_at=datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 4, 3, 10, 5, tzinfo=timezone.utc),
+            duration_minutes=5.0,
+            summary=prior,
+        )
+        current_user = SimpleNamespace(email="owner@example.com")
+        generator = MagicMock()
+        generator.generate = AsyncMock()
+        sender = MagicMock()
+        db = AsyncMock()
+        db.flush = AsyncMock()
+        usage_stub = SimpleNamespace(meeting_id=meeting.id, minutes_used=5.0)
+
+        settings = SimpleNamespace(summary_dir=str(tmp_path))
+
+        with patch(
+            "app.meeting.reporting.upsert_usage_record",
+            new_callable=AsyncMock,
+            return_value=usage_stub,
+        ):
+            report, usage = await finalize_meeting_artifacts(
+                db=db,
+                meeting=meeting,
+                current_user=current_user,
+                settings=settings,
+                generator=generator,
+                sender=sender,
+            )
+
+        generator.generate.assert_not_called()
+        assert report is prior
+        assert usage is usage_stub
+
 
 class TestReportsApi:
     def test_meeting_summary_response_hides_server_paths(self) -> None:
@@ -205,6 +262,53 @@ class TestUsageApi:
                 db=db,
             )
 
+        assert response.status == "ended"
+
+    @pytest.mark.asyncio
+    async def test_stop_meeting_persists_transcript_from_engine(self) -> None:
+        from app.api.routes.meetings import stop_meeting
+
+        current_user = SimpleNamespace(id=uuid4(), email="owner@example.com")
+        meeting = SimpleNamespace(
+            id=uuid4(),
+            user_id=current_user.id,
+            status="active",
+            bot_id="bot-123",
+            transcript=None,
+            started_at=datetime(2026, 4, 3, 10, 0),
+            ended_at=None,
+            duration_minutes=None,
+            credits_used=0,
+        )
+
+        lookup_result = MagicMock()
+        lookup_result.scalar_one_or_none.return_value = meeting
+        bill_result = MagicMock(rowcount=1)
+        settle_result = MagicMock()
+
+        db = AsyncMock()
+        db.execute.side_effect = [lookup_result, bill_result, settle_result]
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock(side_effect=lambda obj: setattr(obj, "status", "ended"))
+
+        engine = MagicMock()
+        engine._sessions_by_bot_id = {"bot-123": "session-123"}
+        engine.stop_meeting = AsyncMock(
+            return_value={
+                "transcript": "Alice: Final answer.\nBob: Sounds good.",
+                "summary": "done",
+            },
+        )
+
+        with patch("app.api.routes.meetings.get_bot_engine", return_value=engine):
+            response = await stop_meeting(
+                meeting_id=meeting.id,
+                current_user=current_user,
+                db=db,
+            )
+
+        engine.stop_meeting.assert_awaited_once_with("session-123")
+        assert meeting.transcript == "Alice: Final answer.\nBob: Sounds good."
         assert response.status == "ended"
 
     @pytest.mark.asyncio

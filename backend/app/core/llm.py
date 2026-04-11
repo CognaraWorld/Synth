@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+from collections.abc import Callable
 
 from app.config import get_settings
 
@@ -55,9 +57,16 @@ class LLMClient:
 
         # Gemini setup (primary fast path)
         self.gemini_client = None
+        self._gemini_async_client = None
         self._gemini_model = "gemini-2.5-flash-lite"
         if genai and self.settings.gemini_api_key:
             self.gemini_client = genai.Client(api_key=self.settings.gemini_api_key)
+            try:
+                self._gemini_async_client = genai.Client(
+                    api_key=self.settings.gemini_api_key,
+                ).aio
+            except Exception:
+                self._gemini_async_client = None
             logger.info("Gemini 2.5 Flash Lite configured as primary LLM")
 
     # ------------------------------------------------------------------
@@ -69,13 +78,23 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        speaker_instruction = ""
+        if speaker:
+            first_name = speaker.split()[0]
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally "
+                f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
+                f"Don't force their name into every sentence — use it once or twice at most. "
+            )
         user_content = (
             f"A meeting participant just asked you this question:\n"
             f"\"{question}\"\n\n"
-            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
-            f"Do NOT say who asked it. Just give the answer. "
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
             f"Here is the meeting context you can reference:\n{context}"
@@ -111,27 +130,35 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        speaker_instruction = ""
+        if speaker:
+            first_name = speaker.split()[0]
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally "
+                f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
+                f"Don't force their name into every sentence — use it once or twice at most. "
+            )
         user_content = (
             f"A meeting participant just asked you this question:\n"
             f"\"{question}\"\n\n"
-            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
-            f"Do NOT say who asked it. Just give the answer. "
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
             f"Here is the meeting context you can reference:\n{context}"
         )
 
-        # Try Gemini first (run sync SDK in executor with timeout)
+        # Try Gemini first — native async when available, executor fallback
         if self.gemini_client:
             try:
-                loop = asyncio.get_running_loop()
                 start = time.time()
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        lambda: self.gemini_client.models.generate_content(
+                if self._gemini_async_client:
+                    response = await asyncio.wait_for(
+                        self._gemini_async_client.models.generate_content(
                             model=self._gemini_model,
                             contents=user_content,
                             config={
@@ -140,9 +167,25 @@ class LLMClient:
                                 "temperature": 0.7,
                             },
                         ),
-                    ),
-                    timeout=30.0,
-                )
+                        timeout=30.0,
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: self.gemini_client.models.generate_content(
+                                model=self._gemini_model,
+                                contents=user_content,
+                                config={
+                                    "system_instruction": prompt,
+                                    "max_output_tokens": 1024,
+                                    "temperature": 0.7,
+                                },
+                            ),
+                        ),
+                        timeout=30.0,
+                    )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
                 text = response.text
@@ -252,13 +295,81 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
+        should_cancel: Callable[[], bool] | None = None,
     ):
-        """Stream a response from Claude, yielding complete sentences."""
-        if self._claude_async is None:
-            raise RuntimeError("Claude SDK not configured for streaming.")
+        """Stream a response yielding complete sentences.
 
+        Tries Gemini streaming first (lower latency), falls back to
+        Claude streaming. Each yielded chunk is a full sentence suitable
+        for immediate TTS synthesis.
+
+        Args:
+            should_cancel: If set, called frequently; when it returns True,
+                the provider stream is stopped cooperatively (best-effort).
+        """
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        speaker_instruction = ""
+        if speaker:
+            first_name = speaker.split()[0]
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally. "
+            )
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting. "
+            f"Combine information from ALL available sources.\n\n"
+            f"Context:\n{context}"
+        )
+
+        # Try Gemini native async streaming first (no executor bridge)
+        if self._gemini_async_client:
+            try:
+                start = time.time()
+                yielded = False
+                async for sentence in self._gemini_stream_native_async(
+                    prompt, user_content, should_cancel=should_cancel,
+                ):
+                    yielded = True
+                    yield sentence
+                if should_cancel and should_cancel():
+                    logger.debug("Gemini async stream cancelled before sentence emission")
+                    return
+                if yielded:
+                    logger.info(
+                        "Gemini async stream completed in %.0fms",
+                        (time.time() - start) * 1000,
+                    )
+                    return
+            except Exception as exc:
+                logger.warning("Gemini async stream failed, trying sync bridge: %s", exc)
+
+        # Sync Gemini client streaming via executor queue (fallback)
+        if self.gemini_client:
+            try:
+                start = time.time()
+                yielded = False
+                async for sentence in self._gemini_stream(
+                    prompt, user_content, should_cancel=should_cancel,
+                ):
+                    yielded = True
+                    yield sentence
+                if should_cancel and should_cancel():
+                    logger.debug("Gemini sync stream cancelled before sentence emission")
+                    return
+                if yielded:
+                    logger.info("Gemini stream completed in %.0fms", (time.time() - start) * 1000)
+                    return
+            except Exception as exc:
+                logger.warning("Gemini stream failed, falling back to Claude: %s", exc)
+
+        # Fallback to Claude streaming
+        if self._claude_async is None:
+            yield "I'm having trouble processing right now. Please try again."
+            return
 
         buffer = ""
         async with self._claude_async.messages.stream(
@@ -267,7 +378,12 @@ class LLMClient:
             system=prompt,
             messages=[{"role": "user", "content": user_content}],
         ) as stream:
+            cancelled = False
             async for text in stream.text_stream:
+                if should_cancel and should_cancel():
+                    logger.debug("Claude stream cancelled by caller")
+                    cancelled = True
+                    break
                 buffer += text
                 while True:
                     best = -1
@@ -282,8 +398,129 @@ class LLMClient:
                     if sentence:
                         yield sentence
 
-        if buffer.strip():
+        if not cancelled and buffer.strip():
             yield buffer.strip()
+
+    async def _gemini_stream_native_async(
+        self,
+        system_prompt: str,
+        user_content: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Stream sentences from Gemini using the async client (true async I/O)."""
+        if not self._gemini_async_client:
+            return
+        stream = self._gemini_async_client.models.generate_content_stream(
+            model=self._gemini_model,
+            contents=user_content,
+            config={
+                "system_instruction": system_prompt,
+                "max_output_tokens": 1024,
+                "temperature": 0.7,
+            },
+        )
+        buffer = ""
+        cancelled = False
+        async for chunk in stream:
+            if should_cancel and should_cancel():
+                logger.debug("Gemini async stream cancelled by caller")
+                cancelled = True
+                break
+            piece = getattr(chunk, "text", None) or ""
+            if not piece:
+                continue
+            buffer += piece
+            while True:
+                best = -1
+                for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                    idx = buffer.find(sep)
+                    if idx != -1 and (best == -1 or idx < best):
+                        best = idx + len(sep)
+                if best == -1:
+                    break
+                sentence = buffer[:best].strip()
+                buffer = buffer[best:]
+                if sentence:
+                    yield sentence
+        if not cancelled and buffer.strip():
+            yield buffer.strip()
+
+    async def _gemini_stream(
+        self,
+        system_prompt: str,
+        user_content: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Stream sentences from Gemini, yielding complete sentences.
+
+        Bridges the sync Gemini SDK to async via a thread executor and
+        an asyncio.Queue. Sentinel errors are propagated after draining
+        any partial content so callers get whatever was generated.
+
+        When *should_cancel* is set, the blocking iterator in the worker
+        thread stops pulling from Gemini as soon as the flag is set.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stream_error: list[Exception] = []
+        stop_worker = threading.Event()
+
+        def _run_gemini_stream() -> None:
+            try:
+                response = self.gemini_client.models.generate_content_stream(
+                    model=self._gemini_model,
+                    contents=user_content,
+                    config={
+                        "system_instruction": system_prompt,
+                        "max_output_tokens": 1024,
+                        "temperature": 0.7,
+                    },
+                )
+                for chunk in response:
+                    if stop_worker.is_set():
+                        break
+                    if chunk.text:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+            except Exception as exc:
+                stream_error.append(exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        task = loop.run_in_executor(None, _run_gemini_stream)
+
+        buffer = ""
+        cancelled = False
+        while True:
+            try:
+                token = await asyncio.wait_for(queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                if should_cancel and should_cancel():
+                    stop_worker.set()
+                    cancelled = True
+                continue
+            if token is None:
+                break
+            buffer += token
+            while True:
+                best = -1
+                for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                    idx = buffer.find(sep)
+                    if idx != -1 and (best == -1 or idx < best):
+                        best = idx + len(sep)
+                if best == -1:
+                    break
+                sentence = buffer[:best].strip()
+                buffer = buffer[best:]
+                if sentence:
+                    yield sentence
+
+        if not cancelled and buffer.strip():
+            yield buffer.strip()
+
+        await task
+
+        if stream_error:
+            raise stream_error[0]
 
     def generate_system_prompt(self, description: str) -> str:
         return (
