@@ -22,3 +22,11 @@ def test_splits_long_sentence_on_spaces() -> None:
 def test_empty() -> None:
     assert split_text_for_tts("") == []
     assert split_text_for_tts("   ") == []
+
+
+def test_prefers_early_space_over_mid_word_cut() -> None:
+    text = "short words " + ("x" * 45)
+    chunks = split_text_for_tts(text, max_chars=25, min_space_break=20)
+
+    assert chunks[0] == "short words"
+    assert all(chunk for chunk in chunks)

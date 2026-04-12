@@ -88,7 +88,8 @@ class FillerManager:
         Produces natural acknowledgments like "Sure Yash, let me check."
         so the bot feels conversational and human.
         """
-        first_name = speaker.split()[0] if speaker else ""
+        cleaned_speaker = (speaker or "").strip()
+        first_name = cleaned_speaker.split()[0] if cleaned_speaker else ""
         if not first_name:
             return self.get_filler_for_category(category)
 

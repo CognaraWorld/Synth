@@ -29,12 +29,14 @@ def record(bot_id: str, text: str) -> None:
 
 def is_echo(bot_id: str, text: str) -> bool:
     """Return True if *text* looks like an echo of recent bot output."""
-    if not bot_id or bot_id not in _recent_output:
+    if not bot_id:
         return False
     text_lower = text.lower().strip()
     if len(text_lower) <= 10:
         return False
     with _lock:
+        if bot_id not in _recent_output:
+            return False
         for bot_text in _recent_output.get(bot_id, []):
             if text_lower in bot_text or bot_text in text_lower:
                 return True

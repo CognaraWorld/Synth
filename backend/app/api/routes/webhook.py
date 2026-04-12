@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.database import Meeting, User, AsyncSessionLocal
 from app.utils.bot_profiles import get_persona_tts_voice
+from app.utils import echo_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,6 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 _bot_engine = None
 _greeted_bots: set[str] = set()
 _pending_hey: dict[str, float] = {}
-
-# Legacy alias — kept so existing imports from bot_engine.py don't break
-# during the transition. New code should use app.utils.echo_tracker directly.
-from app.utils import echo_tracker as _echo_mod
-_recent_bot_output: dict[str, list[str]] = _echo_mod._recent_output
 
 def get_bot_engine():
     """Get or create the shared BotEngine instance."""
@@ -55,10 +51,20 @@ def set_bot_engine(engine):
     _bot_engine = engine
 
 
+def _log_task_failure(task: asyncio.Task, label: str) -> None:
+    """Emit full tracebacks for failed fire-and-forget webhook tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.error(label, exc_info=(type(exc), exc, exc.__traceback__))
+
+
 def cleanup_bot_tracking(bot_id: str) -> None:
     """Remove per-bot tracking data when a meeting ends."""
     _greeted_bots.discard(bot_id)
-    _echo_mod.cleanup(bot_id)
+    echo_tracker.cleanup(bot_id)
     _pending_hey.pop(bot_id, None)
 
 
@@ -104,9 +110,7 @@ async def recall_webhook(request: Request):
         if event in ("transcript.data", "transcript.partial_data"):
             _task = asyncio.create_task(_bounded_handle_transcription(data))
             _task.add_done_callback(
-                lambda t: logger.error("Webhook transcript task failed: %s", t.exception())
-                if not t.cancelled() and t.exception()
-                else None
+                lambda t: _log_task_failure(t, "Webhook transcript task failed")
             )
             handled = True
         elif event.startswith("bot.") and "status" not in event:
@@ -115,7 +119,9 @@ async def recall_webhook(request: Request):
             handled = True
         elif "status" in event.lower():
             _task = asyncio.create_task(_bounded_handle_status_change(data))
-            _task.add_done_callback(lambda t: logger.error("Webhook status task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _task.add_done_callback(
+                lambda t: _log_task_failure(t, "Webhook status task failed")
+            )
             handled = True
         elif event == "video_separate_png.data":
             asyncio.create_task(_bounded_handle_video_frame(data))
@@ -128,7 +134,9 @@ async def recall_webhook(request: Request):
         # No event field — direct transcript webhook
         if "bot_id" in payload or "words" in payload or "text" in payload:
             _task = asyncio.create_task(_bounded_handle_transcription(payload))
-            _task.add_done_callback(lambda t: logger.error("Webhook task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _task.add_done_callback(
+                lambda t: _log_task_failure(t, "Webhook task failed")
+            )
 
     return {"status": "ok"}
 
@@ -231,7 +239,7 @@ async def _handle_transcription(data: dict) -> None:
             logger.debug("Ignoring bot's own transcript: %s", text[:80])
             return
 
-        if bot_id and _echo_mod.is_echo(bot_id, text):
+        if bot_id and echo_tracker.is_echo(bot_id, text):
             logger.debug("Echo detected: %s", text[:80])
             return
 
@@ -400,8 +408,7 @@ async def _handle_status_change(data: dict) -> None:
                 _auto_finalize_report(meeting_id_for_report, user_email_for_report)
             )
             _task.add_done_callback(
-                lambda t: logger.error("Auto-report failed: %s", t.exception())
-                if not t.cancelled() and t.exception() else None
+                lambda t: _log_task_failure(t, "Auto-report failed")
             )
 
     except Exception as exc:
@@ -520,8 +527,8 @@ async def _auto_finalize_report(meeting_id, user_email: str) -> None:
             settings=settings,
         )
         logger.info("Auto-finalized report for meeting %s", meeting_id)
-    except Exception as exc:
-        logger.error("Auto-report finalization failed for meeting %s: %s", meeting_id, exc)
+    except Exception:
+        logger.exception("Auto-report finalization failed for meeting %s", meeting_id)
 
 
 async def _send_greeting(bot_id: str) -> None:

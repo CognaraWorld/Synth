@@ -27,8 +27,11 @@ def split_text_for_tts(
             break
         window = remaining[:max_chars]
         cut = window.rfind(" ")
-        if cut < min_space_break:
+        if cut == -1:
             cut = max_chars
+        elif cut < min_space_break:
+            # Prefer an earlier word boundary over slicing a word in half.
+            cut = cut if cut > 0 else max_chars
         piece = remaining[:cut].strip()
         if piece:
             chunks.append(piece)

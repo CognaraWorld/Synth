@@ -17,6 +17,8 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS = 0.2
+
 try:
     import anthropic
 except ModuleNotFoundError:
@@ -34,6 +36,14 @@ _DEFAULT_SYSTEM_PROMPT = (
     "does not contain enough information to answer, say so honestly rather "
     "than guessing."
 )
+
+
+def _first_name_or_empty(speaker: str) -> str:
+    """Return the speaker's first token, tolerating blank/whitespace names."""
+    cleaned = (speaker or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned.split()[0]
 
 
 class LLMClient:
@@ -82,8 +92,8 @@ class LLMClient:
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         speaker_instruction = ""
-        if speaker:
-            first_name = speaker.split()[0]
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
             speaker_instruction = (
                 f"{first_name} asked this question. You may address them by name naturally "
                 f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
@@ -134,8 +144,8 @@ class LLMClient:
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         speaker_instruction = ""
-        if speaker:
-            first_name = speaker.split()[0]
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
             speaker_instruction = (
                 f"{first_name} asked this question. You may address them by name naturally "
                 f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
@@ -310,8 +320,8 @@ class LLMClient:
         """
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         speaker_instruction = ""
-        if speaker:
-            first_name = speaker.split()[0]
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
             speaker_instruction = (
                 f"{first_name} asked this question. You may address them by name naturally. "
             )
@@ -335,7 +345,7 @@ class LLMClient:
                 ):
                     yielded = True
                     yield sentence
-                if should_cancel and should_cancel():
+                if should_cancel and should_cancel() and not yielded:
                     logger.debug("Gemini async stream cancelled before sentence emission")
                     return
                 if yielded:
@@ -357,7 +367,7 @@ class LLMClient:
                 ):
                     yielded = True
                     yield sentence
-                if should_cancel and should_cancel():
+                if should_cancel and should_cancel() and not yielded:
                     logger.debug("Gemini sync stream cancelled before sentence emission")
                     return
                 if yielded:
@@ -488,43 +498,57 @@ class LLMClient:
 
         task = loop.run_in_executor(None, _run_gemini_stream)
 
+        async def _drain_worker_after_stop(reason: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.debug("Gemini sync worker still blocked after %s", reason)
+            except Exception:
+                pass
+
+        def _schedule_worker_drain(reason: str) -> None:
+            asyncio.create_task(_drain_worker_after_stop(reason))
+
         buffer = ""
         cancelled = False
-        while True:
-            try:
-                token = await asyncio.wait_for(queue.get(), timeout=0.1)
-            except asyncio.TimeoutError:
-                if should_cancel and should_cancel():
-                    stop_worker.set()
-                    cancelled = True
-                    break
-                continue
-            if token is None:
-                break
-            buffer += token
+        try:
             while True:
-                best = -1
-                for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
-                    idx = buffer.find(sep)
-                    if idx != -1 and (best == -1 or idx < best):
-                        best = idx + len(sep)
-                if best == -1:
+                try:
+                    token = await asyncio.wait_for(queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    if should_cancel and should_cancel():
+                        stop_worker.set()
+                        cancelled = True
+                        break
+                    continue
+                if token is None:
                     break
-                sentence = buffer[:best].strip()
-                buffer = buffer[best:]
-                if sentence:
-                    yield sentence
+                buffer += token
+                while True:
+                    best = -1
+                    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                        idx = buffer.find(sep)
+                        if idx != -1 and (best == -1 or idx < best):
+                            best = idx + len(sep)
+                    if best == -1:
+                        break
+                    sentence = buffer[:best].strip()
+                    buffer = buffer[best:]
+                    if sentence:
+                        yield sentence
+        except asyncio.CancelledError:
+            stop_worker.set()
+            _schedule_worker_drain("caller cancellation")
+            raise
 
         if not cancelled and buffer.strip():
             yield buffer.strip()
 
         if cancelled:
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
-            except asyncio.TimeoutError:
-                logger.debug("Gemini sync worker still blocked after cancellation")
-            except Exception:
-                pass
+            await _drain_worker_after_stop("cancellation")
             return
 
         await task

@@ -144,6 +144,34 @@ class BotEngine:
         if session_id not in self._queued_question:
             self._queued_question[session_id] = {}
 
+    async def _wait_for_processing_drain(self, session_id: str) -> None:
+        """Block cleanup until any in-flight question handler finishes."""
+        lock = self._processing_lock.get(session_id)
+        if lock is None:
+            return
+        async with lock:
+            return
+
+    def _cleanup_session_tracking(self, session: MeetingSession) -> None:
+        """Drop per-session caches only after question handling has drained."""
+        session_id = session.session_id
+        vad = self._vad_instances.pop(session_id, None)
+        if vad is not None:
+            vad.reset()
+        self.sessions.pop(session_id, None)
+        self._last_response_time.pop(session_id, None)
+        self._last_speaker.pop(session_id, None)
+        self._followup_speakers.pop(session_id, None)
+        self._pending_question.pop(session_id, None)
+        self._queued_question.pop(session_id, None)
+        self._interrupted.pop(session_id, None)
+        self._processing_lock.pop(session_id, None)
+        self._last_sentiment.pop(session_id, None)
+        self._session_tts.pop(session_id, None)
+        if session.bot_id:
+            self._sessions_by_bot_id.pop(session.bot_id, None)
+            self._recovery_lock_by_bot_id.pop(session.bot_id, None)
+
     def wire_screen_capture(self, session: MeetingSession) -> None:
         """Attach a ScreenCaptureManager to a session."""
         from app.meeting.screen_capture import ScreenCaptureManager
@@ -390,6 +418,10 @@ class BotEngine:
         if session.bot_id:
             await self._recall_client.stop_bot(session.bot_id)
 
+        # Let any in-flight question handler observe session_end_requested
+        # and release the per-session lock before we remove shared state.
+        await self._wait_for_processing_drain(session_id)
+
         # Collect transcript data before flushing
         full_transcript = session.context_manager.raw_buffer.get_full_text()
         summary = session.context_manager.rolling_summary.get_summary()
@@ -408,22 +440,7 @@ class BotEngine:
             )
             _task.add_done_callback(_log_task_exception)
 
-        vad = self._vad_instances.pop(session_id, None)
-        if vad is not None:
-            vad.reset()
-        self.sessions.pop(session_id, None)
-        self._last_response_time.pop(session_id, None)
-        self._last_speaker.pop(session_id, None)
-        self._followup_speakers.pop(session_id, None)
-        self._pending_question.pop(session_id, None)
-        self._queued_question.pop(session_id, None)
-        self._interrupted.pop(session_id, None)
-        self._processing_lock.pop(session_id, None)
-        self._last_sentiment.pop(session_id, None)
-        self._session_tts.pop(session_id, None)
-        if session.bot_id:
-            self._sessions_by_bot_id.pop(session.bot_id, None)
-            self._recovery_lock_by_bot_id.pop(session.bot_id, None)
+        self._cleanup_session_tracking(session)
 
         logger.info(
             "Session %s ended (duration=%.1fs)",
@@ -544,7 +561,12 @@ class BotEngine:
                 raise RuntimeError("Kokoro pipeline failed to initialize")
             self._session_tts[session_id] = tts
             return tts
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Per-session TTS init failed for session %s; using shared TTS: %s",
+                session_id[:8],
+                exc,
+            )
             return self._tts
 
     def _should_cancel_output(self, session: MeetingSession) -> bool:
@@ -1046,7 +1068,6 @@ class BotEngine:
 
         try:
             timer = QuestionStageTimer(session.session_id, question)
-            self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
             from app.utils.query_router import classify_query, needs_web_search
             category = classify_query(question)
             filler_duration = 0.0
