@@ -9,6 +9,11 @@ export async function* readSSE<T = unknown>(
   const reader = response.body?.getReader();
   if (!reader) return;
 
+  // Wire up abort signal to cancel the reader so reader.read() rejects
+  // immediately instead of blocking until the server sends data.
+  const onAbort = () => reader.cancel();
+  signal?.addEventListener("abort", onAbort);
+
   const decoder = new TextDecoder();
   let buffer = "";
 
@@ -34,6 +39,7 @@ export async function* readSSE<T = unknown>(
       }
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }

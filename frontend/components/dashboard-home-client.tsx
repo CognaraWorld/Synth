@@ -36,7 +36,7 @@ export function DashboardHomeClient({ data }: { data: DashboardHomeDTO }) {
         <StatsCard
           label="Minutes used"
           value={formatMinutes(data.stats.minutesUsedThisMonth)}
-          delta="+12% from last month"
+          delta="this month"
         />
         <StatsCard
           label="Minutes remaining"

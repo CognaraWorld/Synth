@@ -4,7 +4,7 @@ import asyncio
 import json as _json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -106,12 +106,16 @@ def _should_use_tools(question: str) -> bool:
     """Detect if a question would benefit from tool use."""
     q = question.lower()
     tool_signals = [
-        "search",
+        "search for",
+        "search the web",
         "look up",
         "find out",
         "what is the latest",
-        "current",
-        "today",
+        "current price",
+        "current status",
+        "current value",
+        "today's news",
+        "today's date",
         "recent news",
         "check if",
         "in the document",
@@ -239,28 +243,36 @@ async def _build_chat_context(
             if document.doc_summary:
                 document_parts.append(f"{document.filename}: {document.doc_summary}")
         if document_parts:
-            parts.append(f"## Documents\n" + "\n\n".join(document_parts[:5]))
+            parts.append("## Documents\n" + "\n\n".join(document_parts[:5]))
 
     if user_question:
         try:
             rag = _get_rag()
-            meeting_id = str(meeting.id)
+            meeting_id_str = str(meeting.id)
             agent_id = str(meeting.agent_id) if meeting.agent_id else None
-            transcript_chunks = [
-                chunk
-                for chunk in rag.hybrid_search(query=user_question, top_k=5)
-                if chunk.get("metadata", {}).get("meeting_id") == meeting_id
-                and chunk.get("metadata", {}).get("source_type") == "transcript"
-            ]
+            transcript_chunks = rag.hybrid_search(
+                query=user_question,
+                top_k=5,
+                where={
+                    "$and": [
+                        {"meeting_id": meeting_id_str},
+                        {"source_type": "transcript"},
+                    ]
+                },
+            )
 
             doc_chunks: list[dict] = []
-            if meeting.agent:
-                doc_chunks = [
-                    chunk
-                    for chunk in rag.hybrid_search(query=user_question, top_k=3)
-                    if chunk.get("metadata", {}).get("source_type") == "document"
-                    and (not agent_id or chunk.get("metadata", {}).get("agent_id") == agent_id)
-                ]
+            if meeting.agent and agent_id:
+                doc_chunks = rag.hybrid_search(
+                    query=user_question,
+                    top_k=3,
+                    where={
+                        "$and": [
+                            {"source_type": "document"},
+                            {"agent_id": agent_id},
+                        ]
+                    },
+                )
 
             if transcript_chunks or doc_chunks:
                 passage_lines: list[str] = []
@@ -408,9 +420,12 @@ async def stream_chat_message(
     db: AsyncSession = Depends(get_db),
 ):
     """SSE streaming version of chat. Yields sentences as they're generated."""
+    from app.models.database import AsyncSessionLocal
+
     await get_rate_limiter().check(str(current_user.id))
     meeting = await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
+    # Pre-compute everything that needs the request-scoped db session
     user_message = ChatMessage(
         meeting_id=meeting_id,
         user_id=current_user.id,
@@ -428,6 +443,10 @@ async def stream_chat_message(
         user_question=req.message,
     )
     system_prompt = _build_system_prompt_for_meeting(meeting)
+    # Capture IDs before the request-scoped session closes
+    user_message_id = str(user_message.id)
+    user_id = current_user.id
+    await db.commit()
 
     async def event_generator():
         full_response = ""
@@ -446,7 +465,7 @@ async def stream_chat_message(
                         inp,
                         search_client=search_client,
                         rag_pipeline=_get_rag(),
-                        db=db,
+                        db=None,
                         meeting_id=meeting_id,
                     )
 
@@ -473,19 +492,21 @@ async def stream_chat_message(
                     question=req.message,
                     system_prompt=system_prompt,
                 ):
-                    full_response += sentence + " "
+                    if full_response:
+                        full_response += " "
+                    full_response += sentence
                     yield f"data: {_json.dumps({'type': 'token', 'content': sentence})}\n\n"
         except asyncio.CancelledError:
-            await db.rollback()
             raise
         except Exception:
             logger.exception("LLM stream failed for meeting %s", meeting_id)
-            await db.rollback()
             yield (
                 f"data: {_json.dumps({'type': 'error', 'content': 'AI service temporarily unavailable.'})}\n\n"
             )
             return
 
+        # Use a dedicated session for the post-stream DB write so we don't
+        # depend on the request-scoped session that may already be closed.
         assistant_content = full_response.strip()
         citations = _parse_citations(assistant_content)
         metadata: dict[str, object] = {}
@@ -493,16 +514,18 @@ async def stream_chat_message(
             metadata["citations"] = citations
         if tool_calls:
             metadata["tool_calls"] = tool_calls
-        assistant_message = ChatMessage(
-            meeting_id=meeting_id,
-            user_id=current_user.id,
-            role="assistant",
-            content=assistant_content,
-            message_metadata=_json.dumps(metadata) if metadata else None,
-        )
-        db.add(assistant_message)
-        await db.flush()
-        await db.commit()
+        async with AsyncSessionLocal() as stream_db:
+            assistant_message = ChatMessage(
+                meeting_id=meeting_id,
+                user_id=user_id,
+                role="assistant",
+                content=assistant_content,
+                message_metadata=_json.dumps(metadata) if metadata else None,
+            )
+            stream_db.add(assistant_message)
+            await stream_db.flush()
+            assistant_message_id = str(assistant_message.id)
+            await stream_db.commit()
 
         follow_ups = await _generate_follow_ups(assistant_content)
 
@@ -511,8 +534,8 @@ async def stream_chat_message(
             + _json.dumps(
                 {
                     "type": "done",
-                    "user_message_id": str(user_message.id),
-                    "assistant_message_id": str(assistant_message.id),
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id,
                     "follow_ups": follow_ups,
                     "citations": citations or None,
                     "tool_calls": tool_calls or None,
@@ -563,16 +586,16 @@ async def cross_meeting_chat(
 
     try:
         rag = _get_rag()
-        allowed_meeting_ids = {str(meeting_id) for meeting_id in req.meeting_ids} if req.meeting_ids else None
-        rag_results = [
-            chunk
-            for chunk in rag.hybrid_search(query=req.message, top_k=8)
-            if chunk.get("metadata", {}).get("user_id") == str(current_user.id)
-            and (
-                allowed_meeting_ids is None
-                or chunk.get("metadata", {}).get("meeting_id") in allowed_meeting_ids
-            )
-        ]
+        rag_where: dict = {"user_id": str(current_user.id)}
+        if req.meeting_ids:
+            allowed_meeting_ids = [str(mid) for mid in req.meeting_ids]
+            rag_where = {
+                "$and": [
+                    {"user_id": str(current_user.id)},
+                    {"meeting_id": {"$in": allowed_meeting_ids}},
+                ]
+            }
+        rag_results = rag.hybrid_search(query=req.message, top_k=8, where=rag_where)
         if rag_results:
             passages = []
             for chunk in rag_results[:8]:
@@ -591,7 +614,7 @@ async def cross_meeting_chat(
     context = "\n\n".join(context_parts) if context_parts else "No meeting summaries available yet."
 
     agent_result = await db.execute(
-        select(Agent).where(Agent.user_id == current_user.id, Agent.is_primary == True)
+        select(Agent).where(Agent.user_id == current_user.id, Agent.is_primary.is_(True))
     )
     agent = agent_result.scalar_one_or_none()
     system_prompt = (
@@ -622,7 +645,7 @@ async def cross_meeting_chat(
         )
 
     follow_ups = await _generate_follow_ups(reply)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     return {
         "user_message": {"id": uuid4(), "role": "user", "content": req.message, "created_at": now, "citations": None},
         "assistant_message": {"id": uuid4(), "role": "assistant", "content": reply, "created_at": now, "citations": None},
@@ -655,7 +678,6 @@ async def get_chat_history(
     if before is not None:
         # Normalize tz-aware to naive UTC for DB comparison
         if before.tzinfo is not None:
-            from datetime import timezone
             before = before.astimezone(timezone.utc).replace(tzinfo=None)
         query = query.where(ChatMessage.created_at < before)
 

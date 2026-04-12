@@ -24,7 +24,9 @@ type StreamEvent =
   | { type: "error"; content: string };
 
 function appendStreamContent(current: string, next: string) {
-  return current + next;
+  if (!current) return next;
+  // Backend yields stripped sentences — add space between them to preserve readability
+  return current + " " + next;
 }
 
 async function readErrorMessage(response: Response) {

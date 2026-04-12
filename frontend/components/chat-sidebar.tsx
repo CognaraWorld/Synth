@@ -36,7 +36,7 @@ export function ChatSidebar({ meetingId, isOpen, onClose, crossMeeting }: ChatSi
 
   useEffect(() => {
     if (voiceTranscript) {
-      setInput(voiceTranscript);
+      setInput((prev) => (prev ? prev + " " + voiceTranscript : voiceTranscript));
     }
   }, [voiceTranscript]);
 
@@ -101,12 +101,18 @@ export function ChatSidebar({ meetingId, isOpen, onClose, crossMeeting }: ChatSi
     }
   }
 
+  const [exportError, setExportError] = useState<string | null>(null);
+
   async function handleExport() {
     if (isExporting) return;
     setIsExporting(true);
+    setExportError(null);
     try {
       const response = await fetch(`/api/chat/${meetingId}/export`);
-      if (!response.ok) return;
+      if (!response.ok) {
+        setExportError("Export failed. Please try again.");
+        return;
+      }
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -117,7 +123,7 @@ export function ChatSidebar({ meetingId, isOpen, onClose, crossMeeting }: ChatSi
       link.remove();
       URL.revokeObjectURL(url);
     } catch {
-      // Download failed — user can retry
+      setExportError("Export failed. Please try again.");
     } finally {
       setIsExporting(false);
     }
@@ -202,6 +208,11 @@ export function ChatSidebar({ meetingId, isOpen, onClose, crossMeeting }: ChatSi
             {error ? (
               <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
                 {error}
+              </div>
+            ) : null}
+            {exportError ? (
+              <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {exportError}
               </div>
             ) : null}
             <div ref={scrollRef} />

@@ -66,7 +66,6 @@ async def execute_tool(
     if tool_name == "document_lookup" and rag_pipeline:
         try:
             query = str(tool_input.get("query", "")).strip()
-            chunks = rag_pipeline.hybrid_search(query=query, top_k=5)
             meeting_id_str = str(meeting_id) if meeting_id is not None else None
             agent_id_str = None
             if db is not None and meeting_id is not None:
@@ -78,16 +77,13 @@ async def execute_tool(
                 if agent_id is not None:
                     agent_id_str = str(agent_id)
 
-            if meeting_id_str is not None or agent_id_str is not None:
-                chunks = [
-                    chunk
-                    for chunk in chunks
-                    if chunk.get("metadata", {}).get("source_type") == "document"
-                    and (
-                        (meeting_id_str is not None and chunk.get("metadata", {}).get("meeting_id") == meeting_id_str)
-                        or (agent_id_str is not None and chunk.get("metadata", {}).get("agent_id") == agent_id_str)
-                    )
-                ]
+            where_filter: dict = {"source_type": "document"}
+            if agent_id_str:
+                where_filter = {"$and": [{"source_type": "document"}, {"agent_id": agent_id_str}]}
+            elif meeting_id_str:
+                where_filter = {"$and": [{"source_type": "document"}, {"meeting_id": meeting_id_str}]}
+
+            chunks = rag_pipeline.hybrid_search(query=query, top_k=5, where=where_filter)
             if not chunks:
                 return "No relevant document passages found."
 
@@ -106,9 +102,10 @@ async def execute_tool(
     if tool_name == "create_action_item":
         description = str(tool_input.get("description", "")).strip()
         assignee = str(tool_input.get("assignee", "")).strip()
-        result = f"Action item created: {description}"
+        result = f"Action item noted: {description}"
         if assignee:
             result += f" (assigned to {assignee})"
+        logger.info("Action item noted (not persisted): %s", description)
         return result
 
     return f"Unknown tool: {tool_name}"

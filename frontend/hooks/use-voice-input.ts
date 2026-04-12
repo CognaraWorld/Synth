@@ -38,7 +38,11 @@ export function useVoiceInput(): UseVoiceInputReturn {
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       const results = event.results;
       const last = results[results.length - 1];
-      setTranscript(last[0].transcript);
+      // Only update transcript on final (non-interim) results to avoid
+      // rapid re-renders and overwriting typed input
+      if (last.isFinal) {
+        setTranscript(last[0].transcript);
+      }
     };
 
     recognition.onspeechend = () => {

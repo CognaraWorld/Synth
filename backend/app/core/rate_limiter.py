@@ -17,13 +17,23 @@ _WINDOW_SECONDS = 60
 class InMemoryRateLimiter:
     """Sliding window rate limiter using in-memory dict. Single-process only."""
 
+    _MAX_BUCKETS = 10_000
+
     def __init__(self) -> None:
         self._buckets: dict[str, list[float]] = {}
         self._lock = asyncio.Lock()
+        self._last_cleanup: float = 0.0
 
     async def check(self, user_id: str) -> None:
         now = datetime.now(timezone.utc).timestamp()
         async with self._lock:
+            # Periodic cleanup: evict stale buckets every 5 minutes
+            if now - self._last_cleanup > 300 or len(self._buckets) > self._MAX_BUCKETS:
+                stale = [uid for uid, ts_list in self._buckets.items() if not ts_list or now - ts_list[-1] >= _WINDOW_SECONDS]
+                for uid in stale:
+                    del self._buckets[uid]
+                self._last_cleanup = now
+
             bucket = [timestamp for timestamp in self._buckets.get(user_id, []) if now - timestamp < _WINDOW_SECONDS]
             if len(bucket) >= _CHAT_RATE_LIMIT:
                 raise HTTPException(

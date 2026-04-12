@@ -103,9 +103,6 @@ class MeetingSession:
         # Screen capture manager — wired up by BotEngine after session creation
         self.screen_capture: "ScreenCaptureManager | None" = None
 
-        # Screen capture manager — wired up by BotEngine after session creation
-        self.screen_capture: "ScreenCaptureManager | None" = None
-
         # Bot ID assigned by Recall.ai after deployment
         self.bot_id: str | None = None
 

@@ -37,6 +37,8 @@ export function useChatInsights(meetingId: string | undefined, enabled: boolean)
           signal: controller.signal,
         });
         if (!response.ok) {
+          // Terminal state (400 = meeting not live) — stop reconnecting
+          if (response.status === 400) return;
           if (!controller.signal.aborted && retryCount < MAX_RETRIES) {
             setTimeout(() => connect(retryCount + 1), Math.min(1000 * 2 ** retryCount, 30000));
           }
@@ -53,9 +55,10 @@ export function useChatInsights(meetingId: string | undefined, enabled: boolean)
           }
         }
 
-        // Stream ended normally — reconnect after a short delay
-        if (!controller.signal.aborted) {
-          setTimeout(() => connect(0), 2000);
+        // Stream ended normally — reconnect, but increment retry count
+        // so we don't loop forever if the meeting has ended
+        if (!controller.signal.aborted && retryCount < MAX_RETRIES) {
+          setTimeout(() => connect(retryCount + 1), Math.min(2000 * 2 ** retryCount, 30000));
         }
       } catch {
         if (!controller.signal.aborted && retryCount < MAX_RETRIES) {
