@@ -95,6 +95,9 @@ export function useChat(meetingId: string, options?: { crossMeeting?: boolean })
         if (err instanceof DOMException && err.name === "AbortError") return;
         if (meetingIdRef.current !== meetingId) return;
         setHistoryLoaded(true);
+        setError(
+          err instanceof Error ? err.message : "Failed to load chat history.",
+        );
       });
 
     return () => controller.abort();

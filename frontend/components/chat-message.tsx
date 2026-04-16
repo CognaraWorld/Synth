@@ -27,27 +27,39 @@ function renderContent(content: string, onCitationClick?: CitationClickHandler):
     if (match[1]) {
       const timestamp = match[1];
       parts.push(
-        <Badge
+        <button
           key={match.index}
-          variant="secondary"
-          className="mx-0.5 cursor-pointer border-teal-300 bg-teal-50 px-1.5 py-0 text-[10px] font-medium text-teal-700 hover:bg-teal-100"
+          type="button"
           onClick={() => onCitationClick?.({ type: "transcript", timestamp })}
+          aria-label={`Jump to transcript at ${timestamp}`}
+          className="inline-flex"
         >
-          {timestamp}
-        </Badge>
+          <Badge
+            variant="secondary"
+            className="mx-0.5 cursor-pointer border-teal-300 bg-teal-50 px-1.5 py-0 text-[10px] font-medium text-teal-700 hover:bg-teal-100"
+          >
+            {timestamp}
+          </Badge>
+        </button>
       );
     } else if (match[2] && match[3]) {
       const filename = match[2].trim();
       const page = parseInt(match[3], 10);
       parts.push(
-        <Badge
+        <button
           key={match.index}
-          variant="secondary"
-          className="mx-0.5 cursor-pointer border-blue-300 bg-blue-50 px-1.5 py-0 text-[10px] font-medium text-blue-700 hover:bg-blue-100"
+          type="button"
           onClick={() => onCitationClick?.({ type: "document", filename, page })}
+          aria-label={`Open ${filename} page ${page}`}
+          className="inline-flex"
         >
-          {filename} p.{page}
-        </Badge>
+          <Badge
+            variant="secondary"
+            className="mx-0.5 cursor-pointer border-blue-300 bg-blue-50 px-1.5 py-0 text-[10px] font-medium text-blue-700 hover:bg-blue-100"
+          >
+            {filename} p.{page}
+          </Badge>
+        </button>
       );
     }
 
