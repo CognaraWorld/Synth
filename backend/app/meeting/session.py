@@ -112,6 +112,8 @@ class MeetingSession:
         # Operator steering controls (used by live control endpoints)
         self.operator_muted: bool = False
         self.output_stop_requested: bool = False
+        # Set by BotEngine.stop_meeting so in-flight Q&A can cancel search/stream.
+        self.session_end_requested: bool = False
         self.last_instruction_at: datetime | None = None
         self.operator_instructions: list[str] = []
 

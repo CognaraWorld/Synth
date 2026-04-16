@@ -77,6 +77,67 @@ def _build_pattern(wake_word: str) -> re.Pattern:
     return re.compile(rf"\b{escaped}\b", re.IGNORECASE)
 
 
+_DIRECTED_AT_OTHER_PATTERN = re.compile(
+    r"^(?:hey\s+)?(\w+)[,\s]+(?:what\s+do\s+you\s+think|can\s+you|could\s+you|"
+    r"would\s+you|do\s+you|your\s+(?:thoughts|opinion|take)|"
+    r"what(?:'s|\s+is)\s+your|tell\s+(?:us|me)|you\s+(?:want|think|agree))",
+    re.IGNORECASE,
+)
+
+_GENERIC_ADDRESSEES = frozenset({
+    "everyone", "guys", "team", "folks", "all", "people", "somebody", "someone",
+})
+_NON_NAME_ADDRESSEES = frozenset({
+    "what", "who", "where", "when", "why", "how", "which",
+})
+
+
+def is_directed_at_other(
+    text: str,
+    bot_names: tuple[str, ...] = (),
+    known_participants: frozenset[str] = frozenset(),
+) -> bool:
+    """Return True when the utterance is clearly addressed to another person.
+
+    Detects patterns like "John, what do you think?" or "Sarah, can you
+    explain?" and returns True so the bot stays silent. Returns False
+    (i.e. "might be for me") when:
+    - The addressee is the bot's own name
+    - The addressee is a generic group word ("everyone", "team")
+    - No directed-at pattern is found
+    """
+    stripped_text = text.strip()
+    match = _DIRECTED_AT_OTHER_PATTERN.match(stripped_text)
+    if not match:
+        return False
+
+    addressee = match.group(1).lower()
+
+    if addressee in _GENERIC_ADDRESSEES:
+        return False
+
+    if addressee in _NON_NAME_ADDRESSEES:
+        return False
+
+    for bot_name in bot_names:
+        if addressee == bot_name.lower() or addressee == bot_name.split()[0].lower():
+            return False
+
+    # If we know the meeting participants and the addressee matches one, it's
+    # directed at them, not the bot.
+    if known_participants:
+        for participant in known_participants:
+            if addressee == participant.lower() or addressee == participant.split()[0].lower():
+                return True
+
+    # Addressee is a proper name (capitalized in original text) — likely a person
+    original_addressee = stripped_text[match.start(1):match.end(1)]
+    if original_addressee and original_addressee[0].isupper():
+        return True
+
+    return False
+
+
 def detect(
     transcript_text: str,
     wake_word: str = "nova",

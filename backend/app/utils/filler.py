@@ -82,6 +82,26 @@ class FillerManager:
         phrases = CATEGORY_FILLERS.get(category, CATEGORY_FILLERS[QueryCategory.GENERAL])
         return random.choice(phrases)
 
+    def get_personalized_filler(self, category: QueryCategory, speaker: str) -> str:
+        """Return a filler phrase personalized with the speaker's name.
+
+        Produces natural acknowledgments like "Sure Yash, let me check."
+        so the bot feels conversational and human.
+        """
+        cleaned_speaker = (speaker or "").strip()
+        first_name = cleaned_speaker.split()[0] if cleaned_speaker else ""
+        if not first_name:
+            return self.get_filler_for_category(category)
+
+        templates = [
+            f"Sure {first_name}, let me check.",
+            f"Good question {first_name}, one sec.",
+            f"On it {first_name}.",
+            f"Let me look into that {first_name}.",
+            f"Hmm, give me a moment {first_name}.",
+        ]
+        return random.choice(templates)
+
     def get_filler_mp3_b64(self, category: QueryCategory, voice: str = "") -> str:
         """Return pre-synthesized base64 MP3 filler for a category.
 

@@ -147,14 +147,19 @@ class SummaryGenerator:
         self,
         transcript: str,
         llm_client: Any | None = None,
+        max_retries: int = 2,
     ) -> dict[str, Any]:
         """Generate a structured summary from a meeting transcript.
+
+        Retries on transient LLM failures before falling back to the
+        basic extractive summary.
 
         Args:
             transcript: The full meeting transcript text.
             llm_client: Optional LLM client instance. If provided, its
                 ``async_query`` method is used for summarization. Otherwise
                 a new ``LLMClient`` is created from settings.
+            max_retries: Number of retry attempts on LLM failure.
 
         Returns:
             Dictionary with keys:
@@ -166,26 +171,46 @@ class SummaryGenerator:
         if not transcript or not transcript.strip():
             return self._fallback_summary("")
 
-        # Attempt LLM-based summarization
-        try:
-            client = llm_client
-            if client is None:
+        client = llm_client
+        if client is None:
+            try:
                 client = LLMClient()
+            except Exception as exc:
+                logger.warning(
+                    "Could not construct LLM client for summary; using fallback: %s",
+                    exc,
+                )
+                return self._fallback_summary(transcript)
 
-            raw_response = await client.async_query(
-                context=transcript,
-                question="Summarize this meeting transcript.",
-                system_prompt=_SUMMARY_SYSTEM_PROMPT,
-            )
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                raw_response = await client.async_query(
+                    context=transcript,
+                    question="Summarize this meeting transcript.",
+                    system_prompt=_SUMMARY_SYSTEM_PROMPT,
+                )
+                result = self._parse_llm_response(raw_response, transcript)
+                key_points = result.get("key_points") or []
+                parse_failed = any(
+                    isinstance(point, str) and "LLM could not be reached" in point
+                    for point in key_points
+                )
+                if result.get("content") and not parse_failed:
+                    return result
+                raise ValueError("LLM returned unparseable summary")
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    import asyncio
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    logger.info("Retrying summary generation (attempt %d/%d)", attempt + 2, max_retries + 1)
 
-            return self._parse_llm_response(raw_response, transcript)
-
-        except Exception:
-            logger.warning(
-                "LLM summarization failed, falling back to basic summary",
-                exc_info=True,
-            )
-            return self._fallback_summary(transcript)
+        logger.warning(
+            "LLM summarization failed after %d attempts: %s",
+            max_retries + 1, last_exc,
+        )
+        return self._fallback_summary(transcript)
 
     def _parse_llm_response(
         self, raw: str, transcript: str
@@ -328,7 +353,7 @@ class SummaryGenerator:
         return bytes(pdf.output())
 
     @staticmethod
-    def _pdf_section(pdf: FPDF, title: str, body: str) -> None:
+    def _pdf_section(pdf: Any, title: str, body: str) -> None:
         """Render a titled text section in the PDF."""
         pdf.set_font("Helvetica", "B", 14)
         pdf.set_text_color(30, 30, 46)
@@ -344,7 +369,7 @@ class SummaryGenerator:
         pdf.ln(6)
 
     @staticmethod
-    def _pdf_list_section(pdf: FPDF, title: str, items: list[str]) -> None:
+    def _pdf_list_section(pdf: Any, title: str, items: list[str]) -> None:
         """Render a titled bullet-list section in the PDF."""
         pdf.set_font("Helvetica", "B", 14)
         pdf.set_text_color(30, 30, 46)

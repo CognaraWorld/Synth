@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.database import Meeting, User, AsyncSessionLocal
 from app.utils.bot_profiles import get_persona_tts_voice
+from app.utils import echo_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,8 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 
 # Singleton BotEngine — initialized on first webhook hit
 _bot_engine = None
-_greeted_bots: set[str] = set()  # bot_ids that have already been greeted
-_recent_bot_output: dict[str, list[str]] = {}  # bot_id -> recent bot output texts for echo detection
-_pending_hey: dict[str, float] = {}  # bot_id -> timestamp of isolated "Hey" chunk
+_greeted_bots: set[str] = set()
+_pending_hey: dict[str, float] = {}
 
 def get_bot_engine():
     """Get or create the shared BotEngine instance."""
@@ -51,14 +51,20 @@ def set_bot_engine(engine):
     _bot_engine = engine
 
 
-def cleanup_bot_tracking(bot_id: str) -> None:
-    """Remove per-bot tracking data when a meeting ends.
+def _log_task_failure(task: asyncio.Task, label: str) -> None:
+    """Emit full tracebacks for failed fire-and-forget webhook tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.error(label, exc_info=(type(exc), exc, exc.__traceback__))
 
-    Prevents unbounded growth of in-memory sets/dicts over time.
-    Called from _handle_status_change on terminal bot states.
-    """
+
+def cleanup_bot_tracking(bot_id: str) -> None:
+    """Remove per-bot tracking data when a meeting ends."""
     _greeted_bots.discard(bot_id)
-    _recent_bot_output.pop(bot_id, None)
+    echo_tracker.cleanup(bot_id)
     _pending_hey.pop(bot_id, None)
 
 
@@ -104,9 +110,7 @@ async def recall_webhook(request: Request):
         if event in ("transcript.data", "transcript.partial_data"):
             _task = asyncio.create_task(_bounded_handle_transcription(data))
             _task.add_done_callback(
-                lambda t: logger.error("Webhook transcript task failed: %s", t.exception())
-                if not t.cancelled() and t.exception()
-                else None
+                lambda t: _log_task_failure(t, "Webhook transcript task failed")
             )
             handled = True
         elif event.startswith("bot.") and "status" not in event:
@@ -115,7 +119,9 @@ async def recall_webhook(request: Request):
             handled = True
         elif "status" in event.lower():
             _task = asyncio.create_task(_bounded_handle_status_change(data))
-            _task.add_done_callback(lambda t: logger.error("Webhook status task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _task.add_done_callback(
+                lambda t: _log_task_failure(t, "Webhook status task failed")
+            )
             handled = True
         elif event == "video_separate_png.data":
             asyncio.create_task(_bounded_handle_video_frame(data))
@@ -128,7 +134,9 @@ async def recall_webhook(request: Request):
         # No event field — direct transcript webhook
         if "bot_id" in payload or "words" in payload or "text" in payload:
             _task = asyncio.create_task(_bounded_handle_transcription(payload))
-            _task.add_done_callback(lambda t: logger.error("Webhook task failed: %s", t.exception()) if not t.cancelled() and t.exception() else None)
+            _task.add_done_callback(
+                lambda t: _log_task_failure(t, "Webhook task failed")
+            )
 
     return {"status": "ok"}
 
@@ -231,26 +239,9 @@ async def _handle_transcription(data: dict) -> None:
             logger.debug("Ignoring bot's own transcript: %s", text[:80])
             return
 
-        # Text-based echo detection: check if this transcript matches recent bot output
-        # (Deepgram sometimes attributes bot speech to a real participant)
-        if bot_id and bot_id in _recent_bot_output:
-            recent_outputs = _recent_bot_output[bot_id]
-            text_lower = text.lower().strip()
-            for bot_text in recent_outputs:
-                bot_lower = bot_text.lower().strip()
-                # Check if the transcript is a substring of bot output or vice versa
-                if len(text_lower) > 10 and (text_lower in bot_lower or bot_lower in text_lower):
-                    logger.debug("Echo detected (text match): %s", text[:80])
-                    return
-                # Check word overlap — if >60% of words match, it's likely echo
-                if len(text_lower.split()) >= 3:
-                    text_words = set(text_lower.split())
-                    bot_words = set(bot_lower.split())
-                    overlap = len(text_words & bot_words)
-                    if overlap / len(text_words) > 0.6:
-                        logger.debug("Echo detected (word overlap %.0f%%): %s",
-                                    overlap / len(text_words) * 100, text[:80])
-                        return
+        if bot_id and echo_tracker.is_echo(bot_id, text):
+            logger.debug("Echo detected: %s", text[:80])
+            return
 
         # Split-chunk wake word merge: if previous chunk was just "Hey",
         # prepend it to this chunk so "Hey" + "Nova what time" becomes "Hey Nova what time"
@@ -329,64 +320,96 @@ async def _handle_status_change(data: dict) -> None:
         if not new_status:
             return
 
-        # Clean up in-memory tracking for terminal states to prevent
-        # unbounded memory growth over long-running server lifetimes
-        if new_status in ("ended", "failed") and bot_id:
+        transcript_text = ""
+        terminal_status = new_status in ("ended", "failed")
+        if terminal_status and bot_id:
             cleanup_bot_tracking(bot_id)
-
-            # Auto-stop the bot session in BotEngine
             try:
                 engine = get_bot_engine()
                 session_id = engine._sessions_by_bot_id.get(bot_id)
                 if session_id:
+                    transcript_text = engine.get_transcript_text(session_id)
                     await engine.stop_meeting(session_id)
             except Exception as exc:
                 logger.warning("Auto-stop on terminal status failed for bot %s: %s", bot_id[:8], exc)
 
         # Update meeting status in database
+        meeting_id_for_report = None
+        user_email_for_report = None
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Meeting).where(Meeting.bot_id == bot_id)
             )
             meeting = result.scalar_one_or_none()
-            if meeting and meeting.status != new_status:
-                meeting.status = new_status
+            if meeting:
+                meeting_changed = False
 
-                # Idempotent billing: atomic UPDATE with credits_used = 0 guard
-                # prevents double-deduct when both stop endpoint and webhook fire.
-                if new_status in ("ended", "failed") and meeting.started_at:
-                    now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    duration_seconds = (now - meeting.started_at).total_seconds()
-                    minutes_used = max(1, math.ceil(duration_seconds / 60))
+                # Persist the best transcript we have, even if another path
+                # already marked the meeting as ended before this webhook lands.
+                if terminal_status and transcript_text:
+                    existing_transcript = (meeting.transcript or "").strip()
+                    if len(transcript_text) > len(existing_transcript):
+                        meeting.transcript = transcript_text
+                        meeting_changed = True
 
-                    bill_result = await db.execute(
-                        update(Meeting)
-                        .where(Meeting.id == meeting.id, Meeting.credits_used == 0)
-                        .values(
-                            ended_at=now,
-                            duration_minutes=minutes_used,
-                            credits_used=minutes_used,
+                if meeting.status != new_status:
+                    meeting.status = new_status
+                    meeting_changed = True
+
+                    if terminal_status and meeting.started_at:
+                        now_utc = datetime.now(timezone.utc)
+                        started = meeting.started_at
+                        if getattr(started, "tzinfo", None) is None:
+                            started = started.replace(tzinfo=timezone.utc)
+                        duration_seconds = (now_utc - started).total_seconds()
+                        minutes_used = max(1, math.ceil(duration_seconds / 60))
+
+                        ended_at_naive = now_utc.replace(tzinfo=None)
+                        bill_result = await db.execute(
+                            update(Meeting)
+                            .where(Meeting.id == meeting.id, Meeting.credits_used == 0)
+                            .values(
+                                ended_at=ended_at_naive,
+                                duration_minutes=minutes_used,
+                                credits_used=minutes_used,
+                            )
                         )
+
+                        if bill_result.rowcount == 1:
+                            delta = minutes_used - 5
+                            await db.execute(
+                                update(User)
+                                .where(User.id == meeting.user_id)
+                                .values(credits=User.credits - delta)
+                            )
+                            logger.info(
+                                "Auto-billed %d minutes for meeting %s (bot %s)",
+                                minutes_used, meeting.id, bot_id[:8],
+                            )
+
+                if terminal_status:
+                    meeting_id_for_report = meeting.id
+                    user_result = await db.execute(
+                        select(User.email).where(User.id == meeting.user_id)
+                    )
+                    row = user_result.first()
+                    user_email_for_report = row[0] if row else None
+
+                if meeting_changed:
+                    await db.commit()
+                    logger.info(
+                        "Meeting %s synced to %s (bot %s)",
+                        meeting.id, new_status, bot_id[:8],
                     )
 
-                    if bill_result.rowcount == 1:
-                        # We won the race -- settle against the 5-min reserve
-                        delta = minutes_used - 5
-                        await db.execute(
-                            update(User)
-                            .where(User.id == meeting.user_id)
-                            .values(credits=User.credits - delta)
-                        )
-                        logger.info(
-                            "Auto-billed %d minutes for meeting %s (bot %s)",
-                            minutes_used, meeting.id, bot_id[:8],
-                        )
-
-                await db.commit()
-                logger.info(
-                    "Meeting %s status updated to %s (bot %s)",
-                    meeting.id, new_status, bot_id[:8],
-                )
+        # Auto-generate summary + report after the meeting ends
+        if meeting_id_for_report and user_email_for_report:
+            _task = asyncio.create_task(
+                _auto_finalize_report(meeting_id_for_report, user_email_for_report)
+            )
+            _task.add_done_callback(
+                lambda t: _log_task_failure(t, "Auto-report failed")
+            )
 
     except Exception as exc:
         logger.error("Error processing status webhook: %s", exc, exc_info=True)
@@ -488,14 +511,37 @@ async def _handle_screenshare_event(event: str, data: dict) -> None:
         logger.error("Error processing screenshare event: %s", exc, exc_info=True)
 
 
+async def _auto_finalize_report(meeting_id, user_email: str) -> None:
+    """Generate summary, PDF/DOCX, and email after a meeting ends.
+
+    Runs as a fire-and-forget background task triggered by the terminal
+    status webhook. Uses the reporting pipeline which handles idempotent
+    summary creation, export, and email delivery.
+    """
+    try:
+        from app.meeting.reporting import finalize_meeting_artifacts_for_meeting_id
+        settings = get_settings()
+        await finalize_meeting_artifacts_for_meeting_id(
+            meeting_id=meeting_id,
+            user_email=user_email,
+            settings=settings,
+        )
+        logger.info("Auto-finalized report for meeting %s", meeting_id)
+    except Exception:
+        logger.exception("Auto-report finalization failed for meeting %s", meeting_id)
+
+
 async def _send_greeting(bot_id: str) -> None:
-    """Send an intro greeting immediately when the bot joins the call."""
+    """Send an intro greeting when the bot joins, then go silent.
+
+    The bot greets participants with its name and wake phrase, then
+    stays quiet until someone invokes the wake word. This matches
+    the "join, greet, then mute" product spec.
+    """
     try:
         engine = get_bot_engine()
-        # Use centralized model initialization (thread-safe, double-checked)
         await engine._lazy_load_models()
 
-        # Pull agent name, wake word, and persona from the session config
         session_id = engine._sessions_by_bot_id.get(bot_id)
         session = engine.sessions.get(session_id) if session_id else None
         agent_name = "your AI assistant"
@@ -506,12 +552,13 @@ async def _send_greeting(bot_id: str) -> None:
             if name:
                 agent_name = name
             ww = session.agent_config.get("wake_word", "nova")
-            wake_phrase = ww.title()
+            wake_phrase = f"Hey {ww.title()}"
             persona_id = session.agent_config.get("persona_id", "general")
 
         greeting = (
-            f"Hi everyone, I'm {agent_name} for this meeting. "
-            f"Ask me anything by saying {wake_phrase} followed by your question."
+            f"Hey everyone! I'm {agent_name}, here to help during this meeting. "
+            f"Just say {wake_phrase} whenever you have a question, and I'll jump in. "
+            f"I'll be on mute until then."
         )
         async with engine._tts_lock:
             if not engine._tts:
@@ -532,8 +579,7 @@ async def _send_greeting(bot_id: str) -> None:
             audio = engine._tts.synthesize(greeting)
         if audio:
             await engine._recall_client.send_audio(bot_id, audio)
-            # Track greeting text for echo detection
-            _recent_bot_output.setdefault(bot_id, []).append(greeting.lower())
-            logger.info("Greeting sent for bot %s", bot_id[:8])
+            _echo_mod.record(bot_id, greeting)
+            logger.info("Greeting sent for bot %s — going silent", bot_id[:8])
     except Exception as exc:
         logger.warning("Failed to send greeting: %s", exc)

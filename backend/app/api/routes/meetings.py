@@ -354,9 +354,10 @@ async def stop_meeting(
     # Stop via BotEngine (flushes RAG, cleans up session, stops Recall bot)
     engine = get_bot_engine()
     session_id = engine._sessions_by_bot_id.get(meeting.bot_id) if meeting.bot_id else None
+    stop_result = None
     if session_id:
         try:
-            await engine.stop_meeting(session_id)
+            stop_result = await engine.stop_meeting(session_id)
         except Exception as exc:
             logger.warning("BotEngine stop failed: %s", exc)
     elif meeting.bot_id:
@@ -368,6 +369,13 @@ async def stop_meeting(
             logger.warning("Failed to stop bot %s: %s", meeting.bot_id, exc)
         finally:
             await recall.close()
+
+    transcript_text = ""
+    if isinstance(stop_result, dict):
+        transcript_text = (stop_result.get("transcript") or "").strip()
+    existing_transcript = (getattr(meeting, "transcript", None) or "").strip()
+    if transcript_text and len(transcript_text) > len(existing_transcript):
+        meeting.transcript = transcript_text
 
     # Calculate actual minutes used
     now = datetime.now(timezone.utc).replace(tzinfo=None)

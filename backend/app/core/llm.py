@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS = 2.0
+_GEMINI_SYNC_WORKER_MAX_WORKERS = 4
+_GEMINI_SYNC_ORPHAN_THRESHOLD = 3
 
 try:
     import anthropic
@@ -34,6 +41,14 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def _first_name_or_empty(speaker: str) -> str:
+    """Return the speaker's first token, tolerating blank/whitespace names."""
+    cleaned = (speaker or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned.split()[0]
+
+
 class LLMClient:
     """Hybrid LLM client: Gemini Flash (fast) with Claude Haiku (fallback).
 
@@ -45,6 +60,9 @@ class LLMClient:
     def __init__(self, claude_model: str = "claude-haiku-4-5-20251001") -> None:
         self.settings = get_settings()
         self.claude_model = claude_model
+        self._gemini_stream_executor: ThreadPoolExecutor | None = None
+        self._gemini_stream_state_lock = threading.Lock()
+        self._gemini_stream_orphans = 0
 
         # Claude setup (fallback + heavy tasks)
         self.claude_client = None
@@ -55,10 +73,44 @@ class LLMClient:
 
         # Gemini setup (primary fast path)
         self.gemini_client = None
+        self._gemini_async_client = None
         self._gemini_model = "gemini-2.5-flash-lite"
         if genai and self.settings.gemini_api_key:
             self.gemini_client = genai.Client(api_key=self.settings.gemini_api_key)
+            try:
+                self._gemini_async_client = genai.Client(
+                    api_key=self.settings.gemini_api_key,
+                ).aio
+            except Exception:
+                self._gemini_async_client = None
             logger.info("Gemini 2.5 Flash Lite configured as primary LLM")
+
+    def _get_gemini_stream_executor(self) -> ThreadPoolExecutor:
+        """Create the sync Gemini bridge executor on demand."""
+        executor = self._gemini_stream_executor
+        if executor is not None:
+            return executor
+        with self._gemini_stream_state_lock:
+            executor = self._gemini_stream_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=_GEMINI_SYNC_WORKER_MAX_WORKERS,
+                    thread_name_prefix="gemini-sync-stream",
+                )
+                self._gemini_stream_executor = executor
+        return executor
+
+    def _should_refuse_gemini_sync_stream(self) -> bool:
+        """Return True when too many blocked Gemini workers are already pinned."""
+        with self._gemini_stream_state_lock:
+            orphan_count = self._gemini_stream_orphans
+        if orphan_count >= _GEMINI_SYNC_ORPHAN_THRESHOLD:
+            logger.warning(
+                "Gemini sync bridge disabled: %d orphaned workers still pinned",
+                orphan_count,
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Primary query — tries Gemini first, falls back to Claude
@@ -69,13 +121,23 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        speaker_instruction = ""
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally "
+                f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
+                f"Don't force their name into every sentence — use it once or twice at most. "
+            )
         user_content = (
             f"A meeting participant just asked you this question:\n"
             f"\"{question}\"\n\n"
-            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
-            f"Do NOT say who asked it. Just give the answer. "
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
             f"Here is the meeting context you can reference:\n{context}"
@@ -111,27 +173,35 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
     ) -> str:
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        speaker_instruction = ""
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally "
+                f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
+                f"Don't force their name into every sentence — use it once or twice at most. "
+            )
         user_content = (
             f"A meeting participant just asked you this question:\n"
             f"\"{question}\"\n\n"
-            f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
-            f"Do NOT say who asked it. Just give the answer. "
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
             f"Here is the meeting context you can reference:\n{context}"
         )
 
-        # Try Gemini first (run sync SDK in executor with timeout)
+        # Try Gemini first — native async when available, executor fallback
         if self.gemini_client:
             try:
-                loop = asyncio.get_running_loop()
                 start = time.time()
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        lambda: self.gemini_client.models.generate_content(
+                if self._gemini_async_client:
+                    response = await asyncio.wait_for(
+                        self._gemini_async_client.models.generate_content(
                             model=self._gemini_model,
                             contents=user_content,
                             config={
@@ -140,9 +210,25 @@ class LLMClient:
                                 "temperature": 0.7,
                             },
                         ),
-                    ),
-                    timeout=30.0,
-                )
+                        timeout=30.0,
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: self.gemini_client.models.generate_content(
+                                model=self._gemini_model,
+                                contents=user_content,
+                                config={
+                                    "system_instruction": prompt,
+                                    "max_output_tokens": 1024,
+                                    "temperature": 0.7,
+                                },
+                            ),
+                        ),
+                        timeout=30.0,
+                    )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
                 text = response.text
@@ -252,13 +338,85 @@ class LLMClient:
         context: str,
         question: str,
         system_prompt: str | None = None,
+        speaker: str = "",
+        should_cancel: Callable[[], bool] | None = None,
     ):
-        """Stream a response from Claude, yielding complete sentences."""
-        if self._claude_async is None:
-            raise RuntimeError("Claude SDK not configured for streaming.")
+        """Stream a response yielding complete sentences.
 
+        Tries Gemini streaming first (lower latency), falls back to
+        Claude streaming. Each yielded chunk is a full sentence suitable
+        for immediate TTS synthesis.
+
+        Args:
+            should_cancel: If set, called frequently; when it returns True,
+                the provider stream is stopped cooperatively (best-effort).
+        """
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
-        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        speaker_instruction = ""
+        first_name = _first_name_or_empty(speaker)
+        if first_name:
+            speaker_instruction = (
+                f"{first_name} asked this question. You may address them by name naturally. "
+            )
+        user_content = (
+            f"A meeting participant just asked you this question:\n"
+            f"\"{question}\"\n\n"
+            f"{speaker_instruction}"
+            f"Answer the question directly. Do NOT repeat or summarize the question. "
+            f"Keep it concise and conversational — you are speaking aloud in a meeting. "
+            f"Combine information from ALL available sources.\n\n"
+            f"Context:\n{context}"
+        )
+
+        # Try Gemini native async streaming first (no executor bridge)
+        if self._gemini_async_client:
+            try:
+                start = time.time()
+                yielded = False
+                async for sentence in self._gemini_stream_native_async(
+                    prompt, user_content, should_cancel=should_cancel,
+                ):
+                    yielded = True
+                    yield sentence
+                if should_cancel and should_cancel() and not yielded:
+                    logger.debug(
+                        "Gemini async stream emitted no sentences (cancelled or empty response)",
+                    )
+                    return
+                if yielded:
+                    logger.info(
+                        "Gemini async stream completed in %.0fms",
+                        (time.time() - start) * 1000,
+                    )
+                    return
+            except Exception as exc:
+                logger.warning("Gemini async stream failed, trying sync bridge: %s", exc)
+
+        # Sync Gemini client streaming via executor queue (fallback)
+        if self.gemini_client:
+            try:
+                start = time.time()
+                yielded = False
+                async for sentence in self._gemini_stream(
+                    prompt, user_content, should_cancel=should_cancel,
+                ):
+                    yielded = True
+                    yield sentence
+                if should_cancel and should_cancel() and not yielded:
+                    logger.debug(
+                        "Gemini sync stream emitted no sentences (cancelled or empty response)",
+                    )
+                    return
+                if yielded:
+                    logger.info("Gemini stream completed in %.0fms", (time.time() - start) * 1000)
+                    return
+            except Exception as exc:
+                logger.warning("Gemini stream failed, falling back to Claude: %s", exc)
+
+        # Fallback to Claude streaming
+        if self._claude_async is None:
+            yield "I'm having trouble processing right now. Please try again."
+            return
 
         buffer = ""
         async with self._claude_async.messages.stream(
@@ -267,7 +425,12 @@ class LLMClient:
             system=prompt,
             messages=[{"role": "user", "content": user_content}],
         ) as stream:
+            cancelled = False
             async for text in stream.text_stream:
+                if should_cancel and should_cancel():
+                    logger.debug("Claude stream cancelled by caller")
+                    cancelled = True
+                    break
                 buffer += text
                 while True:
                     best = -1
@@ -282,8 +445,193 @@ class LLMClient:
                     if sentence:
                         yield sentence
 
-        if buffer.strip():
+        if not cancelled and buffer.strip():
             yield buffer.strip()
+
+    async def _gemini_stream_native_async(
+        self,
+        system_prompt: str,
+        user_content: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Stream sentences from Gemini using the async client (true async I/O)."""
+        if not self._gemini_async_client:
+            return
+        stream = self._gemini_async_client.models.generate_content_stream(
+            model=self._gemini_model,
+            contents=user_content,
+            config={
+                "system_instruction": system_prompt,
+                "max_output_tokens": 1024,
+                "temperature": 0.7,
+            },
+        )
+        buffer = ""
+        cancelled = False
+        async for chunk in stream:
+            if should_cancel and should_cancel():
+                logger.debug("Gemini async stream cancelled by caller")
+                cancelled = True
+                break
+            piece = getattr(chunk, "text", None) or ""
+            if not piece:
+                continue
+            buffer += piece
+            while True:
+                best = -1
+                for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                    idx = buffer.find(sep)
+                    if idx != -1 and (best == -1 or idx < best):
+                        best = idx + len(sep)
+                if best == -1:
+                    break
+                sentence = buffer[:best].strip()
+                buffer = buffer[best:]
+                if sentence:
+                    yield sentence
+        if not cancelled and buffer.strip():
+            yield buffer.strip()
+
+    async def _gemini_stream(
+        self,
+        system_prompt: str,
+        user_content: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Stream sentences from Gemini, yielding complete sentences.
+
+        Bridges the sync Gemini SDK to async via a thread executor and
+        an asyncio.Queue. Sentinel errors are propagated after draining
+        any partial content so callers get whatever was generated.
+
+        When *should_cancel* is set, the blocking iterator in the worker
+        thread stops pulling from Gemini as soon as the flag is set.
+        """
+        if self._should_refuse_gemini_sync_stream():
+            raise RuntimeError("Gemini sync bridge unavailable while orphaned workers recover")
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stream_error: list[Exception] = []
+        stop_worker = threading.Event()
+        worker_done = threading.Event()
+        worker_marked_orphan = False
+
+        def _mark_worker_orphan(reason: str) -> None:
+            nonlocal worker_marked_orphan
+            if worker_done.is_set():
+                return
+            with self._gemini_stream_state_lock:
+                if worker_done.is_set() or worker_marked_orphan:
+                    return
+                worker_marked_orphan = True
+                self._gemini_stream_orphans += 1
+                orphan_count = self._gemini_stream_orphans
+            logger.warning(
+                "Gemini sync worker still blocked after %s; orphan count=%d",
+                reason,
+                orphan_count,
+            )
+
+        def _run_gemini_stream() -> None:
+            nonlocal worker_marked_orphan
+            try:
+                response = self.gemini_client.models.generate_content_stream(
+                    model=self._gemini_model,
+                    contents=user_content,
+                    config={
+                        "system_instruction": system_prompt,
+                        "max_output_tokens": 1024,
+                        "temperature": 0.7,
+                    },
+                )
+                for chunk in response:
+                    if stop_worker.is_set():
+                        break
+                    if chunk.text:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+            except Exception as exc:
+                stream_error.append(exc)
+            finally:
+                with self._gemini_stream_state_lock:
+                    if worker_marked_orphan and self._gemini_stream_orphans > 0:
+                        self._gemini_stream_orphans -= 1
+                        orphan_count = self._gemini_stream_orphans
+                        worker_marked_orphan = False
+                        logger.info(
+                            "Gemini sync worker recovered; orphan count=%d",
+                            orphan_count,
+                        )
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+                worker_done.set()
+
+        executor = self._get_gemini_stream_executor()
+        worker_future: Future[None] = executor.submit(_run_gemini_stream)
+        task = asyncio.wrap_future(worker_future)
+
+        async def _drain_worker_after_stop(reason: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                if worker_future.cancel():
+                    logger.warning(
+                        "Gemini sync worker was still queued after %s; cancelled before start",
+                        reason,
+                    )
+                    return
+                _mark_worker_orphan(reason)
+            except Exception:
+                pass
+
+        def _schedule_worker_drain(reason: str) -> None:
+            asyncio.create_task(_drain_worker_after_stop(reason))
+
+        buffer = ""
+        cancelled = False
+        try:
+            while True:
+                try:
+                    token = await asyncio.wait_for(queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    if should_cancel and should_cancel():
+                        stop_worker.set()
+                        cancelled = True
+                        break
+                    continue
+                if token is None:
+                    break
+                buffer += token
+                while True:
+                    best = -1
+                    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+                        idx = buffer.find(sep)
+                        if idx != -1 and (best == -1 or idx < best):
+                            best = idx + len(sep)
+                    if best == -1:
+                        break
+                    sentence = buffer[:best].strip()
+                    buffer = buffer[best:]
+                    if sentence:
+                        yield sentence
+        except asyncio.CancelledError:
+            stop_worker.set()
+            _schedule_worker_drain("caller cancellation")
+            raise
+
+        if not cancelled and buffer.strip():
+            yield buffer.strip()
+
+        if cancelled:
+            await _drain_worker_after_stop("cancellation")
+            return
+
+        await task
+
+        if stream_error:
+            raise stream_error[0]
 
     async def multi_turn_query(
         self,
@@ -320,7 +668,10 @@ class LLMClient:
             )
             return response.content[0].text if response.content else ""
         except Exception as exc:
-            logger.warning("Multi-turn Claude query failed: %s, falling back to single-turn", exc)
+            logger.warning(
+                "Multi-turn Claude query failed: %s, falling back to single-turn",
+                exc,
+            )
             return await self.async_query(context, question, system_prompt)
 
     async def tool_use_query(

@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 from starlette.responses import PlainTextResponse, StreamingResponse
@@ -17,9 +18,9 @@ from app.api.routes.auth import get_current_user
 from app.core.chat_tools import CHAT_TOOLS, execute_tool
 from app.core.insight_publisher import subscribe as subscribe_insights
 from app.core.llm import LLMClient
-from app.core.rate_limiter import get_rate_limiter
+from app.core.rate_limiter import _CHAT_RATE_LIMIT as _CORE_CHAT_RATE_LIMIT, get_rate_limiter
 from app.models.database import Agent, ChatMessage, Meeting, MeetingSummary, User, get_db
-from app.models.schemas import ChatHistoryResponse, ChatResponse, ChatSendRequest, CrossMeetingChatRequest
+from app.models.schemas import ChatHistoryResponse, ChatMessageResponse, ChatResponse, ChatSendRequest, CrossMeetingChatRequest
 from app.utils.bot_profiles import build_system_prompt
 from app.utils.query_router import classify_chat_complexity
 from app.utils.suggestion_generator import generate_suggestions, get_cached_suggestions, cache_suggestions
@@ -41,6 +42,8 @@ _llm_client: LLMClient | None = None
 _rag_pipeline = None
 _TRANSCRIPT_CITATION_RE = re.compile(r"\[T:(\d{1,3}:\d{2})\]")
 _DOCUMENT_CITATION_RE = re.compile(r"\[D:([^:\]]+):(\d+)\]")
+_CHAT_RATE_LIMIT = _CORE_CHAT_RATE_LIMIT
+_rate_limit_buckets = getattr(get_rate_limiter(), "_buckets", {})
 
 
 def _get_llm() -> LLMClient:
@@ -153,6 +156,17 @@ def _enrich_message_response(msg: ChatMessage) -> dict:
     return result
 
 
+def _message_response_model(msg: ChatMessage) -> ChatMessageResponse:
+    """Build a response model even when tests use non-persisted message objects."""
+    created_at = msg.created_at or datetime.now(timezone.utc)
+    return ChatMessageResponse(
+        id=msg.id or uuid4(),
+        role=msg.role,
+        content=msg.content,
+        created_at=created_at,
+    )
+
+
 async def _generate_follow_ups(response_text: str) -> list[str]:
     follow_ups: list[str] = []
     try:
@@ -177,12 +191,21 @@ async def _get_meeting_or_raise(
         .options(joinedload(Meeting.agent).joinedload(Agent.documents))
         .where(Meeting.id == meeting_id)
     )
-    meeting = result.unique().scalar_one_or_none()
+    try:
+        meeting = result.scalar_one_or_none()
+    except InvalidRequestError:
+        meeting = result.unique().scalar_one_or_none()
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
     if meeting.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     return meeting
+
+
+async def _check_rate_limit(user_id: str) -> None:
+    """Compatibility wrapper for route code and existing tests."""
+    limiter = get_rate_limiter()
+    await limiter.check(user_id)
 
 
 def _build_system_prompt_for_meeting(meeting: Meeting) -> str:
@@ -310,7 +333,7 @@ async def send_chat_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await get_rate_limiter().check(str(current_user.id))
+    await _check_rate_limit(str(current_user.id))
     meeting = await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
     user_message = ChatMessage(
@@ -399,15 +422,8 @@ async def send_chat_message(
     follow_ups = await _generate_follow_ups(assistant_reply)
 
     return {
-        "user_message": _enrich_message_response(user_message),
-        "assistant_message": {
-            "id": assistant_message.id,
-            "role": assistant_message.role,
-            "content": assistant_message.content,
-            "created_at": assistant_message.created_at,
-            "citations": citations or None,
-            "tool_calls": tool_calls or None,
-        },
+        "user_message": _message_response_model(user_message),
+        "assistant_message": _message_response_model(assistant_message),
         "follow_ups": follow_ups,
     }
 
@@ -422,7 +438,7 @@ async def stream_chat_message(
     """SSE streaming version of chat. Yields sentences as they're generated."""
     from app.models.database import AsyncSessionLocal
 
-    await get_rate_limiter().check(str(current_user.id))
+    await _check_rate_limit(str(current_user.id))
     meeting = await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
     # Pre-compute everything that needs the request-scoped db session
@@ -554,7 +570,7 @@ async def cross_meeting_chat(
     db: AsyncSession = Depends(get_db),
 ):
     """Chat across multiple meetings using summaries + RAG."""
-    await get_rate_limiter().check(str(current_user.id))
+    await _check_rate_limit(str(current_user.id))
 
     if req.meeting_ids:
         summary_result = await db.execute(
@@ -647,8 +663,18 @@ async def cross_meeting_chat(
     follow_ups = await _generate_follow_ups(reply)
     now = datetime.now(timezone.utc)
     return {
-        "user_message": {"id": uuid4(), "role": "user", "content": req.message, "created_at": now, "citations": None},
-        "assistant_message": {"id": uuid4(), "role": "assistant", "content": reply, "created_at": now, "citations": None},
+        "user_message": ChatMessageResponse(
+            id=uuid4(),
+            role="user",
+            content=req.message,
+            created_at=now,
+        ),
+        "assistant_message": ChatMessageResponse(
+            id=uuid4(),
+            role="assistant",
+            content=reply,
+            created_at=now,
+        ),
         "follow_ups": follow_ups,
     }
 

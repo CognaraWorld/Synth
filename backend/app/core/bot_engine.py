@@ -15,10 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-import numpy as np
-
 from app.config import get_settings
-from app.context.manager import ContextManager
 from app.core.llm import LLMClient
 from app.core.search import SearchClient
 from app.meeting.recall_client import RecallClient, RecallClientError
@@ -27,7 +24,10 @@ from app.utils.bot_profiles import get_persona_tts_voice
 from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_prompt_for_mode, resolve_persona_id
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
-from app.utils.wake_word import detect as detect_wake_word
+from app.utils.meeting_metrics import QuestionStageTimer
+from app.utils.followup_markers import has_coherence_marker
+from app.utils.tts_chunks import split_text_for_tts
+from app.utils.wake_word import detect as detect_wake_word, is_directed_at_other
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,6 @@ _CORRECTION_TRIGGERS = (
     "is that", "are you sure", "double check", "double-check",
     "actually", "really", "correction",
 )
-
 
 def _log_task_exception(task: asyncio.Task) -> None:
     """Log unhandled exceptions from fire-and-forget background tasks."""
@@ -97,7 +96,6 @@ class BotEngine:
         self._tts_lock: asyncio.Lock = asyncio.Lock()  # serializes TTS voice switch + synthesis across sessions
         self._recovery_lock_by_bot_id: dict[str, asyncio.Lock] = {}  # bot_id -> lock
 
-        # Lightweight services — safe to initialize at startup
         self._settings = get_settings()
         self._recall_client: RecallClient = RecallClient()
         self._llm_client: LLMClient = LLMClient()
@@ -110,13 +108,10 @@ class BotEngine:
         self._models_loaded: bool = False
         self._model_init_lock: asyncio.Lock = asyncio.Lock()
 
-        # Per-session VAD instances (Silero VAD is stateful, cannot be shared)
+        # Per-session TTS instances so parallel meetings don't serialize
+        self._session_tts: dict[str, Any] = {}
+
         self._vad_instances: dict[str, Any] = {}
-
-        # Per-session audio accumulators: session_id -> list of np arrays
-        self._audio_buffers: dict[str, list[np.ndarray]] = {}
-
-        # Per-session sentiment tracking
         self._last_sentiment: dict[str, str] = {}
 
     # ------------------------------------------------------------------
@@ -136,6 +131,34 @@ class BotEngine:
             self._interrupted[session_id] = False
         if session_id not in self._queued_question:
             self._queued_question[session_id] = {}
+
+    async def _wait_for_processing_drain(self, session_id: str) -> None:
+        """Block cleanup until any in-flight question handler finishes."""
+        lock = self._processing_lock.get(session_id)
+        if lock is None:
+            return
+        async with lock:
+            return
+
+    def _cleanup_session_tracking(self, session: MeetingSession) -> None:
+        """Drop per-session caches only after question handling has drained."""
+        session_id = session.session_id
+        vad = self._vad_instances.pop(session_id, None)
+        if vad is not None:
+            vad.reset()
+        self.sessions.pop(session_id, None)
+        self._last_response_time.pop(session_id, None)
+        self._last_speaker.pop(session_id, None)
+        self._followup_speakers.pop(session_id, None)
+        self._pending_question.pop(session_id, None)
+        self._queued_question.pop(session_id, None)
+        self._interrupted.pop(session_id, None)
+        self._processing_lock.pop(session_id, None)
+        self._last_sentiment.pop(session_id, None)
+        self._session_tts.pop(session_id, None)
+        if session.bot_id:
+            self._sessions_by_bot_id.pop(session.bot_id, None)
+            self._recovery_lock_by_bot_id.pop(session.bot_id, None)
 
     def wire_screen_capture(self, session: MeetingSession) -> None:
         """Attach a ScreenCaptureManager to a session."""
@@ -322,7 +345,6 @@ class BotEngine:
             # Store the session and populate all per-session tracking dicts
             self.sessions[session.session_id] = session
             self._sessions_by_bot_id[bot_id] = session.session_id
-            self._audio_buffers[session.session_id] = []
             self._ensure_session_tracking(session.session_id)
 
             # Create a dedicated VAD instance for this session
@@ -368,6 +390,7 @@ class BotEngine:
             SessionNotFoundError: If session_id is not found.
         """
         session = self._get_session(session_id)
+        session.session_end_requested = True
 
         # Transition to ENDED
         try:
@@ -382,6 +405,10 @@ class BotEngine:
         # Disconnect the Recall.ai bot
         if session.bot_id:
             await self._recall_client.stop_bot(session.bot_id)
+
+        # Let any in-flight question handler observe session_end_requested
+        # and release the per-session lock before we remove shared state.
+        await self._wait_for_processing_drain(session_id)
 
         # Collect transcript data before flushing
         full_transcript = session.context_manager.raw_buffer.get_full_text()
@@ -401,23 +428,7 @@ class BotEngine:
             )
             _task.add_done_callback(_log_task_exception)
 
-        # Clean up all session resources
-        vad = self._vad_instances.pop(session_id, None)
-        if vad is not None:
-            vad.reset()
-        self.sessions.pop(session_id, None)
-        self._audio_buffers.pop(session_id, None)
-        self._last_response_time.pop(session_id, None)
-        self._last_speaker.pop(session_id, None)
-        self._followup_speakers.pop(session_id, None)
-        self._pending_question.pop(session_id, None)
-        self._queued_question.pop(session_id, None)
-        self._interrupted.pop(session_id, None)
-        self._processing_lock.pop(session_id, None)
-        self._last_sentiment.pop(session_id, None)
-        if session.bot_id:
-            self._sessions_by_bot_id.pop(session.bot_id, None)
-            self._recovery_lock_by_bot_id.pop(session.bot_id, None)
+        self._cleanup_session_tracking(session)
 
         logger.info(
             "Session %s ended (duration=%.1fs)",
@@ -515,120 +526,92 @@ class BotEngine:
         self._tts.voice = target_voice
         self._filler_manager.preload(self._tts)
 
-    # ------------------------------------------------------------------
-    # Audio processing pipeline
-    # ------------------------------------------------------------------
+    def _get_session_tts(self, session_id: str, persona_id: str | None = None) -> Any | None:
+        """Get or create a per-session TTS instance.
 
-    async def process_audio_chunk(
-        self,
-        session_id: str,
-        audio_chunk: np.ndarray,
-    ) -> bytes | None:
-        """Process an incoming audio chunk through the full pipeline.
-
-        Pipeline stages:
-        1. VAD — detect whether speech is present
-        2. If speech detected, accumulate audio frames
-        3. When speech ends, transcribe accumulated audio via STT
-        4. Check transcript for wake word
-        5. If wake word found:
-           a. Assemble context from transcript + RAG + documents
-           b. Optionally augment with web search results
-           c. Send filler audio for latency masking
-           d. Query LLM for response
-           e. Synthesize response via TTS
-           f. Return audio bytes to send into the meeting
-
-        Args:
-            session_id: The active session ID.
-            audio_chunk: Raw audio samples as a numpy array
-                (float32, mono, 16kHz). Expected frame size is 512 samples.
-
-        Returns:
-            Audio response bytes (PCM) if the bot should speak,
-            or ``None`` if no response is needed for this chunk.
-
-        Raises:
-            SessionNotFoundError: If session_id is not found.
+        Each session gets its own Kokoro pipeline so parallel meetings
+        don't serialize on a single TTS lock. Falls back to the shared
+        instance if per-session creation fails. Returns ``None`` only
+        if no TTS is available at all.
         """
-        session = self._get_session(session_id)
+        tts = self._session_tts.get(session_id)
+        if tts is not None:
+            target_voice = get_persona_tts_voice(persona_id)
+            if tts.voice != target_voice:
+                tts.voice = target_voice
+            return tts
 
-        if not session.is_active:
-            return None
+        try:
+            from app.core.tts import TextToSpeech
+            voice = get_persona_tts_voice(persona_id)
+            tts = TextToSpeech(voice=voice, sample_rate=24000, speed=1.1)
+            if tts._pipeline is None:
+                raise RuntimeError("Kokoro pipeline failed to initialize")
+            self._session_tts[session_id] = tts
+            return tts
+        except Exception as exc:
+            logger.warning(
+                "Per-session TTS init failed for session %s; using shared TTS: %s",
+                session_id[:8],
+                exc,
+            )
+            return self._tts
 
-        if self._stt is None or self._tts is None:
-            logger.error("Models not loaded — cannot process audio")
-            return None
-
-        vad = self._vad_instances.get(session_id)
-        if vad is None:
-            logger.error("No VAD instance for session %s", session_id)
-            return None
-
-        buffer = self._audio_buffers.get(session_id, [])
-
-        # Step 1: Run VAD on the audio frame
-        speech_detected = vad.process_audio_frame(audio_chunk)
-
-        if speech_detected:
-            # Step 2: Accumulate speech frames
-            buffer.append(audio_chunk)
-            self._audio_buffers[session_id] = buffer
-            return None
-
-        # Speech not detected — check if we just finished a speech segment
-        if not buffer:
-            # No accumulated speech — nothing to process
-            return None
-
-        # Step 3: Speech ended — transcribe the accumulated audio
-        speech_audio = np.concatenate(buffer)
-        self._audio_buffers[session_id] = []  # Reset buffer
-
-        # Minimum audio length check (ignore very short segments < 0.3s)
-        min_samples = int(0.15 * 16000)
-        if len(speech_audio) < min_samples:
-            return None
-
-        segment = self._stt.transcribe(speech_audio)
-        transcript_text = segment.text.strip()
-
-        if not transcript_text:
-            return None
-
-        # Feed transcript into the context manager with speaker label
-        labeled = f"Participant: {transcript_text}"
-        session.context_manager.add_transcript(labeled)
-
-        logger.debug(
-            "Session %s transcribed: %s (confidence=%.2f)",
-            session_id,
-            transcript_text[:80],
-            segment.confidence,
+    def _should_cancel_output(self, session: MeetingSession) -> bool:
+        """Return True when current output should stop immediately."""
+        sid = session.session_id
+        return (
+            session.session_end_requested
+            or session.output_stop_requested
+            or self._interrupted.get(sid, False)
         )
 
-        # Step 4: Check for wake word (configurable per agent)
-        wake_word = session.agent_config.get("wake_word", "nova")
-        wake_detected, question = detect_wake_word(transcript_text, wake_word=wake_word)
-        if not wake_detected or not question:
-            return None
+    async def _synthesize_tts_audio(
+        self,
+        tts: Any,
+        text: str,
+        persona_id: str | None = None,
+    ) -> bytes:
+        """Synthesize audio, serializing access when using the shared TTS."""
+        loop = asyncio.get_running_loop()
+        if tts is self._tts:
+            async with self._tts_lock:
+                self._ensure_tts_voice_for_persona(persona_id)
+                return await loop.run_in_executor(None, tts.synthesize, text)
+        return await loop.run_in_executor(None, tts.synthesize, text)
 
-        if session.operator_muted:
-            logger.info(
-                "Wake word ignored due to operator mute for session %s",
-                session.session_id[:8],
-            )
-            return None
+    @staticmethod
+    def _enqueue_playback_chunk(
+        total_playback: float,
+        playback_started_at: float | None,
+        audio_bytes: bytes,
+        *,
+        sample_rate: int = 24000,
+        now: float | None = None,
+    ) -> tuple[float, float | None]:
+        """Track queued playback from the moment audio is first sent."""
+        if not audio_bytes:
+            return total_playback, playback_started_at
 
-        logger.warning("WAKE WORD DETECTED session=%s question=%s", session_id, question)
+        if playback_started_at is None:
+            playback_started_at = time.time() if now is None else now
 
-        # Step 5: Process the question (acquire lock to prevent concurrent handling)
-        lock = self._processing_lock.get(session_id)
-        if lock is None:
-            self._ensure_session_tracking(session_id)
-            lock = self._processing_lock[session_id]
-        async with lock:
-            return await self._handle_question(session, question)
+        chunk_duration = len(audio_bytes) / (sample_rate * 2)
+        return total_playback + chunk_duration, playback_started_at
+
+    @staticmethod
+    def _remaining_playback_time(
+        total_playback: float,
+        playback_started_at: float | None,
+        *,
+        now: float | None = None,
+    ) -> float:
+        """Return queued playback time still expected to be audible."""
+        if playback_started_at is None or total_playback <= 0:
+            return 0.0
+
+        current_time = time.time() if now is None else now
+        return max(0.0, total_playback - (current_time - playback_started_at))
 
     async def _recover_session(self, bot_id: str) -> MeetingSession | None:
         """Recover a session for a bot_id by looking up the meeting in the DB."""
@@ -706,7 +689,6 @@ class BotEngine:
                 # Load past meeting summaries for cross-meeting memory
                 try:
                     from sqlalchemy.orm import joinedload
-                    from app.models.database import MeetingSummary
                     past_result = await db.execute(
                         select(Meeting)
                         .options(joinedload(Meeting.summary))
@@ -743,7 +725,6 @@ class BotEngine:
 
                 self.sessions[session.session_id] = session
                 self._sessions_by_bot_id[bot_id] = session.session_id
-                self._audio_buffers[session.session_id] = []
                 self._ensure_session_tracking(session.session_id)
 
                 from app.core.vad import VoiceActivityDetector
@@ -905,20 +886,34 @@ class BotEngine:
                     self._followup_speakers.pop(sid, None)
                 return
 
-            # Reject incoherent fragments — follow-ups must look like real sentences
-            # (contain a verb, question word, or common conversational pattern)
-            text_lower = text.lower().strip()
-            _COHERENCE_MARKERS = (
-                "what", "who", "where", "when", "why", "how",
-                "can", "could", "would", "should", "will", "do", "does", "did",
-                "is", "are", "was", "were", "have", "has",
-                "tell", "explain", "show", "give", "find", "search",
-                "yes", "no", "yeah", "okay", "sure",
-                "thank", "stop", "enough",
-                "about", "think", "know", "remember", "mean",
-                "?",
-            )
-            if not any(marker in text_lower for marker in _COHERENCE_MARKERS):
+            # Skip if the utterance is clearly directed at another participant
+            bot_name = session.agent_config.get("agent_name", "Synth")
+            wake_word_cfg = session.agent_config.get("wake_word", "nova")
+            known_people = frozenset(session.context_manager._entities.get("people", set()))
+            if is_directed_at_other(
+                text,
+                bot_names=(bot_name, wake_word_cfg),
+                known_participants=known_people,
+            ):
+                logger.debug("Follow-up directed at another person, ignoring: %s", text[:60])
+                return
+
+            has_marker = has_coherence_marker(text)
+
+            # Semantic check: does this follow-up share topic words with
+            # the bot's last response? Catches "tell me more about Delhi"
+            # after the bot discussed Delhi restaurants.
+            has_topic_overlap = False
+            if not has_marker:
+                recent_bot = session.context_manager.raw_buffer.get_recent(minutes=1)
+                if recent_bot:
+                    bot_words = set(w.lower() for w in recent_bot.split() if len(w) > 4)
+                    user_words = set(w.lower() for w in text.split() if len(w) > 4)
+                    overlap = bot_words & user_words
+                    if len(overlap) >= 1:
+                        has_topic_overlap = True
+
+            if not has_marker and not has_topic_overlap:
                 logger.debug("Dropping incoherent follow-up: %s", text[:60])
                 return
 
@@ -960,13 +955,10 @@ class BotEngine:
             "timestamp": now,
         }
 
-        # If the question is already substantial (4+ words), process immediately
-        # instead of waiting for collect time — feels much more responsive
         if len(question.split()) >= 4:
             _task = asyncio.create_task(self._process_pending_question(session))
             _task.add_done_callback(_log_task_exception)
         else:
-            # Short question — wait for more words
             _task = asyncio.create_task(self._wait_and_process(session, now))
             _task.add_done_callback(_log_task_exception)
 
@@ -1004,17 +996,15 @@ class BotEngine:
 
         logger.warning("QUESTION session=%s speaker=%s question=%s", sid[:8], speaker, question)
 
-        # Load TTS lazily if not loaded (use centralized init)
         await self._lazy_load_models()
 
-        # Acquire the per-session lock to serialize question processing
         lock = self._processing_lock.get(sid)
         if lock is None:
             self._ensure_session_tracking(sid)
             lock = self._processing_lock[sid]
 
         async with lock:
-            await self._handle_question(session, question)
+            await self._handle_question(session, question, speaker=speaker)
 
     async def _check_insight(self, session: MeetingSession, speaker: str, text: str) -> None:
         """Background task: verify a factual claim and store correction if wrong."""
@@ -1038,15 +1028,18 @@ class BotEngine:
         self,
         session: MeetingSession,
         question: str,
+        speaker: str = "",
     ) -> bytes | None:
         """Handle a detected question end-to-end.
 
         Assembles context, optionally searches the web, queries the LLM,
-        and synthesizes the response as audio.
+        and synthesizes the response as audio. When *speaker* is provided,
+        the filler and LLM response are personalized with their name.
 
         Args:
             session: The active MeetingSession.
             question: The extracted question text after the wake word.
+            speaker: Name of the participant who asked (for personalization).
 
         Returns:
             Synthesized audio bytes for the response, or ``None`` on error.
@@ -1061,25 +1054,45 @@ class BotEngine:
             return None
 
         try:
-            self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
-            # Classify question and send context-aware filler immediately
+            timer = QuestionStageTimer(session.session_id, question)
             from app.utils.query_router import classify_query, needs_web_search
             category = classify_query(question)
             filler_duration = 0.0
             if session.bot_id:
                 persona_voice = get_persona_tts_voice(session.agent_config.get("persona_id"))
+
+                # Speaker-personalized filler: "Sure Yash, let me check."
                 filler_phrase = self._filler_manager.get_filler_for_category(category)
-                filler_pcm = self._filler_manager.get_filler_audio(category, voice=persona_voice)
-                filler_b64 = self._filler_manager.get_filler_mp3_b64(category, voice=persona_voice)
+                if speaker:
+                    filler_phrase = self._filler_manager.get_personalized_filler(
+                        category, speaker,
+                    )
+
+                # Try pre-cached audio first, fall back to live synthesis for personalized fillers
+                filler_pcm = b""
+                filler_b64 = ""
+                if not speaker:
+                    filler_pcm = self._filler_manager.get_filler_audio(category, voice=persona_voice)
+                    filler_b64 = self._filler_manager.get_filler_mp3_b64(category, voice=persona_voice)
+
+                if not filler_b64 and self._tts:
+                    async with self._tts_lock:
+                        self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
+                        loop = asyncio.get_running_loop()
+                        filler_pcm = await loop.run_in_executor(
+                            None, self._tts.synthesize, filler_phrase,
+                        )
+                    if filler_pcm:
+                        filler_b64 = self._recall_client.pcm_to_mp3_b64(filler_pcm)
+
                 if filler_b64:
                     await self._recall_client.send_audio_b64(session.bot_id, filler_b64)
-                    # Track filler for echo detection
-                    from app.api.routes.webhook import _recent_bot_output
-                    _recent_bot_output.setdefault(session.bot_id, []).append(filler_phrase.lower())
-                    # Calculate filler duration (PCM int16 @ 24kHz = 48000 bytes/sec)
+                    from app.utils.echo_tracker import record as _echo_record
+                    _echo_record(session.bot_id, filler_phrase)
                     if filler_pcm:
                         filler_duration = len(filler_pcm) / 48000
             filler_sent_at = time.time()
+            timer.mark("filler_sent")
 
             # Rewrite the question with recent conversation context so both
             # RAG search and web search include the right topic keywords.
@@ -1113,6 +1126,24 @@ class BotEngine:
                 )
 
             context = await context_task
+            timer.mark("context_ready")
+
+            if self._should_cancel_output(session):
+                if search_task is not None and not search_task.done():
+                    search_task.cancel()
+                    try:
+                        await search_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                try:
+                    session.transition(SessionState.LISTENING)
+                except ValueError:
+                    pass
+                timer.mark("aborted_session_end")
+                timer.log_summary({"aborted": True})
+                return None
 
             if session.operator_instructions:
                 recent_instructions = session.operator_instructions[-3:]
@@ -1157,36 +1188,111 @@ class BotEngine:
                 except Exception as exc:
                     logger.debug("Speculative search failed (non-blocking): %s", exc)
 
-            # Single LLM call with full context + search results (30s timeout)
+            timer.mark("search_phase_done")
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
 
+            # Wait for filler to finish playing before first sentence
+            elapsed = time.time() - filler_sent_at
+            remaining = filler_duration - elapsed
+            if remaining > 0 and not self._should_cancel_output(session):
+                await asyncio.sleep(remaining)
+            timer.mark("pre_llm_stream")
+
+            # --- Streaming pipeline: LLM sentence -> TTS -> send audio ---
+            # Each sentence is synthesized and sent as soon as it arrives
+            # from the LLM, cutting perceived latency by 60-70%.
+            response_parts: list[str] = []
+            total_playback = 0.0
+            playback_started_at: float | None = None
+            stream_timed_out = False
+
             try:
-                response_text = await asyncio.wait_for(
-                    self._llm_client.async_query(
+                async with asyncio.timeout(30.0):
+                    async for sentence in self._llm_client.async_query_stream(
                         context=context,
                         question=question,
                         system_prompt=system_prompt,
-                    ),
-                    timeout=30.0,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("LLM timed out after 30s for session %s", session.session_id[:8])
-                response_text = "I'm taking too long to think about that. Could you ask again?"
+                        speaker=speaker,
+                        should_cancel=lambda: self._should_cancel_output(session),
+                    ):
+                        if self._should_cancel_output(session):
+                            logger.info(
+                                "Output cancelled — stopping LLM stream for %s",
+                                session.session_id[:8],
+                            )
+                            if session.bot_id:
+                                await self._recall_client.stop_audio(session.bot_id)
+                            break
 
-            # Skip non-answers
-            cleaned = response_text.strip().strip("()[]").lower()
-            if not cleaned or cleaned in ("silence", "silent", "..."):
-                logger.info("LLM returned silence for session %s — skipping TTS", session.session_id[:8])
+                        cleaned = sentence.strip().strip("()[]").lower()
+                        if not cleaned or cleaned in ("silence", "silent", "..."):
+                            continue
+
+                        response_parts.append(sentence)
+
+                        session_tts = self._get_session_tts(
+                            session.session_id,
+                            session.agent_config.get("persona_id"),
+                        )
+                        if session_tts is None:
+                            logger.error("No TTS available for session %s", session.session_id[:8])
+                            continue
+                        for tts_piece in split_text_for_tts(sentence):
+                            if self._should_cancel_output(session):
+                                break
+                            sentence_audio = await self._synthesize_tts_audio(
+                                session_tts,
+                                tts_piece,
+                                session.agent_config.get("persona_id"),
+                            )
+                            if session.bot_id and sentence_audio:
+                                await self._recall_client.send_audio(session.bot_id, sentence_audio)
+                                total_playback, playback_started_at = self._enqueue_playback_chunk(
+                                    total_playback,
+                                    playback_started_at,
+                                    sentence_audio,
+                                )
+
+            except TimeoutError:
+                stream_timed_out = True
+                timer.mark("stream_timeout")
+                logger.warning("LLM stream timed out after 30s for session %s", session.session_id[:8])
+                if not response_parts:
+                    fallback = "I'm taking too long to think about that. Could you ask again?"
+                    response_parts.append(fallback)
+                    session_tts = self._get_session_tts(
+                        session.session_id,
+                        session.agent_config.get("persona_id"),
+                    )
+                    if session_tts and session.bot_id:
+                        fallback_audio = await self._synthesize_tts_audio(
+                            session_tts,
+                            fallback,
+                            session.agent_config.get("persona_id"),
+                        )
+                        if fallback_audio:
+                            await self._recall_client.send_audio(session.bot_id, fallback_audio)
+                            total_playback, playback_started_at = self._enqueue_playback_chunk(
+                                total_playback,
+                                playback_started_at,
+                                fallback_audio,
+                            )
+
+            response_text = " ".join(response_parts)
+
+            if not response_text.strip():
+                logger.info("LLM returned nothing for session %s — skipping", session.session_id[:8])
                 try:
                     session.transition(SessionState.LISTENING)
                 except ValueError:
                     pass
+                timer.mark("pipeline_done")
+                timer.log_summary({"sentences": 0, "empty": True, "stream_timeout": stream_timed_out})
                 return None
 
-            # Check if interrupted while LLM was generating
-            if self._interrupted.get(session.session_id, False):
-                logger.info("Bot interrupted during LLM — going silent for session %s", session.session_id[:8])
+            # Log interrupted partial responses for context
+            if self._interrupted.get(session.session_id, False) and response_parts:
                 partial = (
                     f"[Assistant was answering \"{question}\" and said: "
                     f"\"{response_text.strip()}\" before being interrupted]"
@@ -1196,66 +1302,38 @@ class BotEngine:
 
             if response_text:
                 logger.warning(
-                    "RESPONSE session=%s (%d chars): %s",
-                    session.session_id,
+                    "RESPONSE session=%s (%d chars, streamed): %s",
+                    session.session_id[:8],
                     len(response_text),
                     response_text[:100],
                 )
 
-                # Synthesize in thread executor to avoid blocking the event loop
-                # (Kokoro TTS is CPU-bound). Hold TTS lock for voice switch + synthesis.
-                async with self._tts_lock:
-                    self._ensure_tts_voice_for_persona(session.agent_config.get("persona_id"))
-                    loop = asyncio.get_running_loop()
-                    response_audio = await loop.run_in_executor(
-                        None, self._tts.synthesize, response_text
-                    )
-                if session.bot_id and response_audio:
-                    # Wait for filler to finish playing
-                    elapsed = time.time() - filler_sent_at
-                    remaining = filler_duration - elapsed
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                    await self._recall_client.send_audio(session.bot_id, response_audio)
-                    logger.warning("Audio sent to bot %s", session.bot_id[:8])
-
-                    # Stay in RESPONDING during playback so interruptions work.
-                    # PCM int16 at 24kHz = 48000 bytes per second.
-                    playback_duration = (
-                        len(response_audio) / (24000 * 2)
-                        if response_audio
-                        else len(response_text) / 15
-                    )
-                    playback_start = time.time()
-
-                    # Poll for interruption during playback
-                    while time.time() - playback_start < playback_duration:
-                        if self._interrupted.get(session.session_id, False):
-                            logger.info("Interrupted during playback — stopping audio for session %s", session.session_id[:8])
+                # Wait for remaining playback to finish (interruption check)
+                playback_remaining = self._remaining_playback_time(
+                    total_playback,
+                    playback_started_at,
+                )
+                while playback_remaining > 0:
+                    if self._should_cancel_output(session):
+                        logger.info("Interrupted during playback — stopping for session %s", session.session_id[:8])
+                        if session.bot_id:
                             await self._recall_client.stop_audio(session.bot_id)
-                            partial = (
-                                f"[Assistant was answering \"{question}\" and said: "
-                                f"\"{response_text.strip()}\" before being interrupted]"
-                            )
-                            session.context_manager.add_transcript(partial)
-                            break
-                        await asyncio.sleep(0.3)  # check every 300ms
+                        break
+                    await asyncio.sleep(min(0.3, playback_remaining))
+                    playback_remaining = self._remaining_playback_time(
+                        total_playback,
+                        playback_started_at,
+                    )
 
-            # Store bot's response in transcript buffer so follow-up
-            # questions have full conversational context (Q + A).
             if response_text:
                 bot_name = session.agent_config.get("agent_name", "Nova")
                 session.context_manager.add_transcript(
                     f"{bot_name}: {response_text.strip()}"
                 )
 
-            # Track response text for echo detection
             if response_text:
-                from app.api.routes.webhook import _recent_bot_output
-                echoes = _recent_bot_output.setdefault(session.bot_id, [])
-                echoes.append(response_text.lower())
-                if len(echoes) > 5:
-                    _recent_bot_output[session.bot_id] = echoes[-5:]
+                from app.utils.echo_tracker import record as _echo_record
+                _echo_record(session.bot_id, response_text)
 
             # Reset follow-up speaker tracking for new window
             self._followup_speakers.pop(session.session_id, None)
@@ -1290,6 +1368,15 @@ class BotEngine:
                 elif was_interrupted:
                     logger.info("Participant interrupted without wake word — staying silent for session %s", session.session_id[:8])
 
+            timer.mark("pipeline_done")
+            timer.log_summary(
+                {
+                    "sentences": len(response_parts),
+                    "stream_timeout": stream_timed_out,
+                    "session_end": session.session_end_requested,
+                    "cancelled": was_interrupted or session.session_end_requested,
+                },
+            )
             return None  # Audio already sent via streaming
 
         except Exception as exc:

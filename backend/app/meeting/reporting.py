@@ -116,8 +116,28 @@ async def finalize_meeting_artifacts(
     generator = generator or SummaryGenerator()
     sender = sender or EmailSender()
 
+    existing = meeting.summary
+    if existing is not None and existing.email_delivery_status == "sent":
+        pdf_ok = bool(existing.pdf_path) and Path(existing.pdf_path).is_file()
+        docx_ok = bool(existing.docx_path) and Path(existing.docx_path).is_file()
+        if pdf_ok and docx_ok:
+            logger.info(
+                "Meeting %s report already finalized and emailed; skipping duplicate run",
+                meeting.id,
+            )
+            usage_record = await upsert_usage_record(db=db, meeting=meeting)
+            await db.flush()
+            return existing, usage_record
+
     meeting_info = build_meeting_info(meeting)
-    summary_payload = await generator.generate(meeting.transcript or "")
+
+    # Use the best available transcript source: DB field first, then
+    # check if the meeting summary already has content from the rolling
+    # summary (saved by BotEngine.stop_meeting).
+    transcript_source = (meeting.transcript or "").strip()
+    if not transcript_source and meeting.summary and meeting.summary.content:
+        transcript_source = meeting.summary.content
+    summary_payload = await generator.generate(transcript_source)
 
     summary_dir = Path(settings.summary_dir).resolve()
     pdf_path, docx_path, pdf_bytes, docx_bytes = await anyio.to_thread.run_sync(

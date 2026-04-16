@@ -261,6 +261,17 @@ class TestFillerManager:
         assert isinstance(manager._cache, dict)
         assert isinstance(manager._mp3_cache, dict)
 
+    def test_personalized_filler_handles_whitespace_only_speaker(self) -> None:
+        from app.utils.filler import FillerManager
+        from app.utils.query_router import QueryCategory
+
+        manager = FillerManager()
+
+        result = manager.get_personalized_filler(QueryCategory.GENERAL, "   ")
+
+        assert isinstance(result, str)
+        assert result
+
 
 # ---------------------------------------------------------------------------
 # Integration Tests (require ML models -- slow)

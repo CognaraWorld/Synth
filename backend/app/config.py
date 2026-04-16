@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -10,6 +10,15 @@ class Settings(BaseSettings):
 
     # Environment: "development" or "production"
     environment: str = "development"
+
+    # When True, GET /api/health/meeting-latency exposes in-process p50/p95 (lock down in prod)
+    expose_meeting_latency_metrics: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "expose_meeting_latency_metrics",
+            "EXPOSE_MEETING_LATENCY_METRICS",
+        ),
+    )
 
     # Auth
     secret_key: str = "change-me-in-production"
@@ -61,9 +70,6 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     frontend_success_url: str = "http://localhost:3000/dashboard/settings?payment=success"
     frontend_cancel_url: str = "http://localhost:3000/dashboard/settings?payment=cancelled"
-
-    # Gemini (screen content extraction)
-    gemini_api_key: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
