@@ -1,6 +1,5 @@
 import { getBackendToken } from "@/lib/auth/session";
 import { backendGet, backendPut } from "@/lib/backend-client";
-import { sampleBotProfile } from "@/lib/sample-data";
 import {
   type BackendBotProfileResponse,
   type BackendDocumentResponse,
@@ -24,40 +23,28 @@ async function loadBotProfileWithDocuments(token: string) {
 
 export async function getBotProfile() {
   const token = await getBackendToken();
-  if (!token) return sampleBotProfile;
-
-  try {
-    return await loadBotProfileWithDocuments(token);
-  } catch (err) {
-    console.error("[bot-profile] getBotProfile failed:", err);
-    return sampleBotProfile;
+  if (!token) {
+    throw new Error("Not authenticated");
   }
+  return loadBotProfileWithDocuments(token);
 }
 
 export async function upsertBotProfile(input: unknown) {
   const payload = botProfileSchema.parse(input);
   const token = await getBackendToken();
-
   if (!token) {
-    return { ...sampleBotProfile, ...payload, updatedAt: new Date().toISOString() };
+    throw new Error("Not authenticated");
   }
-
-  try {
-    const bot = await backendPut<BackendBotProfileResponse>(
-      "/api/bot/profile",
-      transformBotProfileForUpsert(payload),
-      token
-    );
-    const documents = await backendGet<BackendDocumentResponse[]>(`/api/documents/${bot.id}`, token).catch(
-      () => []
-    );
-
-    return {
-      ...transformBotProfile(bot),
-      documents: documents.map(transformDocument)
-    };
-  } catch (err) {
-    console.error("[bot-profile] upsertBotProfile failed:", err);
-    return { ...sampleBotProfile, ...payload, updatedAt: new Date().toISOString() };
-  }
+  const bot = await backendPut<BackendBotProfileResponse>(
+    "/api/bot/profile",
+    transformBotProfileForUpsert(payload),
+    token
+  );
+  const documents = await backendGet<BackendDocumentResponse[]>(`/api/documents/${bot.id}`, token).catch(
+    () => []
+  );
+  return {
+    ...transformBotProfile(bot),
+    documents: documents.map(transformDocument)
+  };
 }

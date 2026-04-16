@@ -1,5 +1,4 @@
-import Link from "next/link";
-import { CalendarClock, ExternalLink, Settings2 } from "lucide-react";
+import { CalendarClock, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -35,10 +34,6 @@ export function MeetingCard({ meeting, compact = false }: MeetingCardProps) {
               Join
               <ExternalLink className="h-4 w-4" />
             </a>
-          </Button>
-          <Button variant="outline" className="flex-1 sm:flex-none">
-            <Settings2 className="h-4 w-4" />
-            Edit settings
           </Button>
         </div>
       </CardContent>

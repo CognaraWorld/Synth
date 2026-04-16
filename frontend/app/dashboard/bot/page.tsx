@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, type ChangeEvent } from "react";
 import { Save, Upload, Trash2, FileText } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useBotProfile } from "@/hooks/use-bot-profile";
 import { PageHeader } from "@/components/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,11 +26,15 @@ const PERSONA_DESCRIPTIONS: Record<string, string> = {
 
 export default function BotPage() {
   const { data: bot, isLoading, updateBotProfile, isSaving } = useBotProfile();
+  const queryClient = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
   const [voice, setVoice] = useState<VoiceOption>("FEMALE");
   const [responseMode, setResponseMode] = useState<ResponseMode>("WAKE_WORD_ONLY");
   const [saved, setSaved] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (bot) {
@@ -44,6 +49,40 @@ export default function BotPage() {
     await updateBotProfile({ name, persona, voice, responseMode });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+  }
+
+  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setUploadError(null);
+    setUploading(true);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch("/api/upload", {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? "Upload failed");
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["bot-profile"] });
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : "Upload failed");
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
   }
 
   if (isLoading) {
@@ -153,13 +192,27 @@ export default function BotPage() {
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle>Global Documents</CardTitle>
-              <Button variant="outline" size="sm">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.docx,.txt"
+                className="hidden"
+                onChange={handleFileChange}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+              >
                 <Upload className="h-4 w-4" />
-                Upload
+                {uploading ? "Uploading..." : "Upload"}
               </Button>
             </div>
           </CardHeader>
           <CardContent>
+            {uploadError ? <p className="mb-4 text-sm text-destructive">{uploadError}</p> : null}
             {bot?.documents && bot.documents.length > 0 ? (
               <div className="space-y-3">
                 {bot.documents.map((doc) => (
