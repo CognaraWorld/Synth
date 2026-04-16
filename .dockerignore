@@ -1,0 +1,53 @@
+# VCS + editor / IDE cruft
+.git
+.gitignore
+.github
+.vscode
+.idea
+.claude
+.codex
+*.swp
+
+# Local Python bytecode + venvs
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+backend/.venv
+backend/venv
+
+# Node — we don't ship the frontend in the backend image
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/dist
+
+# Local DB state, logs, and uploads — runtime-only
+backend/chroma_data
+backend/uploads
+backend/summaries
+backend/*.log
+backend/.env
+backend/.env.*
+
+# Audit + plan artefacts (repo-only)
+AUDIT-REPORT-*.md
+AUDIT-WORKPLAN.md
+tasks/
+
+# Docs + top-level markdown — not needed in the runtime image
+README.md
+CLAUDE.md
+AGENTS.md
+CONTRIBUTING.md
+
+# Test artifacts
+**/coverage.xml
+**/.coverage
+**/htmlcov
+
+# OS junk
+.DS_Store
+Thumbs.db
