@@ -269,6 +269,24 @@ export function useChat(meetingId: string, options?: { crossMeeting?: boolean })
             }
           }
 
+          if (controller.signal.aborted) {
+            setMessages((current) =>
+              current.filter((message) => message.id !== tempUserId && message.id !== streamingId)
+            );
+
+            try {
+              const resyncController = new AbortController();
+              resyncAbortRef.current = resyncController;
+              const history = await loadHistory(currentMeetingId, resyncController.signal);
+              if (meetingIdRef.current === currentMeetingId && !resyncController.signal.aborted) {
+                setMessages(history);
+              }
+            } catch {
+              // Ignore sync failure after an abort.
+            }
+            return;
+          }
+
           if (!completed && !controller.signal.aborted) {
             throw new Error("Stream ended unexpectedly.");
           }
