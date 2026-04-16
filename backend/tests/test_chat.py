@@ -211,14 +211,14 @@ class TestChatHistory:
         # _get_meeting_or_raise
         meeting_result = MagicMock()
         meeting_result.scalar_one_or_none.return_value = meeting
-        # count
-        count_result = MagicMock()
-        count_result.scalar.return_value = 60
-        # messages (DESC order from DB)
+        # Combined window-function query: rows expose both the ChatMessage
+        # and a total column. The endpoint reads total from the first row.
         messages_result = MagicMock()
-        messages_result.scalars.return_value.all.return_value = newest_50_desc
+        messages_result.all.return_value = [
+            MagicMock(ChatMessage=msg, total=60) for msg in newest_50_desc
+        ]
 
-        db.execute.side_effect = [meeting_result, count_result, messages_result]
+        db.execute.side_effect = [meeting_result, messages_result]
 
         result = await get_chat_history(
             meeting_id=meeting.id,
@@ -232,6 +232,8 @@ class TestChatHistory:
         # Messages should be in chronological order (oldest first) after reversal
         assert result.messages[0].content == "Message 10"
         assert result.messages[-1].content == "Message 59"
+        # One round-trip each for the ownership check and the page fetch.
+        assert db.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_history_respects_before_parameter(self) -> None:
@@ -244,11 +246,10 @@ class TestChatHistory:
         db = AsyncMock()
         meeting_result = MagicMock()
         meeting_result.scalar_one_or_none.return_value = meeting
-        count_result = MagicMock()
-        count_result.scalar.return_value = 10
+        # Empty page still needs to return total=0 via window-function path.
         messages_result = MagicMock()
-        messages_result.scalars.return_value.all.return_value = []
-        db.execute.side_effect = [meeting_result, count_result, messages_result]
+        messages_result.all.return_value = []
+        db.execute.side_effect = [meeting_result, messages_result]
 
         cutoff = datetime(2026, 4, 6, 12, 0, 0, tzinfo=timezone.utc)
         result = await get_chat_history(
@@ -260,8 +261,9 @@ class TestChatHistory:
         )
 
         # Verify the query was called (the before filter is applied via SQLAlchemy)
-        assert db.execute.call_count == 3
-        assert result.total == 10
+        assert db.execute.call_count == 2
+        # No rows → total defaults to 0.
+        assert result.total == 0
 
 
 class TestRateLimit:

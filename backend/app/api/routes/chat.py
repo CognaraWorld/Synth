@@ -147,8 +147,15 @@ def _enrich_message_response(msg: ChatMessage) -> dict:
             meta = _json.loads(msg.message_metadata)
             result["citations"] = meta.get("citations")
             result["tool_calls"] = meta.get("tool_calls")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Citations will silently disappear if this fires repeatedly
+            # for valid messages — surface it at debug level so we can tell
+            # corrupt-data cases apart from "message has no metadata".
+            logger.debug(
+                "Failed to parse message_metadata for msg %s: %s",
+                getattr(msg, "id", "?"),
+                exc,
+            )
     elif msg.role == "assistant":
         citations = _parse_citations(msg.content)
         if citations:
@@ -357,6 +364,7 @@ async def send_chat_message(
     tool_calls: list[dict] = []
     use_tools = _should_use_tools(req.message)
 
+    search_client = None
     try:
         if use_tools:
             from app.core.search import SearchClient
@@ -401,6 +409,14 @@ async def send_chat_message(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="AI service temporarily unavailable. Please try again.",
         )
+    finally:
+        # SearchClient owns an httpx.AsyncClient — a per-request leak here
+        # eventually exhausts the default connection pool under load.
+        if search_client is not None:
+            try:
+                await search_client.close()
+            except Exception:
+                logger.debug("SearchClient close failed", exc_info=True)
 
     citations = _parse_citations(assistant_reply)
     metadata: dict[str, object] = {}
@@ -469,6 +485,7 @@ async def stream_chat_message(
         tool_calls: list[dict] = []
         complexity = classify_chat_complexity(req.message)
         use_tools = _should_use_tools(req.message)
+        search_client = None
         try:
             if use_tools:
                 from app.core.search import SearchClient
@@ -520,6 +537,14 @@ async def stream_chat_message(
                 f"data: {_json.dumps({'type': 'error', 'content': 'AI service temporarily unavailable.'})}\n\n"
             )
             return
+        finally:
+            # SearchClient owns an httpx.AsyncClient — per-stream leaks exhaust
+            # the default connection pool if left dangling.
+            if search_client is not None:
+                try:
+                    await search_client.close()
+                except Exception:
+                    logger.debug("SearchClient close failed", exc_info=True)
 
         # Use a dedicated session for the post-stream DB write so we don't
         # depend on the request-scoped session that may already be closed.
@@ -694,12 +719,11 @@ async def get_chat_history(
     """
     await _get_meeting_or_raise(meeting_id=meeting_id, current_user=current_user, db=db)
 
-    count_result = await db.execute(
-        select(func.count(ChatMessage.id)).where(ChatMessage.meeting_id == meeting_id)
-    )
-    total = count_result.scalar() or 0
-
-    query = select(ChatMessage).where(ChatMessage.meeting_id == meeting_id)
+    # Single round-trip: use COUNT(*) OVER() as a window function alongside
+    # the page fetch. Previous version ran COUNT(*) and SELECT as two
+    # separate queries on every history page load.
+    total_col = func.count().over().label("total")
+    query = select(ChatMessage, total_col).where(ChatMessage.meeting_id == meeting_id)
 
     if before is not None:
         # Normalize tz-aware to naive UTC for DB comparison
@@ -707,10 +731,12 @@ async def get_chat_history(
             before = before.astimezone(timezone.utc).replace(tzinfo=None)
         query = query.where(ChatMessage.created_at < before)
 
-    # Fetch newest N by DESC then reverse for chronological render
     query = query.order_by(ChatMessage.created_at.desc()).limit(per_page)
     result = await db.execute(query)
-    messages = list(reversed(result.scalars().all()))
+    rows = result.all()
+    total = rows[0].total if rows else 0
+    # Fetch newest N by DESC then reverse for chronological render
+    messages = list(reversed([row.ChatMessage for row in rows]))
 
     return ChatHistoryResponse(
         messages=[_enrich_message_response(message) for message in messages],
