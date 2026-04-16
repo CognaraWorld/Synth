@@ -25,6 +25,7 @@ from app.utils.filler import FillerManager
 from app.utils.prompt_builder import build_prompt_for_mode, resolve_persona_id
 from app.core.insight_detector import contains_verifiable_claim, verify_claim
 from app.utils.meeting_metrics import QuestionStageTimer
+from app.utils.followup_markers import has_coherence_marker
 from app.utils.tts_chunks import split_text_for_tts
 from app.utils.wake_word import detect as detect_wake_word, is_directed_at_other
 
@@ -44,19 +45,6 @@ _CORRECTION_TRIGGERS = (
     "is that", "are you sure", "double check", "double-check",
     "actually", "really", "correction",
 )
-
-_COHERENCE_MARKERS = (
-    "what", "who", "where", "when", "why", "how",
-    "can", "could", "would", "should", "will", "do", "does", "did",
-    "is", "are", "was", "were", "have", "has",
-    "tell", "explain", "show", "give", "find", "search",
-    "yes", "no", "yeah", "okay", "sure",
-    "thank", "stop", "enough",
-    "about", "think", "know", "remember", "mean",
-    "also", "what about", "and", "but", "more",
-    "?",
-)
-
 
 def _log_task_exception(task: asyncio.Task) -> None:
     """Log unhandled exceptions from fire-and-forget background tasks."""
@@ -910,8 +898,7 @@ class BotEngine:
                 logger.debug("Follow-up directed at another person, ignoring: %s", text[:60])
                 return
 
-            text_lower = text.lower().strip()
-            has_marker = any(marker in text_lower for marker in _COHERENCE_MARKERS)
+            has_marker = has_coherence_marker(text)
 
             # Semantic check: does this follow-up share topic words with
             # the bot's last response? Catches "tell me more about Delhi"

@@ -12,12 +12,15 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS = 0.2
+_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS = 2.0
+_GEMINI_SYNC_WORKER_MAX_WORKERS = 4
+_GEMINI_SYNC_ORPHAN_THRESHOLD = 3
 
 try:
     import anthropic
@@ -57,6 +60,9 @@ class LLMClient:
     def __init__(self, claude_model: str = "claude-haiku-4-5-20251001") -> None:
         self.settings = get_settings()
         self.claude_model = claude_model
+        self._gemini_stream_executor: ThreadPoolExecutor | None = None
+        self._gemini_stream_state_lock = threading.Lock()
+        self._gemini_stream_orphans = 0
 
         # Claude setup (fallback + heavy tasks)
         self.claude_client = None
@@ -78,6 +84,33 @@ class LLMClient:
             except Exception:
                 self._gemini_async_client = None
             logger.info("Gemini 2.5 Flash Lite configured as primary LLM")
+
+    def _get_gemini_stream_executor(self) -> ThreadPoolExecutor:
+        """Create the sync Gemini bridge executor on demand."""
+        executor = self._gemini_stream_executor
+        if executor is not None:
+            return executor
+        with self._gemini_stream_state_lock:
+            executor = self._gemini_stream_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=_GEMINI_SYNC_WORKER_MAX_WORKERS,
+                    thread_name_prefix="gemini-sync-stream",
+                )
+                self._gemini_stream_executor = executor
+        return executor
+
+    def _should_refuse_gemini_sync_stream(self) -> bool:
+        """Return True when too many blocked Gemini workers are already pinned."""
+        with self._gemini_stream_state_lock:
+            orphan_count = self._gemini_stream_orphans
+        if orphan_count >= _GEMINI_SYNC_ORPHAN_THRESHOLD:
+            logger.warning(
+                "Gemini sync bridge disabled: %d orphaned workers still pinned",
+                orphan_count,
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Primary query — tries Gemini first, falls back to Claude
@@ -346,7 +379,9 @@ class LLMClient:
                     yielded = True
                     yield sentence
                 if should_cancel and should_cancel() and not yielded:
-                    logger.debug("Gemini async stream cancelled before sentence emission")
+                    logger.debug(
+                        "Gemini async stream emitted no sentences (cancelled or empty response)",
+                    )
                     return
                 if yielded:
                     logger.info(
@@ -368,7 +403,9 @@ class LLMClient:
                     yielded = True
                     yield sentence
                 if should_cancel and should_cancel() and not yielded:
-                    logger.debug("Gemini sync stream cancelled before sentence emission")
+                    logger.debug(
+                        "Gemini sync stream emitted no sentences (cancelled or empty response)",
+                    )
                     return
                 if yielded:
                     logger.info("Gemini stream completed in %.0fms", (time.time() - start) * 1000)
@@ -470,12 +507,34 @@ class LLMClient:
         When *should_cancel* is set, the blocking iterator in the worker
         thread stops pulling from Gemini as soon as the flag is set.
         """
+        if self._should_refuse_gemini_sync_stream():
+            raise RuntimeError("Gemini sync bridge unavailable while orphaned workers recover")
+
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         stream_error: list[Exception] = []
         stop_worker = threading.Event()
+        worker_done = threading.Event()
+        worker_marked_orphan = False
+
+        def _mark_worker_orphan(reason: str) -> None:
+            nonlocal worker_marked_orphan
+            if worker_done.is_set():
+                return
+            with self._gemini_stream_state_lock:
+                if worker_done.is_set() or worker_marked_orphan:
+                    return
+                worker_marked_orphan = True
+                self._gemini_stream_orphans += 1
+                orphan_count = self._gemini_stream_orphans
+            logger.warning(
+                "Gemini sync worker still blocked after %s; orphan count=%d",
+                reason,
+                orphan_count,
+            )
 
         def _run_gemini_stream() -> None:
+            nonlocal worker_marked_orphan
             try:
                 response = self.gemini_client.models.generate_content_stream(
                     model=self._gemini_model,
@@ -494,9 +553,21 @@ class LLMClient:
             except Exception as exc:
                 stream_error.append(exc)
             finally:
+                with self._gemini_stream_state_lock:
+                    if worker_marked_orphan and self._gemini_stream_orphans > 0:
+                        self._gemini_stream_orphans -= 1
+                        orphan_count = self._gemini_stream_orphans
+                        worker_marked_orphan = False
+                        logger.info(
+                            "Gemini sync worker recovered; orphan count=%d",
+                            orphan_count,
+                        )
                 loop.call_soon_threadsafe(queue.put_nowait, None)
+                worker_done.set()
 
-        task = loop.run_in_executor(None, _run_gemini_stream)
+        executor = self._get_gemini_stream_executor()
+        worker_future: Future[None] = executor.submit(_run_gemini_stream)
+        task = asyncio.wrap_future(worker_future)
 
         async def _drain_worker_after_stop(reason: str) -> None:
             try:
@@ -505,7 +576,13 @@ class LLMClient:
                     timeout=_GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                logger.debug("Gemini sync worker still blocked after %s", reason)
+                if worker_future.cancel():
+                    logger.warning(
+                        "Gemini sync worker was still queued after %s; cancelled before start",
+                        reason,
+                    )
+                    return
+                _mark_worker_orphan(reason)
             except Exception:
                 pass
 
