@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { MessageSquare, Mic, MicOff, PhoneOff, SendHorizonal, Square } from "lucide-react";
+import { useChatInsights } from "@/hooks/use-chat-insights";
 import { useLiveControls } from "@/hooks/use-live-controls";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,6 +21,7 @@ export function BotControlPanel({
 }) {
   const [instruction, setInstruction] = useState("");
   const controls = useLiveControls(meetingId ?? "");
+  const { unreadCount, clearUnread } = useChatInsights(meetingId, !!meetingId);
   const status = useTranscriptStore((state) => state.status);
   const setStatus = useTranscriptStore((state) => state.setStatus);
   const addChunk = useTranscriptStore((state) => state.addChunk);
@@ -144,9 +146,20 @@ export function BotControlPanel({
             <PhoneOff className="h-4 w-4" />
             Leave Meeting
           </Button>
-          <Button variant="outline" onClick={onOpenChat}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              clearUnread();
+              onOpenChat?.();
+            }}
+          >
             <MessageSquare className="h-4 w-4" />
             Chat
+            {unreadCount > 0 ? (
+              <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">
+                {unreadCount}
+              </span>
+            ) : null}
           </Button>
         </div>
       </CardContent>

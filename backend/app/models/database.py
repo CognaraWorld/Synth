@@ -258,6 +258,7 @@ class ChatMessage(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     role = Column(String(16), nullable=False)
     content = Column(Text, nullable=False)
+    message_metadata = Column("metadata", Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
     meeting = relationship("Meeting", back_populates="chat_messages")
