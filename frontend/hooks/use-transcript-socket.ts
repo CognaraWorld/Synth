@@ -31,15 +31,19 @@ export function useTranscriptSocket(meetingId: string) {
       if (cancelled) return;
 
       try {
-        const tokenResponse = await fetch("/api/auth/backend-token", {
+        // Trade the server-side JWT for a 60-second single-use ticket.
+        // The raw JWT never reaches the browser, so a leaked URL/log
+        // line can only be replayed for a minute and only once.
+        const ticketResponse = await fetch("/api/auth/ws-ticket", {
+          method: "POST",
           cache: "no-store",
         });
-        if (!tokenResponse.ok || cancelled) return;
+        if (!ticketResponse.ok || cancelled) return;
 
-        const tokenData = (await tokenResponse.json()) as { token?: string };
-        if (!tokenData.token || cancelled) return;
+        const ticketData = (await ticketResponse.json()) as { ticket?: string };
+        if (!ticketData.ticket || cancelled) return;
 
-        const endpoint = `${process.env.NEXT_PUBLIC_BACKEND_WS_URL ?? "ws://localhost:8000"}/api/ws/${sessionId}?token=${encodeURIComponent(tokenData.token)}`;
+        const endpoint = `${process.env.NEXT_PUBLIC_BACKEND_WS_URL ?? "ws://localhost:8000"}/api/ws/${sessionId}?ticket=${encodeURIComponent(ticketData.ticket)}`;
         socket = new WebSocket(endpoint);
 
         socket.onopen = () => {

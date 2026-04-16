@@ -1,4 +1,10 @@
-"""Rate limiter with in-memory fallback and optional Redis backend."""
+"""Rate limiter with in-memory fallback and optional Redis backend.
+
+Supports the default chat-style limiter used by ``get_rate_limiter()``
+plus named limiters (e.g. login, register, service-token) with their
+own limits + window. Named limiters share the same in-memory storage
+so they all participate in periodic cleanup.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,17 @@ _CHAT_RATE_LIMIT = 20
 _WINDOW_SECONDS = 60
 
 
+# Named limits used by non-chat endpoints. Keep these tight — they protect
+# auth and payment surfaces against brute force / enumeration.
+NAMED_LIMITS: dict[str, tuple[int, int]] = {
+    "login": (5, 900),              # 5 attempts / 15 min
+    "register": (3, 3600),          # 3 / hour
+    "service-token": (5, 60),       # 5 / minute
+    "create-checkout": (10, 3600),  # 10 / hour
+    "create-meeting": (5, 60),      # 5 / minute
+}
+
+
 class InMemoryRateLimiter:
     """Sliding window rate limiter using in-memory dict. Single-process only."""
 
@@ -24,24 +41,51 @@ class InMemoryRateLimiter:
         self._lock = asyncio.Lock()
         self._last_cleanup: float = 0.0
 
-    async def check(self, user_id: str) -> None:
+    async def check(
+        self,
+        key: str,
+        *,
+        limit: int = _CHAT_RATE_LIMIT,
+        window_seconds: int = _WINDOW_SECONDS,
+        detail: str | None = None,
+    ) -> None:
+        """Reject with 429 when *key* has made ``limit`` calls inside ``window_seconds``.
+
+        ``key`` is the namespaced identifier (e.g. ``"login:1.2.3.4"``). Callers
+        should include their own prefix so different endpoints don't share buckets.
+        """
         now = datetime.now(timezone.utc).timestamp()
         async with self._lock:
-            # Periodic cleanup: evict stale buckets every 5 minutes
+            # Periodic cleanup: evict buckets whose newest entry has aged out
+            # of the largest window we know about (default + named limits).
             if now - self._last_cleanup > 300 or len(self._buckets) > self._MAX_BUCKETS:
-                stale = [uid for uid, ts_list in self._buckets.items() if not ts_list or now - ts_list[-1] >= _WINDOW_SECONDS]
+                max_window = max(
+                    window_seconds,
+                    _WINDOW_SECONDS,
+                    *(w for _, w in NAMED_LIMITS.values()),
+                )
+                stale = [
+                    uid
+                    for uid, ts_list in self._buckets.items()
+                    if not ts_list or now - ts_list[-1] >= max_window
+                ]
                 for uid in stale:
                     del self._buckets[uid]
                 self._last_cleanup = now
 
-            bucket = [timestamp for timestamp in self._buckets.get(user_id, []) if now - timestamp < _WINDOW_SECONDS]
-            if len(bucket) >= _CHAT_RATE_LIMIT:
+            bucket = [
+                timestamp
+                for timestamp in self._buckets.get(key, [])
+                if now - timestamp < window_seconds
+            ]
+            if len(bucket) >= limit:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=f"Chat rate limit exceeded. Max {_CHAT_RATE_LIMIT} messages per minute.",
+                    detail=detail
+                    or f"Rate limit exceeded. Max {limit} requests per {window_seconds}s.",
                 )
             bucket.append(now)
-            self._buckets[user_id] = bucket
+            self._buckets[key] = bucket
 
 
 class RedisRateLimiter:
@@ -52,22 +96,30 @@ class RedisRateLimiter:
 
         self._redis = aioredis.from_url(redis_url, decode_responses=True)
 
-    async def check(self, user_id: str) -> None:
+    async def check(
+        self,
+        key: str,
+        *,
+        limit: int = _CHAT_RATE_LIMIT,
+        window_seconds: int = _WINDOW_SECONDS,
+        detail: str | None = None,
+    ) -> None:
         import time
 
-        key = f"chat:ratelimit:{user_id}"
+        redis_key = f"ratelimit:{key}"
         now = time.time()
         pipe = self._redis.pipeline()
-        pipe.zremrangebyscore(key, "-inf", now - _WINDOW_SECONDS)
-        pipe.zcard(key)
-        pipe.zadd(key, {str(now): now})
-        pipe.expire(key, _WINDOW_SECONDS + 5)
+        pipe.zremrangebyscore(redis_key, "-inf", now - window_seconds)
+        pipe.zcard(redis_key)
+        pipe.zadd(redis_key, {str(now): now})
+        pipe.expire(redis_key, window_seconds + 5)
         results = await pipe.execute()
         count = results[1]
-        if count >= _CHAT_RATE_LIMIT:
+        if count >= limit:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Chat rate limit exceeded. Max {_CHAT_RATE_LIMIT} messages per minute.",
+                detail=detail
+                or f"Rate limit exceeded. Max {limit} requests per {window_seconds}s.",
             )
 
 
@@ -90,3 +142,29 @@ def get_rate_limiter() -> InMemoryRateLimiter | RedisRateLimiter:
             _limiter = InMemoryRateLimiter()
 
     return _limiter
+
+
+async def check_named_limit(bucket: str, key: str) -> None:
+    """Apply a named limit (e.g. ``"login"``) to ``key`` (e.g. an IP address).
+
+    Raises HTTP 429 when the caller exceeds the configured rate.
+    """
+    if bucket not in NAMED_LIMITS:
+        raise ValueError(f"Unknown rate-limit bucket: {bucket!r}")
+    limit, window = NAMED_LIMITS[bucket]
+    await get_rate_limiter().check(
+        f"{bucket}:{key}",
+        limit=limit,
+        window_seconds=window,
+        detail=f"Too many {bucket} attempts. Try again in {window}s.",
+    )
+
+
+def reset_for_tests() -> None:
+    """Clear all rate-limit state. Unit tests only."""
+    global _limiter
+    if isinstance(_limiter, InMemoryRateLimiter):
+        _limiter._buckets.clear()
+        _limiter._last_cleanup = 0.0
+    else:
+        _limiter = None

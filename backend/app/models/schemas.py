@@ -59,6 +59,13 @@ class ServiceTokenRequest(BaseModel):
     service_secret: str
 
 
+class WebSocketTicketResponse(BaseModel):
+    """Short-lived single-use credential for WebSocket auth."""
+
+    ticket: str
+    expires_in: int = Field(description="Seconds until the ticket expires.")
+
+
 # Agent
 class AgentCreate(BaseModel):
     name: NameField = "Synth"

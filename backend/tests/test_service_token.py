@@ -11,6 +11,24 @@ from fastapi import HTTPException
 from app.models.schemas import ServiceTokenRequest
 
 
+def _mock_request(ip: str = "203.0.113.7") -> MagicMock:
+    """Build a FastAPI ``Request`` stand-in that exposes only what auth.py reads."""
+    request = MagicMock()
+    request.headers = {}
+    request.client = MagicMock(host=ip)
+    return request
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter_state():
+    """Keep each test isolated — the IP-based limiter is shared process-wide."""
+    from app.core.rate_limiter import reset_for_tests
+
+    reset_for_tests()
+    yield
+    reset_for_tests()
+
+
 class TestServiceTokenEndpoint:
     """Tests for the service-to-service token exchange endpoint."""
 
@@ -28,12 +46,13 @@ class TestServiceTokenEndpoint:
         with patch("app.api.routes.auth.settings") as mock_settings:
             mock_settings.service_secret = "correct-secret"
             with pytest.raises(HTTPException) as exc_info:
-                await service_token(req, db)
+                await service_token(req, _mock_request(), db)
             assert exc_info.value.status_code == 403
             assert "Invalid service secret" in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
     async def test_rejects_empty_service_secret_config(self) -> None:
+        """Empty service_secret is treated as misconfiguration, not just a wrong guess."""
         from app.api.routes.auth import service_token
 
         db = AsyncMock()
@@ -46,8 +65,26 @@ class TestServiceTokenEndpoint:
         with patch("app.api.routes.auth.settings") as mock_settings:
             mock_settings.service_secret = ""
             with pytest.raises(HTTPException) as exc_info:
-                await service_token(req, db)
-            assert exc_info.value.status_code == 403
+                await service_token(req, _mock_request(), db)
+            assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_rejects_default_shipped_service_secret(self) -> None:
+        """The repo-shipped default is equivalent to being unconfigured."""
+        from app.api.routes.auth import service_token
+
+        db = AsyncMock()
+        req = ServiceTokenRequest(
+            email="user@example.com",
+            name="Test User",
+            service_secret="cognara-service-secret-dev",
+        )
+
+        with patch("app.api.routes.auth.settings") as mock_settings:
+            mock_settings.service_secret = "cognara-service-secret-dev"
+            with pytest.raises(HTTPException) as exc_info:
+                await service_token(req, _mock_request(), db)
+            assert exc_info.value.status_code == 503
 
     @pytest.mark.asyncio
     async def test_creates_new_user_on_first_exchange(self) -> None:
@@ -71,7 +108,7 @@ class TestServiceTokenEndpoint:
         ):
             mock_settings.service_secret = "test-secret"
 
-            result = await service_token(req, db)
+            result = await service_token(req, _mock_request(), db)
 
             # Verify user was added to DB
             db.add.assert_called()
@@ -106,7 +143,7 @@ class TestServiceTokenEndpoint:
         ):
             mock_settings.service_secret = "test-secret"
 
-            result = await service_token(req, db)
+            result = await service_token(req, _mock_request(), db)
 
             # Should NOT create a new user
             db.flush.assert_not_awaited()
@@ -137,7 +174,7 @@ class TestServiceTokenEndpoint:
         ):
             mock_settings.service_secret = "test-secret"
 
-            await service_token(req, db)
+            await service_token(req, _mock_request(), db)
 
             # db.add is called twice: once for User, once for CreditTransaction
             assert db.add.call_count >= 2
@@ -156,6 +193,33 @@ class TestServiceTokenEndpoint:
         assert "hmac.compare_digest" in source, (
             "service_token must use hmac.compare_digest for timing-safe secret comparison"
         )
+
+    @pytest.mark.asyncio
+    async def test_rate_limits_after_five_attempts_per_ip(self) -> None:
+        """6th call from the same IP within a minute must return 429."""
+        from app.api.routes.auth import service_token
+
+        db = AsyncMock()
+        req = ServiceTokenRequest(
+            email="user@example.com",
+            name="Test User",
+            service_secret="wrong",
+        )
+        request = _mock_request(ip="198.51.100.4")
+
+        with patch("app.api.routes.auth.settings") as mock_settings:
+            mock_settings.service_secret = "correct-secret"
+
+            # 5 attempts are allowed (each rejected on secret mismatch, not rate limit)
+            for _ in range(5):
+                with pytest.raises(HTTPException) as exc_info:
+                    await service_token(req, request, db)
+                assert exc_info.value.status_code == 403
+
+            # 6th attempt trips the rate limit
+            with pytest.raises(HTTPException) as exc_info:
+                await service_token(req, request, db)
+            assert exc_info.value.status_code == 429
 
     def test_service_token_request_validates_email(self) -> None:
         with pytest.raises(Exception):

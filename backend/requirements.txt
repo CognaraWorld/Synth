@@ -10,7 +10,11 @@ alembic==1.14.0
 psycopg2-binary==2.9.10
 
 # Auth
+# python-jose retained temporarily for websocket.py; auth.py now uses PyJWT
+# (python-jose has CVE-2024-33663 algorithm-confusion issues and is
+# effectively unmaintained). Remove once websocket.py finishes migrating.
 python-jose[cryptography]==3.3.0
+PyJWT==2.9.0
 passlib[bcrypt]==1.7.4
 
 # AI / ML
