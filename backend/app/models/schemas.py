@@ -242,6 +242,11 @@ class ChatHistoryResponse(BaseModel):
     total: int
 
 
+class CrossMeetingChatRequest(BaseModel):
+    message: LongTextField
+    meeting_ids: list[UUID] | None = None
+
+
 # Payments
 class CheckoutRequest(BaseModel):
     pack_id: str = Field(

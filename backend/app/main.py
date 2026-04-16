@@ -175,6 +175,16 @@ def _run_migrations(connection):
                 ddl=ddl,
             )
 
+    if inspector.has_table("chat_messages"):
+        chat_columns = _get_columns(inspector, "chat_messages")
+        _add_column_if_missing(
+            connection=connection,
+            table_name="chat_messages",
+            columns=chat_columns,
+            column_name="metadata",
+            ddl="ALTER TABLE chat_messages ADD COLUMN metadata TEXT",
+        )
+
     if inspector.has_table("credit_transactions"):
         credit_columns = _get_columns(inspector, "credit_transactions")
         meeting_id_type = "UUID" if dialect_name == "postgresql" else "VARCHAR(36)"

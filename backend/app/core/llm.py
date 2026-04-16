@@ -633,6 +633,124 @@ class LLMClient:
         if stream_error:
             raise stream_error[0]
 
+    async def multi_turn_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+        chat_history: list[dict] | None = None,
+    ) -> str:
+        """Multi-turn conversation using Claude with full message history."""
+        if self._claude_async is None:
+            return await self.async_query(context, question, system_prompt)
+
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        prompt += (
+            "\n\nThink through complex questions step by step. "
+            "Break them into sub-questions and address each one. "
+            "Reference specific parts of the context."
+        )
+
+        messages: list[dict[str, str]] = []
+        if chat_history:
+            for message in chat_history[-10:]:
+                messages.append({"role": message["role"], "content": message["content"]})
+
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        messages.append({"role": "user", "content": user_content})
+
+        try:
+            response = await self._claude_async.messages.create(
+                model=self.claude_model,
+                max_tokens=4096,
+                system=prompt,
+                messages=messages,
+            )
+            return response.content[0].text if response.content else ""
+        except Exception as exc:
+            logger.warning(
+                "Multi-turn Claude query failed: %s, falling back to single-turn",
+                exc,
+            )
+            return await self.async_query(context, question, system_prompt)
+
+    async def tool_use_query(
+        self,
+        context: str,
+        question: str,
+        system_prompt: str | None = None,
+        tools: list[dict] | None = None,
+        tool_executor=None,
+        max_rounds: int = 3,
+    ) -> tuple[str, list[dict]]:
+        """Query Claude with tool use. Returns (response_text, tool_calls_made)."""
+        if self._claude_async is None or not tools:
+            return await self.async_query(context, question, system_prompt), []
+
+        prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        messages: list[dict] = [{"role": "user", "content": user_content}]
+        tool_calls_made: list[dict] = []
+
+        for _ in range(max_rounds):
+            try:
+                response = await self._claude_async.messages.create(
+                    model=self.claude_model,
+                    max_tokens=4096,
+                    system=prompt,
+                    messages=messages,
+                    tools=tools,
+                )
+            except Exception as exc:
+                logger.warning("Tool-use Claude query failed: %s", exc)
+                return await self.async_query(context, question, system_prompt), []
+
+            if response.stop_reason == "tool_use":
+                assistant_content = response.content
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                tool_results = []
+                for block in assistant_content:
+                    if getattr(block, "type", None) != "tool_use":
+                        continue
+
+                    tool_name = getattr(block, "name", "")
+                    tool_input = getattr(block, "input", {}) or {}
+                    if tool_executor:
+                        result = await tool_executor(tool_name, tool_input)
+                    else:
+                        result = f"Tool {tool_name} not available"
+
+                    tool_calls_made.append(
+                        {
+                            "tool_name": tool_name,
+                            "input": tool_input,
+                            "output_summary": str(result)[:200],
+                        }
+                    )
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": getattr(block, "id", ""),
+                            "content": result,
+                        }
+                    )
+
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            text_parts = [
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+            ]
+            return " ".join(text_parts).strip(), tool_calls_made
+
+        return (
+            "I wasn't able to complete all the research needed. Please try a more specific question.",
+            tool_calls_made,
+        )
+
     def generate_system_prompt(self, description: str) -> str:
         return (
             f"You are a specialized meeting assistant with the following "

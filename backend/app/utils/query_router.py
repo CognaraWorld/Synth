@@ -305,3 +305,58 @@ def needs_web_search(question: str) -> bool:
 
     # Default: search. Better to have extra context than to miss a needed lookup.
     return True
+
+
+def classify_chat_complexity(question: str) -> str:
+    """Classify a chat question as simple or complex."""
+    question_lower = question.lower().strip()
+    word_count = len(question_lower.split())
+
+    if question.count("?") >= 2:
+        return "complex"
+    if word_count > 40:
+        return "complex"
+
+    comparison_words = {
+        "compare",
+        "contrast",
+        "vs",
+        "versus",
+        "difference",
+        "differences",
+        "better",
+        "worse",
+        "pros and cons",
+        "trade-off",
+        "tradeoff",
+    }
+    if any(word in question_lower for word in comparison_words):
+        return "complex"
+
+    analytical_words = {
+        "analyze",
+        "analyse",
+        "explain why",
+        "explain how",
+        "step by step",
+        "break down",
+        "walk me through",
+        "deep dive",
+        "implications",
+        "root cause",
+    }
+    if any(word in question_lower for word in analytical_words):
+        return "complex"
+
+    synthesis_words = {
+        "summarize everything",
+        "overall assessment",
+        "big picture",
+        "what should we",
+        "recommend",
+        "strategy",
+    }
+    if any(word in question_lower for word in synthesis_words):
+        return "complex"
+
+    return "simple"
