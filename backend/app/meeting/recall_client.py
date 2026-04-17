@@ -12,14 +12,20 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import time
 from typing import Any, AsyncIterator
 
 import httpx
 from pydub import AudioSegment
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_CIRCUIT_BREAKER_THRESHOLD = 5
+_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 30.0
 
 
 class RecallClientError(Exception):
@@ -65,6 +71,61 @@ class RecallClient:
             },
             timeout=httpx.Timeout(30.0),
         )
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+    def _check_circuit_breaker(self) -> None:
+        if self._circuit_open_until > time.time():
+            raise RecallClientError("Recall.ai circuit breaker is open")
+
+    @staticmethod
+    def _is_retryable_exception(exc: BaseException) -> bool:
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in _RETRYABLE_HTTP_STATUS_CODES
+        return False
+
+    def _record_success(self) -> None:
+        if self._consecutive_failures:
+            logger.info("Recall.ai circuit breaker reset after recovery")
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+    def _record_failure(self, exc: BaseException) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+            self._circuit_open_until = time.time() + _CIRCUIT_BREAKER_COOLDOWN_SECONDS
+            logger.warning(
+                "Recall.ai circuit breaker opened for %.0fs after %d consecutive failures: %s",
+                _CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+                self._consecutive_failures,
+                exc,
+            )
+
+    async def _run_with_retry(
+        self,
+        operation_name: str,
+        operation,
+    ) -> httpx.Response:
+        self._check_circuit_breaker()
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=1, max=4),
+                retry=retry_if_exception(self._is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await operation()
+                    response.raise_for_status()
+                    self._record_success()
+                    return response
+        except Exception as exc:
+            self._record_failure(exc)
+            logger.warning("Recall.ai %s failed after retries: %s", operation_name, exc)
+            raise
+        raise RecallClientError(f"Recall.ai {operation_name} failed unexpectedly")
 
     # ------------------------------------------------------------------
     # Bot lifecycle
@@ -207,8 +268,10 @@ class RecallClient:
             bot_id: The Recall.ai bot identifier.
         """
         try:
-            response = await self._client.post(f"/bot/{bot_id}/leave")
-            response.raise_for_status()
+            await self._run_with_retry(
+                f"stop_bot:{bot_id}",
+                lambda: self._client.post(f"/bot/{bot_id}/leave"),
+            )
             logger.info("Stopped Recall.ai bot %s", bot_id)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
@@ -308,14 +371,16 @@ class RecallClient:
             return
 
         try:
-            response = await self._client.post(
-                f"/bot/{bot_id}/output_audio",
-                json={
-                    "kind": "mp3",
-                    "b64_data": b64_audio,
-                },
+            await self._run_with_retry(
+                f"send_audio:{bot_id}",
+                lambda: self._client.post(
+                    f"/bot/{bot_id}/output_audio",
+                    json={
+                        "kind": "mp3",
+                        "b64_data": b64_audio,
+                    },
+                ),
             )
-            response.raise_for_status()
             logger.info("Sent %d audio bytes to bot %s", len(audio_bytes), bot_id)
         except httpx.HTTPStatusError as exc:
             logger.error(
@@ -337,11 +402,13 @@ class RecallClient:
             logger.debug("Skipping empty pre-encoded audio payload for bot %s", bot_id)
             return
         try:
-            response = await self._client.post(
-                f"/bot/{bot_id}/output_audio",
-                json={"kind": "mp3", "b64_data": b64_audio},
+            await self._run_with_retry(
+                f"send_audio_b64:{bot_id}",
+                lambda: self._client.post(
+                    f"/bot/{bot_id}/output_audio",
+                    json={"kind": "mp3", "b64_data": b64_audio},
+                ),
             )
-            response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             logger.error(
                 "Send audio failed for bot %s (HTTP %d): %s",

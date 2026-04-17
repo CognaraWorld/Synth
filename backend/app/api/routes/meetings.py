@@ -3,15 +3,15 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 import logging
 
 from app.api.routes.auth import get_current_user
-from app.api.routes.webhook import get_bot_engine, set_bot_engine
 from app.config import get_settings
+from app.core.engine_singleton import get_engine as get_bot_engine
 from app.meeting.recall_client import RecallClient, RecallClientError
 from app.models.database import Agent, Meeting, MeetingOverride, MeetingSummary, User, get_db
 from app.models.schemas import (
@@ -48,6 +48,18 @@ async def create_meeting(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    active_count_result = await db.execute(
+        select(func.count(Meeting.id)).where(
+            Meeting.user_id == current_user.id,
+            Meeting.status == "active",
+        )
+    )
+    if (active_count_result.scalar() or 0) >= 20:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Maximum of 20 active meetings per user reached",
+        )
+
     # Atomically reserve 5 minutes to prevent overdraw under concurrent requests.
     # The WHERE guard ensures the UPDATE is a no-op when balance is too low.
     reserve_result = await db.execute(
@@ -93,7 +105,7 @@ async def create_meeting(
         credits_used=0,
     )
     db.add(meeting)
-
+    await db.flush()
     await db.commit()
     await db.refresh(meeting)
 
@@ -117,9 +129,6 @@ async def create_meeting(
         )
         meeting.bot_id = bot_id
         meeting.status = "active"
-        await db.commit()
-        await db.refresh(meeting)
-        logger.info("Bot %s joined meeting %s", bot_id, meeting.id)
 
         # Initialize BotEngine session so webhook has a target
         engine = get_bot_engine()
@@ -216,11 +225,19 @@ async def create_meeting(
         engine._sessions_by_bot_id[bot_id] = session.session_id
         engine._ensure_session_tracking(session.session_id)
 
+        await db.commit()
+        await db.refresh(meeting)
+        logger.info("Bot %s joined meeting %s", bot_id, meeting.id)
         logger.info("BotEngine session %s ready for bot %s", session.session_id, bot_id)
 
     except RecallClientError as exc:
         logger.error("Failed to deploy bot for meeting %s: %s", meeting.id, exc)
         meeting.status = "failed"
+        await db.execute(
+            update(User)
+            .where(User.id == current_user.id)
+            .values(credits=User.credits + 5)
+        )
         await db.commit()
         raise HTTPException(status_code=502, detail="Failed to deploy meeting bot.")
     finally:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -13,13 +12,12 @@ from fastapi import HTTPException
 from app.api.routes.payments import CREDIT_PACKS
 from app.context.documents import DocumentProcessor
 from app.models.credit_transaction import CreditTransaction
+from app.meeting.recall_client import RecallClientError
 from app.models.schemas import MeetingCreate, UserCreate
 
 
 class TestDocumentProcessorDependencyFallbacks:
-    def test_parse_docx_reports_missing_dependency(self, tmp_path: Path) -> None:
-        file_path = tmp_path / "notes.docx"
-        file_path.write_text("placeholder", encoding="utf-8")
+    def test_parse_docx_reports_missing_dependency(self) -> None:
         processor = DocumentProcessor()
 
         def fake_import(module_name: str):
@@ -27,13 +25,14 @@ class TestDocumentProcessorDependencyFallbacks:
                 raise ModuleNotFoundError("No module named 'docx'")
             raise AssertionError(f"Unexpected import: {module_name}")
 
-        with patch("app.context.documents.importlib.import_module", side_effect=fake_import):
+        with (
+            patch("app.context.documents.os.path.isfile", return_value=True),
+            patch("app.context.documents.importlib.import_module", side_effect=fake_import),
+        ):
             with pytest.raises(RuntimeError, match="DOCX processing is unavailable"):
-                processor.parse_docx(str(file_path))
+                processor.parse_docx("notes.docx")
 
-    def test_parse_pdf_reports_missing_dependency(self, tmp_path: Path) -> None:
-        file_path = tmp_path / "notes.pdf"
-        file_path.write_text("placeholder", encoding="utf-8")
+    def test_parse_pdf_reports_missing_dependency(self) -> None:
         processor = DocumentProcessor()
 
         def fake_import(module_name: str):
@@ -41,19 +40,29 @@ class TestDocumentProcessorDependencyFallbacks:
                 raise ModuleNotFoundError("No module named 'pdfplumber'")
             raise AssertionError(f"Unexpected import: {module_name}")
 
-        with patch("app.context.documents.importlib.import_module", side_effect=fake_import):
+        with (
+            patch("app.context.documents.os.path.isfile", return_value=True),
+            patch("app.context.documents.importlib.import_module", side_effect=fake_import),
+        ):
             with pytest.raises(RuntimeError, match="PDF processing is unavailable"):
-                processor.parse_pdf(str(file_path))
+                processor.parse_pdf("notes.pdf")
 
 
 class TestAuthRegistrationHardening:
+    @staticmethod
+    def _request() -> MagicMock:
+        return MagicMock(headers={}, client=MagicMock(host="127.0.0.1"))
+
     @pytest.mark.asyncio
     async def test_register_requires_password_for_email_provider(self) -> None:
         from app.api.routes.auth import register
 
         db = AsyncMock()
 
-        with pytest.raises(HTTPException, match="Password is required"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            pytest.raises(HTTPException, match="Password is required"),
+        ):
             await register(
                 UserCreate(
                     email="user@example.com",
@@ -61,6 +70,7 @@ class TestAuthRegistrationHardening:
                     password=None,
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 
@@ -70,7 +80,10 @@ class TestAuthRegistrationHardening:
 
         db = AsyncMock()
 
-        with pytest.raises(HTTPException, match="at least 8 characters"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            pytest.raises(HTTPException, match="at least 8 characters"),
+        ):
             await register(
                 UserCreate(
                     email="user@example.com",
@@ -78,6 +91,7 @@ class TestAuthRegistrationHardening:
                     password="short",
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 
@@ -103,7 +117,10 @@ class TestAuthRegistrationHardening:
 
         db.flush.side_effect = flush_side_effect
 
-        with patch("app.api.routes.auth.pwd_context.hash", return_value="hashed-password"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            patch("app.api.routes.auth.pwd_context.hash", return_value="hashed-password"),
+        ):
             result = await register(
                 UserCreate(
                     email="user@example.com",
@@ -111,6 +128,7 @@ class TestAuthRegistrationHardening:
                     password="StrongPass123",
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 
@@ -235,14 +253,17 @@ class TestMeetingCreditAuditTrail:
         current_user = MagicMock(id=user_id, credits=60)
         agent = MagicMock(id=agent_id, user_id=user_id)
 
-        # First call: atomic reserve (rowcount=1 means success)
+        # First call: active meetings count check (< 20)
+        active_count_result = MagicMock()
+        active_count_result.scalar.return_value = 0
+        # Second call: atomic reserve (rowcount=1 means success)
         reserve_result = MagicMock(rowcount=1)
-        # Second call: agent lookup
+        # Third call: agent lookup
         agent_result = MagicMock()
         agent_result.scalar_one_or_none.return_value = agent
 
         db = AsyncMock()
-        db.execute.side_effect = [reserve_result, agent_result]
+        db.execute.side_effect = [active_count_result, reserve_result, agent_result]
         db.add = MagicMock()
         db.commit = AsyncMock()
         db.refresh = AsyncMock()
@@ -327,6 +348,69 @@ class TestMeetingCreditAuditTrail:
         assert created_transaction.balance_after == 4
         assert created_transaction.transaction_type == "refund"
 
+    @pytest.mark.asyncio
+    async def test_create_meeting_refunds_reserved_credits_on_recall_failure(self) -> None:
+        from app.api.routes.meetings import create_meeting
+
+        user_id = uuid4()
+        agent_id = uuid4()
+        current_user = MagicMock(id=user_id, credits=60)
+        agent = MagicMock(
+            id=agent_id,
+            user_id=user_id,
+            name="Synth",
+            mode="general",
+            persona_id="general",
+            description="",
+            system_prompt="",
+            voice="female",
+        )
+
+        active_count_result = MagicMock()
+        active_count_result.scalar.return_value = 0
+        reserve_result = MagicMock(rowcount=1)
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+        refund_result = MagicMock()
+
+        db = AsyncMock()
+        db.execute.side_effect = [active_count_result, reserve_result, agent_result, refund_result]
+        db.add = MagicMock()
+        db.flush = AsyncMock()
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        mock_recall = MagicMock()
+        mock_recall.create_bot = AsyncMock(side_effect=RecallClientError("boom"))
+        mock_recall.close = AsyncMock()
+
+        settings = MagicMock(
+            recall_api_key="recall-key",
+            gemini_api_key="gemini-key",
+            webhook_base_url="https://example.com",
+        )
+
+        with (
+            patch("app.api.routes.meetings.detect_platform", return_value="zoom"),
+            patch("app.api.routes.meetings.get_settings", return_value=settings),
+            patch("app.api.routes.meetings.RecallClient", return_value=mock_recall),
+        ):
+            with pytest.raises(HTTPException, match="Failed to deploy meeting bot"):
+                await create_meeting(
+                    MeetingCreate(
+                        agent_id=agent_id,
+                        meeting_link="https://zoom.us/j/123456789",
+                    ),
+                    current_user=current_user,
+                    db=db,
+                )
+
+        created_meeting = db.add.call_args.args[0]
+        assert created_meeting.status == "failed"
+        assert db.execute.await_count == 4
+        assert db.commit.await_count == 2
+        mock_recall.close.assert_awaited_once()
+
 
 class TestWebhookUuidHardening:
     @pytest.mark.asyncio
@@ -356,13 +440,13 @@ class TestWebhookUuidHardening:
         user_id = uuid4()
         user = MagicMock(id=user_id, credits=1)
 
-        duplicate_check = MagicMock()
-        duplicate_check.scalar_one_or_none.return_value = None
         user_lookup = MagicMock()
         user_lookup.scalar_one_or_none.return_value = user
+        duplicate_check = MagicMock()
+        duplicate_check.scalar_one_or_none.return_value = None
 
         db = AsyncMock()
-        db.execute.side_effect = [duplicate_check, user_lookup]
+        db.execute.side_effect = [user_lookup, duplicate_check]
         db.add = MagicMock()
         db.commit = AsyncMock()
 

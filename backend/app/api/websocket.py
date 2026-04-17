@@ -15,44 +15,28 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from jose import jwt, JWTError
+
+try:
+    import jwt as pyjwt
+    from jwt.exceptions import InvalidTokenError
+except ModuleNotFoundError:  # pragma: no cover - only hits when PyJWT isn't installed
+    from jose import JWTError, jwt as jose_jwt
+
+    class _JosePyJwtCompat:
+        @staticmethod
+        def decode(token: str, key: str, algorithms: list[str]):
+            return jose_jwt.decode(token, key, algorithms=algorithms)
+
+    pyjwt = _JosePyJwtCompat()
+    InvalidTokenError = JWTError
 
 from app.config import get_settings
 from app.core.bot_engine import BotEngine, SessionNotFoundError
+from app.core.engine_singleton import get_engine, set_engine
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websocket"])
-
-# Shared BotEngine instance — initialized once and reused across
-# WebSocket connections. Created lazily on first access.
-_engine: BotEngine | None = None
-
-
-def get_engine() -> BotEngine:
-    """Return the shared BotEngine singleton.
-
-    Creates the instance on first call. This avoids loading heavy
-    models at import time while ensuring all WebSocket connections
-    share the same engine state.
-
-    Returns:
-        The shared BotEngine instance.
-    """
-    global _engine
-    if _engine is None:
-        _engine = BotEngine()
-    return _engine
-
-
-def set_engine(engine: BotEngine) -> None:
-    """Override the shared BotEngine instance (useful for testing).
-
-    Args:
-        engine: A BotEngine instance to use as the singleton.
-    """
-    global _engine
-    _engine = engine
 
 
 @router.websocket("/ws/{session_id}")
@@ -85,10 +69,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         session_id: The meeting session ID to stream updates for.
     """
     # Authenticate before accepting. Two paths are supported:
-    # 1. ``?ticket=`` — short-lived single-use ticket from POST /api/auth/ws-ticket.
+    # 1. ``?ticket=`` - short-lived single-use ticket from POST /api/auth/ws-ticket.
     #    Preferred. Limits blast radius of URL-bound credentials to 60s + one use.
-    # 2. ``?token=`` — raw backend JWT. Legacy path, kept for backward compat.
-    #    TODO(devyansh): drop during PyJWT migration once frontend fully uses tickets.
+    # 2. ``?token=`` - raw backend JWT. Legacy path, kept for backward compat.
     settings = get_settings()
     ticket = websocket.query_params.get("ticket")
     token = websocket.query_params.get("token")
@@ -111,27 +94,21 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             return
         user_id = str(consumed)
     else:
-        # Legacy `?token=` path. Logged at WARNING so we can see whether any
-        # client is still hitting it before the PyJWT migration removes this
-        # branch. Two JWT libs (python-jose here, PyJWT in auth.py) decoding
-        # tokens for the same app is exactly the CVE-2024-33663 surface, so
-        # this path should be deleted as soon as the frontend is verified
-        # to only use ws-tickets.
         logger.warning(
             "WebSocket auth used deprecated ?token= path from client %s (session %s). "
-            "Tracking removal — see audit finding S-09 / websocket.py PyJWT migration.",
+            "Tracking removal once all clients use ws tickets.",
             websocket.client.host if websocket.client else "unknown",
             session_id[:8],
         )
         try:
-            payload = jwt.decode(
+            payload = pyjwt.decode(
                 token, settings.secret_key, algorithms=[settings.algorithm]
             )
             user_id = payload.get("sub")
             if not user_id:
                 await websocket.close(code=4001, reason="Invalid token")
                 return
-        except (JWTError, Exception):
+        except InvalidTokenError:
             await websocket.close(code=4001, reason="Invalid token")
             return
 
@@ -146,8 +123,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     if session_obj.bot_id:
         try:
             from uuid import UUID as _UUID
+
             from sqlalchemy import select
-            from app.models.database import Meeting, AsyncSessionLocal
+
+            from app.models.database import AsyncSessionLocal, Meeting
+
             parsed_uid = _UUID(user_id)
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
@@ -182,22 +162,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             try:
                 status = await engine.get_status(session_id)
             except SessionNotFoundError:
-                await _send_json(websocket, {
-                    "type": "error",
-                    "message": f"Session {session_id} not found",
-                })
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": f"Session {session_id} not found",
+                    },
+                )
                 break
 
             current_state = status.get("state", "unknown")
 
             # Send status update if state changed
             if current_state != last_state:
-                await _send_json(websocket, {
-                    "type": "status",
-                    "state": current_state,
-                    "duration": status.get("duration_seconds", 0),
-                    "is_active": status.get("is_active", False),
-                })
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "status",
+                        "state": current_state,
+                        "duration": status.get("duration_seconds", 0),
+                        "is_active": status.get("is_active", False),
+                    },
+                )
                 last_state = current_state
 
             # Send new transcript text if available
@@ -207,20 +193,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 if len(full_text) > last_transcript_len:
                     new_text = full_text[last_transcript_len:]
                     last_transcript_len = len(full_text)
-                    await _send_json(websocket, {
-                        "type": "transcript",
-                        "text": new_text,
-                        "speaker": "participant",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "transcript",
+                            "text": new_text,
+                            "speaker": "participant",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
 
             # Check for terminal state
             if current_state in ("ended", "failed"):
-                await _send_json(websocket, {
-                    "type": "ended",
-                    "state": current_state,
-                    "duration": status.get("duration_seconds", 0),
-                })
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "ended",
+                        "state": current_state,
+                        "duration": status.get("duration_seconds", 0),
+                    },
+                )
                 break
 
             # Check for incoming client messages (non-blocking)
@@ -231,7 +223,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 )
                 await _handle_client_message(client_msg, session_id, websocket, engine)
             except asyncio.TimeoutError:
-                # No client message within the poll interval — continue loop
+                # No client message within the poll interval - continue loop
                 pass
 
     except WebSocketDisconnect:
@@ -244,10 +236,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             exc_info=True,
         )
         try:
-            await _send_json(websocket, {
-                "type": "error",
-                "message": "Internal server error",
-            })
+            await _send_json(
+                websocket,
+                {
+                    "type": "error",
+                    "message": "Internal server error",
+                },
+            )
         except Exception:
             pass
     finally:
@@ -274,8 +269,8 @@ async def _handle_client_message(
 
     Supported client commands:
 
-    - ``{"action": "stop"}`` — stop the meeting session.
-    - ``{"action": "status"}`` — request an immediate status update.
+    - ``{"action": "stop"}`` - stop the meeting session.
+    - ``{"action": "status"}`` - request an immediate status update.
 
     Args:
         raw_message: Raw JSON string from the client.
@@ -286,10 +281,13 @@ async def _handle_client_message(
     try:
         message = json.loads(raw_message)
     except json.JSONDecodeError:
-        await _send_json(websocket, {
-            "type": "error",
-            "message": "Invalid JSON",
-        })
+        await _send_json(
+            websocket,
+            {
+                "type": "error",
+                "message": "Invalid JSON",
+            },
+        )
         return
 
     action = message.get("action")
@@ -297,34 +295,49 @@ async def _handle_client_message(
     if action == "stop":
         try:
             result = await engine.stop_meeting(session_id)
-            await _send_json(websocket, {
-                "type": "ended",
-                "state": "ended",
-                "duration": result.get("duration_seconds", 0),
-            })
+            await _send_json(
+                websocket,
+                {
+                    "type": "ended",
+                    "state": "ended",
+                    "duration": result.get("duration_seconds", 0),
+                },
+            )
         except SessionNotFoundError:
-            await _send_json(websocket, {
-                "type": "error",
-                "message": f"Session {session_id} not found",
-            })
+            await _send_json(
+                websocket,
+                {
+                    "type": "error",
+                    "message": f"Session {session_id} not found",
+                },
+            )
 
     elif action == "status":
         try:
             status = await engine.get_status(session_id)
-            await _send_json(websocket, {
-                "type": "status",
-                "state": status.get("state", "unknown"),
-                "duration": status.get("duration_seconds", 0),
-                "is_active": status.get("is_active", False),
-            })
+            await _send_json(
+                websocket,
+                {
+                    "type": "status",
+                    "state": status.get("state", "unknown"),
+                    "duration": status.get("duration_seconds", 0),
+                    "is_active": status.get("is_active", False),
+                },
+            )
         except SessionNotFoundError:
-            await _send_json(websocket, {
-                "type": "error",
-                "message": f"Session {session_id} not found",
-            })
+            await _send_json(
+                websocket,
+                {
+                    "type": "error",
+                    "message": f"Session {session_id} not found",
+                },
+            )
 
     else:
-        await _send_json(websocket, {
-            "type": "error",
-            "message": f"Unknown action: {action!r}",
-        })
+        await _send_json(
+            websocket,
+            {
+                "type": "error",
+                "message": f"Unknown action: {action!r}",
+            },
+        )

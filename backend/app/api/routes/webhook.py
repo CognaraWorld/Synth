@@ -8,9 +8,14 @@ to avoid webhook timeouts.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hmac
 import json
 import logging
+import hashlib
 import math
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
@@ -19,6 +24,8 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.engine_singleton import get_engine as get_bot_engine
+from app.core.engine_singleton import set_engine as set_bot_engine
 from app.models.database import Meeting, User, AsyncSessionLocal
 from app.utils.bot_profiles import get_persona_tts_voice
 from app.utils import echo_tracker
@@ -27,28 +34,188 @@ logger = logging.getLogger(__name__)
 
 # Bounded concurrency: limit parallel webhook processing to prevent
 # resource exhaustion under burst traffic (OWASP A05:2021 - Security Misconfiguration)
-_webhook_semaphore = asyncio.Semaphore(20)
+_webhook_semaphore = asyncio.Semaphore(50)
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
-# Singleton BotEngine — initialized on first webhook hit
-_bot_engine = None
-_greeted_bots: set[str] = set()
+_greeted_bots: dict[str, float] = {}
 _pending_hey: dict[str, float] = {}
-
-def get_bot_engine():
-    """Get or create the shared BotEngine instance."""
-    global _bot_engine
-    if _bot_engine is None:
-        from app.core.bot_engine import BotEngine
-        _bot_engine = BotEngine()
-    return _bot_engine
+_MAX_WEBHOOK_AGE_SECONDS = 300
+_GREETED_BOT_TTL_SECONDS = 24 * 60 * 60
+_MAX_GREETED_BOTS = 2048
+_seen_nonces: dict[str, float] = {}
+_seen_nonces_lock = asyncio.Lock()
 
 
-def set_bot_engine(engine):
-    """Set the shared BotEngine (called from meetings route)."""
-    global _bot_engine
-    _bot_engine = engine
+def _prune_seen_nonces(now: float | None = None) -> None:
+    """Drop expired webhook replay nonces."""
+    current_time = time.time() if now is None else now
+    expired = [nonce for nonce, expires_at in _seen_nonces.items() if expires_at <= current_time]
+    for nonce in expired:
+        _seen_nonces.pop(nonce, None)
+
+
+def _build_replay_nonce(
+    raw_body: bytes,
+    timestamp_header: str,
+    message_id: str = "",
+) -> str:
+    """Create a stable replay nonce from the webhook envelope."""
+    hasher = hashlib.sha256()
+    hasher.update(raw_body)
+    hasher.update(b"|")
+    hasher.update(timestamp_header.encode("utf-8"))
+    if message_id:
+        hasher.update(b"|")
+        hasher.update(message_id.encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _get_header(headers, *names: str) -> str:
+    """Read a header from either Starlette headers or plain dicts."""
+    if hasattr(headers, "get"):
+        for name in names:
+            value = headers.get(name)
+            if value:
+                return value
+
+    try:
+        normalized = {str(key).lower(): value for key, value in headers.items()}
+    except AttributeError:
+        return ""
+
+    for name in names:
+        value = normalized.get(name.lower())
+        if value:
+            return value
+    return ""
+
+
+def _urlsafe_b64decode_padded(value: str) -> bytes:
+    """Decode a URL-safe base64 value, tolerating missing padding."""
+    padding = (-len(value)) % 4
+    return base64.urlsafe_b64decode(value + ("=" * padding))
+
+
+def _verify_workspace_signature(
+    secret: str,
+    message_id: str,
+    timestamp_header: str,
+    signature_header: str,
+    raw_body: bytes,
+) -> bool:
+    """Verify Recall workspace/Svix request signatures."""
+    if not secret.startswith("whsec_"):
+        return False
+
+    try:
+        signing_key = _urlsafe_b64decode_padded(secret.removeprefix("whsec_"))
+    except (ValueError, binascii.Error):
+        logger.warning("Configured Recall webhook secret is not valid base64")
+        return False
+
+    payload_text = raw_body.decode("utf-8")
+    signed_payload = f"{message_id}.{timestamp_header}.{payload_text}".encode("utf-8")
+    expected_signature = hmac.new(
+        signing_key,
+        signed_payload,
+        hashlib.sha256,
+    ).digest()
+
+    for versioned_signature in signature_header.split():
+        version, _, encoded_signature = versioned_signature.partition(",")
+        if version != "v1" or not encoded_signature:
+            continue
+        try:
+            actual_signature = _urlsafe_b64decode_padded(encoded_signature)
+        except (ValueError, binascii.Error):
+            continue
+        if (
+            len(actual_signature) == len(expected_signature)
+            and hmac.compare_digest(actual_signature, expected_signature)
+        ):
+            return True
+    return False
+
+
+def _authenticate_webhook_request(
+    headers,
+    raw_body: bytes,
+    webhook_secret: str,
+) -> tuple[str, str] | JSONResponse:
+    """Authenticate Recall webhook requests across current and legacy schemes."""
+    message_id = _get_header(headers, "webhook-id", "svix-id")
+    timestamp_header = _get_header(
+        headers,
+        "webhook-timestamp",
+        "svix-timestamp",
+        "X-Recall-Timestamp",
+    )
+    signature_header = _get_header(headers, "webhook-signature", "svix-signature")
+
+    if webhook_secret.startswith("whsec_"):
+        if not (message_id and timestamp_header and signature_header):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "missing verification headers"},
+            )
+        if not _verify_workspace_signature(
+            secret=webhook_secret,
+            message_id=message_id,
+            timestamp_header=timestamp_header,
+            signature_header=signature_header,
+            raw_body=raw_body,
+        ):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return timestamp_header, message_id
+
+    if webhook_secret:
+        token = _get_header(headers, "X-Webhook-Secret")
+        if not hmac.compare_digest(token, webhook_secret):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    if timestamp_header:
+        return timestamp_header, message_id
+    return "", message_id
+
+
+def _prune_greeted_bots(now: float | None = None) -> None:
+    """Drop stale greeted-bot markers so missed terminal events do not leak memory."""
+    current_time = time.time() if now is None else now
+    stale_before = current_time - _GREETED_BOT_TTL_SECONDS
+    expired = [bot_id for bot_id, greeted_at in _greeted_bots.items() if greeted_at <= stale_before]
+    for bot_id in expired:
+        _greeted_bots.pop(bot_id, None)
+
+    if len(_greeted_bots) <= _MAX_GREETED_BOTS:
+        return
+
+    overflow = len(_greeted_bots) - _MAX_GREETED_BOTS
+    for bot_id, _ in sorted(_greeted_bots.items(), key=lambda item: item[1])[:overflow]:
+        _greeted_bots.pop(bot_id, None)
+
+
+def _mark_greeted_bot(bot_id: str, now: float | None = None) -> None:
+    """Record that a bot has been greeted, pruning old entries first."""
+    if not bot_id:
+        return
+    current_time = time.time() if now is None else now
+    _prune_greeted_bots(current_time)
+    _greeted_bots[bot_id] = current_time
+
+
+def _get_payload_bot_id(payload: dict, data: dict) -> str:
+    """Extract the Recall bot id from either payload shape."""
+    for candidate in (payload, data):
+        bot_obj = candidate.get("bot", {})
+        if isinstance(bot_obj, dict):
+            bot_id = bot_obj.get("id", "")
+            if bot_id:
+                return bot_id
+        bot_id = candidate.get("bot_id", "")
+        if bot_id:
+            return bot_id
+    return ""
 
 
 def _log_task_failure(task: asyncio.Task, label: str) -> None:
@@ -63,7 +230,7 @@ def _log_task_failure(task: asyncio.Task, label: str) -> None:
 
 def cleanup_bot_tracking(bot_id: str) -> None:
     """Remove per-bot tracking data when a meeting ends."""
-    _greeted_bots.discard(bot_id)
+    _greeted_bots.pop(bot_id, None)
     echo_tracker.cleanup(bot_id)
     _pending_hey.pop(bot_id, None)
 
@@ -75,21 +242,20 @@ async def recall_webhook(request: Request):
     Returns 200 immediately. Processing happens in a background task
     to keep webhook response time under Recall.ai's timeout.
 
-    Security: validates X-Webhook-Secret header when webhook_secret is
-    configured (OWASP A01:2021 - Broken Access Control).
+    Security: validates either the legacy shared-secret header or the current
+    Recall workspace signature headers when a webhook secret is configured.
     """
-    # Authenticate webhook requests via shared secret header
-    settings = get_settings()
-    if settings.webhook_secret:
-        token = request.headers.get("X-Webhook-Secret", "")
-        import hmac
-        if not hmac.compare_digest(token, settings.webhook_secret):
-            return JSONResponse(
-                status_code=401, content={"error": "unauthorized"}
-            )
+    try:
+        raw_body = await request.body()
+    except Exception:
+        logger.warning("Invalid webhook body")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "invalid payload"},
+        )
 
     try:
-        payload = await request.json()
+        payload = json.loads(raw_body or b"{}")
     except Exception:
         logger.warning("Invalid JSON in webhook payload")
         return JSONResponse(
@@ -97,11 +263,48 @@ async def recall_webhook(request: Request):
             content={"status": "error", "message": "invalid payload"},
         )
 
+    if not isinstance(payload, dict):
+        logger.warning("Webhook payload is not an object")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "invalid payload"},
+        )
+
+    settings = get_settings()
+    auth_result = _authenticate_webhook_request(
+        headers=request.headers,
+        raw_body=raw_body,
+        webhook_secret=settings.webhook_secret,
+    )
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    timestamp_header, message_id = auth_result
+
     # Log raw payload at debug level only
     logger.debug("WEBHOOK RAW: %s", json.dumps(payload, default=str)[:2000])
 
     event = payload.get("event", "")
     data = payload.get("data", {})
+    if timestamp_header:
+        try:
+            request_timestamp = float(timestamp_header)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "invalid timestamp"})
+
+        current_time = time.time()
+        if abs(current_time - request_timestamp) > _MAX_WEBHOOK_AGE_SECONDS:
+            return JSONResponse(status_code=401, content={"error": "expired"})
+
+        nonce = _build_replay_nonce(raw_body, timestamp_header, message_id)
+        async with _seen_nonces_lock:
+            _prune_seen_nonces(current_time)
+            if nonce in _seen_nonces:
+                return JSONResponse(status_code=409, content={"error": "duplicate"})
+            _seen_nonces[nonce] = current_time + _MAX_WEBHOOK_AGE_SECONDS
+    elif settings.webhook_secret:
+        logger.warning(
+            "Webhook secret configured without timestamp headers; replay protection is unavailable"
+        )
 
     # Route to the correct handler — only one task per webhook.
     # Uses bounded concurrency to prevent resource exhaustion.
@@ -275,8 +478,9 @@ async def _handle_transcription(data: dict) -> None:
         logger.info("TRANSCRIPT [%s] %s: %s", bot_id[:8] if bot_id else "?", speaker, text[:120])
 
         # Fallback greeting: if status webhook didn't fire, greet on first transcript
+        _prune_greeted_bots()
         if bot_id and bot_id not in _greeted_bots:
-            _greeted_bots.add(bot_id)
+            _mark_greeted_bot(bot_id)
             await _send_greeting(bot_id)
 
         await engine.process_webhook_transcript(bot_id, speaker, text, sentiment=sentiment)
@@ -301,9 +505,10 @@ async def _handle_status_change(data: dict) -> None:
         logger.info("Bot %s status: %s", bot_id[:8], code)
 
         # Greet immediately when bot joins the call (before anyone speaks)
+        _prune_greeted_bots()
         if code in ("in_call_recording", "in_call_not_recording"):
             if bot_id and bot_id not in _greeted_bots:
-                _greeted_bots.add(bot_id)
+                _mark_greeted_bot(bot_id)
                 await _send_greeting(bot_id)
 
         # Map Recall.ai status codes to our meeting status
@@ -579,7 +784,7 @@ async def _send_greeting(bot_id: str) -> None:
             audio = engine._tts.synthesize(greeting)
         if audio:
             await engine._recall_client.send_audio(bot_id, audio)
-            _echo_mod.record(bot_id, greeting)
+            echo_tracker.record(bot_id, greeting)
             logger.info("Greeting sent for bot %s — going silent", bot_id[:8])
     except Exception as exc:
         logger.warning("Failed to send greeting: %s", exc)

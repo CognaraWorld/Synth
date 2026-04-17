@@ -46,6 +46,8 @@ _CORRECTION_TRIGGERS = (
     "actually", "really", "correction",
 )
 
+_INSIGHT_CHECK_COOLDOWN_SECONDS = 30.0
+
 def _log_task_exception(task: asyncio.Task) -> None:
     """Log unhandled exceptions from fire-and-forget background tasks."""
     if not task.cancelled() and task.exception():
@@ -89,6 +91,8 @@ class BotEngine:
         self._pending_question: dict[str, dict] = {}  # session_id -> {question, speaker, timestamp}
         self._queued_question: dict[str, dict] = {}  # session_id -> question received during RESPONDING
         self._interrupted: dict[str, bool] = {}  # session_id -> True if participant interrupted bot
+        self._insight_last_check: dict[str, float] = {}  # session_id -> last insight verification start time
+        self._insight_inflight: set[str] = set()  # session_ids currently being verified
         self._question_collect_time: float = 0.5  # seconds to wait for user to finish speaking
         self._followup_window: float = 8.0  # seconds after audio finishes playing to accept follow-ups
         self._cooldown_seconds: float = 0.0  # no cooldown
@@ -153,6 +157,8 @@ class BotEngine:
         self._pending_question.pop(session_id, None)
         self._queued_question.pop(session_id, None)
         self._interrupted.pop(session_id, None)
+        self._insight_last_check.pop(session_id, None)
+        self._insight_inflight.discard(session_id)
         self._processing_lock.pop(session_id, None)
         self._last_sentiment.pop(session_id, None)
         self._session_tts.pop(session_id, None)
@@ -625,6 +631,7 @@ class BotEngine:
                 )
                 meeting = result.scalar_one_or_none()
                 if not meeting:
+                    logger.info("No active meeting found for bot %s during recovery", bot_id[:8])
                     return None
 
                 # Load agent info
@@ -732,11 +739,11 @@ class BotEngine:
                     sample_rate=16000, threshold=0.5,
                 )
 
-                logger.warning("Recovered session %s for bot %s (with RAG + docs)", session.session_id, bot_id)
+                logger.info("Recovered session %s for bot %s (with RAG + docs)", session.session_id, bot_id)
                 return session
 
         except Exception as exc:
-            logger.error("Failed to recover session for bot %s: %s", bot_id, exc)
+            logger.error("Failed to recover session for bot %s: %s", bot_id, exc, exc_info=True)
             return None
 
     async def process_webhook_transcript(
@@ -1008,6 +1015,16 @@ class BotEngine:
 
     async def _check_insight(self, session: MeetingSession, speaker: str, text: str) -> None:
         """Background task: verify a factual claim and store correction if wrong."""
+        sid = session.session_id
+        now = time.time()
+        last_check = self._insight_last_check.get(sid, 0.0)
+        if sid in self._insight_inflight or (now - last_check) < _INSIGHT_CHECK_COOLDOWN_SECONDS:
+            logger.debug("Skipping insight check for session %s due to rate limit", sid[:8])
+            return
+
+        self._insight_inflight.add(sid)
+        self._insight_last_check[sid] = now
+
         try:
             result = await verify_claim(
                 text=text,
@@ -1023,6 +1040,8 @@ class BotEngine:
                 )
         except Exception as exc:
             logger.debug("Insight check failed: %s", exc)
+        finally:
+            self._insight_inflight.discard(session.session_id)
 
     async def _handle_question(
         self,
@@ -1390,8 +1409,8 @@ class BotEngine:
             if session.bot_id:
                 try:
                     await self._recall_client.mute(session.bot_id)
-                except Exception:
-                    pass
+                except Exception as mute_exc:
+                    logger.warning("Failed to mute during error recovery: %s", mute_exc)
             try:
                 session.transition(SessionState.LISTENING)
             except ValueError:

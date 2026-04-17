@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -176,7 +177,16 @@ async def _handle_checkout_completed(
         logger.error("Webhook received invalid user_id: %s", user_id)
         return
 
-    # Check for duplicate processing
+    result = await db.execute(
+        select(User).where(User.id == user_uuid).with_for_update()
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        logger.error("Webhook user not found: %s", user_id)
+        return
+
+    # Duplicate check happens after taking the user row lock so concurrent
+    # deliveries for the same session serialize cleanly on existing DBs.
     existing = await db.execute(
         select(CreditTransaction).where(
             CreditTransaction.stripe_session_id == stripe_session_id
@@ -184,12 +194,6 @@ async def _handle_checkout_completed(
     )
     if existing.scalar_one_or_none():
         logger.info("Duplicate webhook for session %s, skipping", stripe_session_id)
-        return
-
-    result = await db.execute(select(User).where(User.id == user_uuid))
-    user = result.scalar_one_or_none()
-    if not user:
-        logger.error("Webhook user not found: %s", user_id)
         return
 
     credits_to_add = pack["credits"]
@@ -206,7 +210,15 @@ async def _handle_checkout_completed(
     )
     db.add(transaction)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        logger.info(
+            "Duplicate Stripe webhook resolved by constraint for session %s",
+            stripe_session_id,
+        )
+        return
     logger.info(
         "Added %d credits to user %s (balance: %d)",
         credits_to_add,

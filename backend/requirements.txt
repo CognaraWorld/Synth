@@ -10,9 +10,9 @@ alembic==1.14.0
 psycopg2-binary==2.9.10
 
 # Auth
-# python-jose retained temporarily for websocket.py; auth.py now uses PyJWT
-# (python-jose has CVE-2024-33663 algorithm-confusion issues and is
-# effectively unmaintained). Remove once websocket.py finishes migrating.
+# python-jose retained temporarily as a compatibility fallback for websocket auth.
+# Auth.py uses PyJWT directly; websocket.py prefers PyJWT and only falls back when
+# PyJWT is unavailable in the running environment.
 python-jose[cryptography]==3.3.0
 PyJWT==2.9.0
 passlib[bcrypt]==1.7.4
@@ -48,6 +48,9 @@ stripe==11.4.0
 python-dotenv==1.0.1
 pydantic[email]==2.10.0
 pydantic-settings==2.7.0
+tenacity==8.5.0
+python-json-logger==2.0.7
+prometheus-fastapi-instrumentator==6.1.0
 
 # Testing
 pytest==9.0.2

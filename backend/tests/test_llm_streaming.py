@@ -18,6 +18,83 @@ class _PendingExecutor:
         return self.future
 
 
+def test_query_retries_transient_gemini_failure_before_succeeding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import llm as llm_module
+    from app.core.llm import LLMClient
+
+    class _TransientGeminiError(RuntimeError):
+        status_code = 503
+
+    client = LLMClient()
+    attempts = 0
+    sleep_calls: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    def generate_content(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _TransientGeminiError("service unavailable")
+        return SimpleNamespace(text="Gemini answer")
+
+    monkeypatch.setattr(llm_module.time, "sleep", fake_sleep)
+    client.gemini_client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=generate_content),
+    )
+
+    def fail_claude(*_args, **_kwargs):
+        raise AssertionError(
+            "Claude fallback should not run when Gemini succeeds on retry",
+        )
+
+    client._claude_query = fail_claude
+
+    result = client.query(context="ctx", question="question")
+
+    assert result == "Gemini answer"
+    assert attempts == 2
+    assert sleep_calls == [0.25]
+
+
+@pytest.mark.asyncio
+async def test_async_query_retries_transient_claude_failure_before_succeeding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import llm as llm_module
+    from app.core.llm import LLMClient
+
+    class _TransientClaudeError(RuntimeError):
+        status_code = 429
+
+    client = LLMClient()
+    attempts = 0
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    async def create(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _TransientClaudeError("rate limited")
+        return SimpleNamespace(content=[SimpleNamespace(text="Claude answer")])
+
+    monkeypatch.setattr(llm_module.asyncio, "sleep", fake_sleep)
+    client.gemini_client = None
+    client._claude_async = SimpleNamespace(messages=SimpleNamespace(create=create))
+
+    result = await client.async_query(context="ctx", question="question")
+
+    assert result == "Claude answer"
+    assert attempts == 2
+    assert sleep_calls == [0.25]
+
+
 @pytest.mark.asyncio
 async def test_async_query_stream_cancelled_async_gemini_does_not_fallback() -> None:
     from app.core.llm import LLMClient

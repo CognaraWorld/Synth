@@ -11,9 +11,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from app.api.websocket import get_engine
 from app.config import get_settings
 from app.core.bot_engine import BotEngine
+from app.core.engine_singleton import get_engine
 from app.meeting.recall_client import RecallClient
 from app.models.database import Agent, LiveSession, Meeting, OperatorInstruction, User
 
@@ -203,7 +203,6 @@ class LiveSessionService:
             session_id = await self.engine.join_meeting(
                 meeting.meeting_link,
                 self._build_agent_config(meeting.agent),
-                meeting_id=str(meeting.id),
             )
             engine_session = self.engine.sessions.get(session_id)
 

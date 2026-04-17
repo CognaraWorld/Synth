@@ -35,6 +35,9 @@ class RollingSummary:
             a summary update.
     """
 
+    MAX_PENDING_TEXT_CHARS = 4000
+    MAX_PENDING_PREVIEW_CHARS = 500
+
     def __init__(self, update_interval_chars: int = 300) -> None:
         """Initialize the rolling summary.
 
@@ -52,6 +55,15 @@ class RollingSummary:
         # drift over long meetings (Item 8).
         self._key_facts: list[str] = []
         self._update_count: int = 0
+
+    def _append_pending_text(self, text: str) -> None:
+        """Append text to the pending buffer and keep only the newest tail."""
+        if not text:
+            return
+
+        self._pending_text += text
+        if len(self._pending_text) > self.MAX_PENDING_TEXT_CHARS:
+            self._pending_text = self._pending_text[-self.MAX_PENDING_TEXT_CHARS :]
 
     def set_llm_client(self, llm_client: Any) -> None:
         """Inject the LLM client used for summarization calls.
@@ -73,7 +85,7 @@ class RollingSummary:
             new_transcript_chunk: New transcript text to incorporate.
         """
         with self._lock:
-            self._pending_text += new_transcript_chunk
+            self._append_pending_text(new_transcript_chunk)
             if (
                 len(self._pending_text) < self.update_interval_chars
                 or self._llm_client is None
@@ -154,7 +166,8 @@ class RollingSummary:
         """Return the current rolling summary.
 
         If there is pending text that has not yet been summarized, it is
-        appended as a note so the caller always sees the freshest content.
+        appended as a bounded note so the caller always sees the freshest
+        content without echoing an unbounded raw backlog.
 
         Returns:
             The accumulated summary text, potentially with a pending-text
@@ -163,10 +176,13 @@ class RollingSummary:
         """
         with self._lock:
             if self._pending_text:
+                preview = self._pending_text[-self.MAX_PENDING_PREVIEW_CHARS :]
+                if len(self._pending_text) > self.MAX_PENDING_PREVIEW_CHARS:
+                    preview = f"...{preview}"
                 return (
                     self.summary
                     + "\n\n[Recent, not yet summarized]: "
-                    + self._pending_text
+                    + preview
                 )
             return self.summary
 
@@ -176,7 +192,7 @@ class RollingSummary:
         Used by callers that cannot run async update() (e.g., from sync contexts).
         """
         with self._lock:
-            self._pending_text += text
+            self._append_pending_text(text)
 
     def get_pending_length(self) -> int:
         """Return the character length of text awaiting summarization.

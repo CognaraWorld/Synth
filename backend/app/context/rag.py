@@ -23,6 +23,12 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
+_HYBRID_STOPWORDS = {
+    "what", "when", "where", "which", "that", "this", "with",
+    "from", "about", "have", "been", "were", "they", "their",
+    "will", "would", "could", "should", "does",
+}
+
 # -----------------------------------------------------------------------
 # Shared embedding model singleton (Item 3)
 # One ~1.3 GB model for the whole process, not one per agent.
@@ -103,6 +109,7 @@ class RAGPipeline:
             metadata={"hnsw:space": "cosine"},
         )
         self._model = _get_shared_model(embedding_model)
+        self._failed_batch_chunks: list[dict[str, Any]] = []
 
     def _encode(self, texts: str | list[str]) -> list:
         """Thread-safe wrapper around SentenceTransformer.encode."""
@@ -130,6 +137,8 @@ class RAGPipeline:
         """Add multiple text chunks in a single operation."""
         if not chunks:
             return
+
+        self._retry_failed_batch_chunks()
         try:
             texts = [c["text"] for c in chunks]
             metadatas = [c["metadata"] for c in chunks]
@@ -142,7 +151,13 @@ class RAGPipeline:
                 embeddings=embeddings,
             )
         except Exception as exc:
-            logger.error("Failed to add batch of %d chunks: %s", len(chunks), exc)
+            logger.warning(
+                "Failed to add batch of %d chunks: %s; queueing per-chunk retry",
+                len(chunks),
+                exc,
+            )
+            self._failed_batch_chunks.extend(chunks)
+            self._retry_failed_batch_chunks()
 
     # ------------------------------------------------------------------
     # Deletion (Item 2)
@@ -262,13 +277,7 @@ class RAGPipeline:
     ) -> list[dict[str, Any]]:
         """Hybrid search (semantic + keyword) with optional metadata filter."""
         semantic_results = self.search(query=query, top_k=top_k, where=where)
-
-        _stopwords = {
-            "what", "when", "where", "which", "that", "this", "with",
-            "from", "about", "have", "been", "were", "they", "their",
-            "will", "would", "could", "should", "does",
-        }
-        terms = [w for w in query.lower().split() if len(w) > 3 and w not in _stopwords]
+        terms = [w for w in query.lower().split() if len(w) > 3 and w not in _HYBRID_STOPWORDS]
 
         keyword_results: list[dict[str, Any]] = []
         seen_texts: set[str] = {r["text"][:100] for r in semantic_results}
@@ -298,6 +307,28 @@ class RAGPipeline:
                 logger.debug("Keyword search for '%s' failed: %s", term, exc)
 
         return (semantic_results + keyword_results)[:top_k]
+
+    def _retry_failed_batch_chunks(self) -> None:
+        """Retry chunks that previously failed in batch ingestion."""
+        if not self._failed_batch_chunks:
+            return
+
+        chunks_to_retry = list(self._failed_batch_chunks)
+        still_failed: list[dict[str, Any]] = []
+        succeeded = 0
+
+        for chunk in chunks_to_retry:
+            try:
+                self.add_chunk(text=chunk["text"], metadata=chunk["metadata"])
+                succeeded += 1
+            except Exception as exc:
+                still_failed.append(chunk)
+                logger.debug("Chunk retry failed: %s", exc)
+
+        if succeeded:
+            logger.info("Retried %d previously failed batch chunks successfully", succeeded)
+
+        self._failed_batch_chunks = still_failed
 
     # ------------------------------------------------------------------
     # Utilities

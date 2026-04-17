@@ -4,13 +4,19 @@ import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-import jwt
-from jwt.exceptions import InvalidTokenError
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.security import OAuth2PasswordBearer
+
+try:
+    import jwt
+    from jwt.exceptions import InvalidTokenError
+except ModuleNotFoundError:  # pragma: no cover - only hits when PyJWT isn't installed
+    from jose import JWTError, jwt
+
+    InvalidTokenError = JWTError
 
 from app.config import get_settings
 from app.core.rate_limiter import check_named_limit

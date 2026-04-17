@@ -172,3 +172,34 @@ class TestOrphanBotReconciliation:
 
         # No orphans means no commit needed
         mock_db.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_duration_orphan_skips_billing_delta(self) -> None:
+        meeting = MagicMock(
+            id=uuid4(),
+            user_id=uuid4(),
+            bot_id=None,
+            status="active",
+            started_at=None,
+            ended_at=None,
+            credits_used=0,
+        )
+
+        mock_db = AsyncMock()
+        select_result = MagicMock()
+        select_result.scalars.return_value.all.return_value = [meeting]
+        mock_db.execute.return_value = select_result
+        mock_db.commit = AsyncMock()
+
+        mock_session_ctx = AsyncMock()
+        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_db)
+        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        from app import main as main_module
+
+        with patch("app.models.database.AsyncSessionLocal", MagicMock(return_value=mock_session_ctx)):
+            await main_module._stop_orphaned_bots()
+
+        assert mock_db.execute.await_count == 1
+        assert meeting.status == "ended"
+        mock_db.commit.assert_awaited_once()
