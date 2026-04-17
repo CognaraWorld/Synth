@@ -95,6 +95,9 @@ export function useChat(meetingId: string, options?: { crossMeeting?: boolean })
         if (err instanceof DOMException && err.name === "AbortError") return;
         if (meetingIdRef.current !== meetingId) return;
         setHistoryLoaded(true);
+        setError(
+          err instanceof Error ? err.message : "Failed to load chat history.",
+        );
       });
 
     return () => controller.abort();
@@ -264,6 +267,24 @@ export function useChat(meetingId: string, options?: { crossMeeting?: boolean })
               }
               break;
             }
+          }
+
+          if (controller.signal.aborted) {
+            setMessages((current) =>
+              current.filter((message) => message.id !== tempUserId && message.id !== streamingId)
+            );
+
+            try {
+              const resyncController = new AbortController();
+              resyncAbortRef.current = resyncController;
+              const history = await loadHistory(currentMeetingId, resyncController.signal);
+              if (meetingIdRef.current === currentMeetingId && !resyncController.signal.aborted) {
+                setMessages(history);
+              }
+            } catch {
+              // Ignore sync failure after an abort.
+            }
+            return;
           }
 
           if (!completed && !controller.signal.aborted) {

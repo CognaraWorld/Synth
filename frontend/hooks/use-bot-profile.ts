@@ -13,12 +13,15 @@ async function fetchBotProfile() {
   return result.data;
 }
 
-export function useBotProfile() {
+export function useBotProfile(options?: { initialData?: BotProfileDTO }) {
   const queryClient = useQueryClient();
+  const hasInitialData = Boolean(options?.initialData);
 
   const query = useQuery({
     queryKey: ["bot-profile"],
-    queryFn: fetchBotProfile
+    queryFn: fetchBotProfile,
+    initialData: options?.initialData,
+    staleTime: hasInitialData ? 60_000 : 0
   });
 
   const mutation = useMutation({

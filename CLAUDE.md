@@ -9,7 +9,7 @@ AI meeting bot that joins Zoom/Teams/Google Meet as a voice participant. Listens
 | Layer | Technology | Notes |
 |---|---|---|
 | Backend | Python 3.12, FastAPI, SQLAlchemy (async), PostgreSQL | `backend/app/` |
-| Frontend | Next.js 16.2.2 (App Router), React 19, Tailwind v4, shadcn/ui | `frontend/` |
+| Frontend | Next.js 14.2.5 (App Router), React 18.3.1, Tailwind 3.4.7, shadcn/ui | `frontend/` |
 | LLM | Gemini 2.5 Flash Lite (primary), Claude Haiku 4.5 (fallback) | Gemini for Q&A, Claude for summaries/streaming |
 | Transcription | Deepgram Nova-3 via Recall.ai (streaming) | Keyword boost `Nova:5` |
 | TTS | Kokoro (persona-bound voices, 24kHz, 1.1x speed) | Pre-loaded at startup, synthesis in thread executor |

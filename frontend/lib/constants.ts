@@ -34,3 +34,16 @@ export const voiceOptions = [
   { value: "MALE", label: "Male" },
   { value: "FEMALE", label: "Female" }
 ] as const;
+
+export const personaDescriptions: Record<string, string> = {
+  Professional:
+    "Professional and strategic meeting copilot that answers crisply and drives decisions to closure.",
+  Friendly:
+    "Warm and approachable assistant that keeps meetings positive and ensures everyone feels heard.",
+  Technical:
+    "Technically precise assistant that provides detailed answers with data references and system context.",
+  Strategic:
+    "Strategic advisor that frames discussions around business goals, trade-offs, and key decisions.",
+  "Research Assistant":
+    "Thorough research-oriented assistant that surfaces relevant data during discussions."
+};

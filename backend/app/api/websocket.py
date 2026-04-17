@@ -84,12 +84,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         websocket: The incoming WebSocket connection.
         session_id: The meeting session ID to stream updates for.
     """
-    # Authenticate via JWT token in query params before accepting.
-    # WebSocket connections cannot use standard Authorization headers,
-    # so the token is passed as a query parameter instead.
+    # Authenticate before accepting. Two paths are supported:
+    # 1. ``?ticket=`` — short-lived single-use ticket from POST /api/auth/ws-ticket.
+    #    Preferred. Limits blast radius of URL-bound credentials to 60s + one use.
+    # 2. ``?token=`` — raw backend JWT. Legacy path, kept for backward compat.
+    #    TODO(devyansh): drop during PyJWT migration once frontend fully uses tickets.
     settings = get_settings()
+    ticket = websocket.query_params.get("ticket")
     token = websocket.query_params.get("token")
-    if not token:
+    if not ticket and not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
 
@@ -98,17 +101,39 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=4001, reason="Authentication not configured")
         return
 
-    try:
-        payload = jwt.decode(
-            token, settings.secret_key, algorithms=[settings.algorithm]
+    user_id: str | None = None
+    if ticket:
+        from app.core.ws_tickets import consume_ticket
+
+        consumed = consume_ticket(ticket)
+        if consumed is None:
+            await websocket.close(code=4001, reason="Invalid or expired ticket")
+            return
+        user_id = str(consumed)
+    else:
+        # Legacy `?token=` path. Logged at WARNING so we can see whether any
+        # client is still hitting it before the PyJWT migration removes this
+        # branch. Two JWT libs (python-jose here, PyJWT in auth.py) decoding
+        # tokens for the same app is exactly the CVE-2024-33663 surface, so
+        # this path should be deleted as soon as the frontend is verified
+        # to only use ws-tickets.
+        logger.warning(
+            "WebSocket auth used deprecated ?token= path from client %s (session %s). "
+            "Tracking removal — see audit finding S-09 / websocket.py PyJWT migration.",
+            websocket.client.host if websocket.client else "unknown",
+            session_id[:8],
         )
-        user_id = payload.get("sub")
-        if not user_id:
+        try:
+            payload = jwt.decode(
+                token, settings.secret_key, algorithms=[settings.algorithm]
+            )
+            user_id = payload.get("sub")
+            if not user_id:
+                await websocket.close(code=4001, reason="Invalid token")
+                return
+        except (JWTError, Exception):
             await websocket.close(code=4001, reason="Invalid token")
             return
-    except (JWTError, Exception):
-        await websocket.close(code=4001, reason="Invalid token")
-        return
 
     # Verify the authenticated user owns this session (prevent IDOR)
     # Fail-closed: reject if session not found or ownership can't be verified

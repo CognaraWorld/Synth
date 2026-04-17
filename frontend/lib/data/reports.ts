@@ -1,6 +1,5 @@
 import { getBackendToken } from "@/lib/auth/session";
-import { backendGet } from "@/lib/backend-client";
-import { sampleReports } from "@/lib/sample-data";
+import { BackendError, backendGet } from "@/lib/backend-client";
 import {
   type BackendReportDetailResponse,
   type BackendReportListResponse,
@@ -9,26 +8,26 @@ import {
 
 export async function getReports() {
   const token = await getBackendToken();
-  if (!token) return sampleReports;
-
-  try {
-    const reports = await backendGet<BackendReportListResponse>("/api/reports/?per_page=100", token);
-    return reports.reports.map(transformReport);
-  } catch (err) {
-    console.error("[reports] getReports failed:", err);
-    return sampleReports;
+  if (!token) {
+    throw new Error("Not authenticated");
   }
+  const reports = await backendGet<BackendReportListResponse>("/api/reports/?per_page=100", token);
+  return reports.reports.map(transformReport);
 }
 
 export async function getReportById(reportId: string) {
   const token = await getBackendToken();
-  if (!token) return sampleReports[0];
-
+  if (!token) {
+    throw new Error("Not authenticated");
+  }
   try {
-    const report = await backendGet<BackendReportDetailResponse>(`/api/reports/${reportId}`, token);
-    return transformReport(report);
+    return transformReport(
+      await backendGet<BackendReportDetailResponse>(`/api/reports/${reportId}`, token)
+    );
   } catch (err) {
-    console.error("[reports] getReportById failed:", err);
-    return sampleReports[0];
+    if (err instanceof BackendError && err.status === 404) {
+      return null;
+    }
+    throw err;
   }
 }

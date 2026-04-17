@@ -1,17 +1,40 @@
 import { NextRequest } from "next/server";
-import { successResponse } from "@/lib/api-response";
+import { z } from "zod";
+import { successResponse, errorResponse } from "@/lib/api-response";
 import { backendPost } from "@/lib/backend-client";
-import { backendErrorResponse, notAuthenticatedResponse, requireBackendToken } from "@/lib/backend-proxy";
+import {
+  backendErrorResponse,
+  notAuthenticatedResponse,
+  requireBackendToken,
+} from "@/lib/backend-proxy";
 
-export async function POST(request: NextRequest, { params }: { params: { meetingId: string } }) {
+const instructionSchema = z.object({
+  instruction: z.string().trim().min(1).max(2000),
+});
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: { meetingId: string } },
+) {
   const token = await requireBackendToken();
   if (!token) {
     return notAuthenticatedResponse();
   }
 
   try {
-    const body = await request.json();
-    const result = await backendPost(`/api/live-sessions/${params.meetingId}/instructions`, body, token);
+    const raw = await request.json();
+    const parsed = instructionSchema.safeParse(raw);
+    if (!parsed.success) {
+      return errorResponse(
+        "instruction must be a non-empty string under 2000 characters",
+        400,
+      );
+    }
+    const result = await backendPost(
+      `/api/live-sessions/${params.meetingId}/instructions`,
+      parsed.data,
+      token,
+    );
     return successResponse(result);
   } catch (error) {
     return backendErrorResponse(error, "Failed to send instruction");

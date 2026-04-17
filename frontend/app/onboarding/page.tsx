@@ -9,15 +9,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { personaPresets, voiceOptions } from "@/lib/constants";
-
-const PERSONA_DESCRIPTIONS: Record<string, string> = {
-  Professional: "Professional and strategic meeting copilot that answers crisply and drives decisions to closure.",
-  Friendly: "Warm and approachable assistant that keeps meetings positive and ensures everyone feels heard.",
-  Technical: "Technically precise assistant that provides detailed answers with data references and system context.",
-  Strategic: "Strategic advisor that frames discussions around business goals, trade-offs, and key decisions.",
-  "Research Assistant": "Thorough research-oriented assistant that surfaces relevant data during discussions."
-};
+import { personaDescriptions, personaPresets, voiceOptions } from "@/lib/constants";
 
 export default function OnboardingPage() {
   const router = useRouter();
@@ -37,7 +29,7 @@ export default function OnboardingPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: botName,
-          persona: isCustom ? customPersona : PERSONA_DESCRIPTIONS[selectedPreset] ?? selectedPreset,
+          persona: isCustom ? customPersona : personaDescriptions[selectedPreset] ?? selectedPreset,
           voice,
           responseMode: "WAKE_WORD_ONLY"
         })
