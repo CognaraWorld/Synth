@@ -41,6 +41,14 @@ _MAX_OUTSTANDING_TICKETS = 10_000
 # backend workers we need Redis here. For now the ``engine_singleton``
 # story already pins us to one worker, so this is consistent.
 _tickets: dict[str, tuple[UUID, float]] = {}
+
+# Deliberately a ``threading.Lock``, not ``asyncio.Lock``. Every operation
+# here is a microsecond-scale dict lookup / mutation, so holding the lock
+# never blocks the event loop in a way we'd notice. And because it is a
+# threading lock, the store is safe to call from code running in a
+# thread-executor (e.g. some of BotEngine's TTS/embedding paths) without
+# having to build an async bridge. If any of these operations ever grows
+# real I/O, switch to ``asyncio.Lock`` and make the callers async.
 _lock = threading.Lock()
 _last_cleanup: float = 0.0
 

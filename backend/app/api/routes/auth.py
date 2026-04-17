@@ -1,4 +1,5 @@
 import hmac
+import ipaddress
 import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
@@ -39,24 +40,50 @@ _INSECURE_SERVICE_SECRETS = frozenset(
 )
 
 
+def _parse_ip(candidate: str) -> str | None:
+    """Return *candidate* iff it parses as a valid IPv4/IPv6 address."""
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort client IP extraction for rate-limit keys.
 
-    Prefers ``X-Forwarded-For`` (first address) when running behind a
-    reverse proxy, falls back to the direct socket peer. Ignores anything
-    unparseable so a missing header never yields a blank key.
+    Prefers ``X-Forwarded-For`` (first address) then ``X-Real-IP``, then
+    the direct socket peer. Every candidate is validated through
+    ``ipaddress.ip_address()`` so clients that inject arbitrary strings
+    (``"; DROP TABLE"``, 10 MB of bytes, etc.) can't pollute the rate
+    limiter's key space with garbage.
+
+    **Trusted-proxy assumption:** this function trusts whatever appears in
+    ``X-Forwarded-For`` / ``X-Real-IP``. That is only safe when a reverse
+    proxy *you control* terminates the client connection and overwrites
+    those headers before handing the request to uvicorn. If you ever run
+    this service without such a proxy (e.g. exposed directly to the
+    internet), set ``--forwarded-allow-ips`` on uvicorn or drop the
+    header-based paths from this helper, otherwise an attacker can bypass
+    IP-based rate limits by rotating the header on every request.
     """
     fwd = request.headers.get("x-forwarded-for") or ""
     if fwd:
-        first = fwd.split(",")[0].strip()
+        first = _parse_ip(fwd.split(",")[0])
         if first:
             return first
-    real = request.headers.get("x-real-ip")
-    if real:
-        return real.strip()
+    real = request.headers.get("x-real-ip") or ""
+    parsed_real = _parse_ip(real)
+    if parsed_real:
+        return parsed_real
     client = request.client
     if client and client.host:
-        return client.host
+        parsed_peer = _parse_ip(client.host)
+        if parsed_peer:
+            return parsed_peer
     return "unknown"
 
 

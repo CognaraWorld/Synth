@@ -236,3 +236,63 @@ class TestServiceTokenEndpoint:
                 name="",
                 service_secret="secret",
             )
+
+    def test_service_token_request_bounds_secret_length(self) -> None:
+        """Oversized service_secret must be rejected before hitting hmac."""
+        with pytest.raises(Exception):
+            ServiceTokenRequest(
+                email="user@example.com",
+                name="Test",
+                service_secret="x" * 1025,
+            )
+        # 1024 exactly should still be allowed
+        ServiceTokenRequest(
+            email="user@example.com",
+            name="Test",
+            service_secret="x" * 1024,
+        )
+
+
+class TestClientIP:
+    """Validate _client_ip() rejects non-IP strings in forwarding headers."""
+
+    def test_rejects_non_ip_xff_header(self) -> None:
+        from app.api.routes.auth import _client_ip
+
+        request = MagicMock()
+        request.headers = {"x-forwarded-for": "; DROP TABLE users"}
+        request.client = MagicMock(host="10.0.0.1")
+        # Invalid XFF should fall through to the socket peer.
+        assert _client_ip(request) == "10.0.0.1"
+
+    def test_rejects_non_ip_real_ip_header(self) -> None:
+        from app.api.routes.auth import _client_ip
+
+        request = MagicMock()
+        request.headers = {"x-real-ip": "not-an-ip"}
+        request.client = MagicMock(host="10.0.0.2")
+        assert _client_ip(request) == "10.0.0.2"
+
+    def test_accepts_valid_ipv4(self) -> None:
+        from app.api.routes.auth import _client_ip
+
+        request = MagicMock()
+        request.headers = {"x-forwarded-for": "203.0.113.42, 10.0.0.1"}
+        request.client = MagicMock(host="127.0.0.1")
+        assert _client_ip(request) == "203.0.113.42"
+
+    def test_accepts_valid_ipv6(self) -> None:
+        from app.api.routes.auth import _client_ip
+
+        request = MagicMock()
+        request.headers = {"x-forwarded-for": "2001:db8::1"}
+        request.client = MagicMock(host="127.0.0.1")
+        assert _client_ip(request) == "2001:db8::1"
+
+    def test_returns_unknown_when_nothing_parseable(self) -> None:
+        from app.api.routes.auth import _client_ip
+
+        request = MagicMock()
+        request.headers = {"x-forwarded-for": "bogus"}
+        request.client = MagicMock(host="also-bogus")
+        assert _client_ip(request) == "unknown"

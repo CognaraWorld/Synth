@@ -111,6 +111,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
             return
         user_id = str(consumed)
     else:
+        # Legacy `?token=` path. Logged at WARNING so we can see whether any
+        # client is still hitting it before the PyJWT migration removes this
+        # branch. Two JWT libs (python-jose here, PyJWT in auth.py) decoding
+        # tokens for the same app is exactly the CVE-2024-33663 surface, so
+        # this path should be deleted as soon as the frontend is verified
+        # to only use ws-tickets.
+        logger.warning(
+            "WebSocket auth used deprecated ?token= path from client %s (session %s). "
+            "Tracking removal — see audit finding S-09 / websocket.py PyJWT migration.",
+            websocket.client.host if websocket.client else "unknown",
+            session_id[:8],
+        )
         try:
             payload = jwt.decode(
                 token, settings.secret_key, algorithms=[settings.algorithm]

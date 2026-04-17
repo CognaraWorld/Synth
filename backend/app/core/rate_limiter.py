@@ -57,18 +57,25 @@ class InMemoryRateLimiter:
         now = datetime.now(timezone.utc).timestamp()
         async with self._lock:
             # Periodic cleanup: evict buckets whose newest entry has aged out
-            # of the largest window we know about (default + named limits).
+            # of *that bucket's own window*. Using the global max (3600s from
+            # register) for all buckets kept 60s-window entries alive 60× too
+            # long under many-IP load. We look the window up from the bucket
+            # prefix (e.g. "login:1.2.3.4" → login window), and fall back to
+            # the current call's window for unprefixed keys (chat).
             if now - self._last_cleanup > 300 or len(self._buckets) > self._MAX_BUCKETS:
-                max_window = max(
-                    window_seconds,
-                    _WINDOW_SECONDS,
-                    *(w for _, w in NAMED_LIMITS.values()),
-                )
-                stale = [
-                    uid
-                    for uid, ts_list in self._buckets.items()
-                    if not ts_list or now - ts_list[-1] >= max_window
-                ]
+                stale: list[str] = []
+                for uid, ts_list in self._buckets.items():
+                    if not ts_list:
+                        stale.append(uid)
+                        continue
+                    # "<bucket>:<key>" → use NAMED_LIMITS window; bare keys
+                    # (chat's raw user_id) use the current call's window.
+                    prefix = uid.split(":", 1)[0] if ":" in uid else ""
+                    bucket_window = (
+                        NAMED_LIMITS[prefix][1] if prefix in NAMED_LIMITS else window_seconds
+                    )
+                    if now - ts_list[-1] >= bucket_window:
+                        stale.append(uid)
                 for uid in stale:
                     del self._buckets[uid]
                 self._last_cleanup = now

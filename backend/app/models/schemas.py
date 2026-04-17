@@ -56,7 +56,11 @@ class LoginRequest(BaseModel):
 class ServiceTokenRequest(BaseModel):
     email: EmailStr
     name: NameField
-    service_secret: str
+    # Bound the secret length so an attacker cannot POST a multi-MB payload
+    # that still gets held through JSON parse, Pydantic validation, and
+    # hmac.compare_digest. Real secrets are ≤64 chars; 1024 is a
+    # comfortable ceiling that keeps the endpoint cheap to reject.
+    service_secret: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
 
 
 class WebSocketTicketResponse(BaseModel):
