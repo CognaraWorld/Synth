@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-in-production"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440  # 24 hours
-    service_secret: str = Field(default="cognara-service-secret-dev", alias="BACKEND_SERVICE_SECRET")
+    service_secret: str = Field(default="", alias="BACKEND_SERVICE_SECRET")
 
     # Claude API
     anthropic_api_key: str = ""

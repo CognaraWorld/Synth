@@ -6,6 +6,8 @@ and checkpoint save/restore.
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -82,6 +84,52 @@ class TestEmbedFailureRetry:
             cm._retry_failed_embeds()
 
         assert len(cm._embed_failed_chunks) == 0
+
+
+class TestRagBatchRetry:
+    """Batch ingestion should preserve failed chunks for retry."""
+
+    def test_failed_batch_chunks_fall_back_to_individual_retry(self) -> None:
+        chromadb_stub = types.ModuleType("chromadb")
+        chromadb_stub.PersistentClient = MagicMock()
+        sentence_transformers_stub = types.ModuleType("sentence_transformers")
+        sentence_transformers_stub.SentenceTransformer = MagicMock()
+
+        with patch.dict(
+            sys.modules,
+            {
+                "chromadb": chromadb_stub,
+                "sentence_transformers": sentence_transformers_stub,
+            },
+        ):
+            from app.context.rag import RAGPipeline
+
+        pipeline = object.__new__(RAGPipeline)
+        pipeline._failed_batch_chunks = []
+        pipeline._collection = MagicMock()
+
+        def fake_encode(texts):
+            if isinstance(texts, list):
+                return [[0.1] for _ in texts]
+            return [0.1]
+
+        pipeline._encode = MagicMock(side_effect=fake_encode)
+
+        batch = [
+            {"text": "alpha", "metadata": {"chunk_index": 1}},
+            {"text": "beta", "metadata": {"chunk_index": 2}},
+        ]
+
+        pipeline._collection.add.side_effect = [
+            RuntimeError("batch failed"),
+            None,
+            RuntimeError("bad chunk"),
+        ]
+
+        pipeline.add_chunks_batch(batch)
+
+        assert pipeline._collection.add.call_count == 3
+        assert pipeline._failed_batch_chunks == [batch[1]]
 
 
 class TestTruncationDirection:

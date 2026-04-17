@@ -129,6 +129,26 @@ class TestRollingSummaryWithLLM:
         prompt = call_args.kwargs.get("question") or call_args[1].get("question") or call_args[0][1]
         assert "Previous summary content." in prompt
 
+    def test_update_caps_pending_text_during_llm_outage(self) -> None:
+        """Repeated failed updates should keep only a bounded pending tail."""
+
+        class FailingLLM:
+            async def async_query(self, context: str, question: str) -> str:
+                raise RuntimeError("LLM outage")
+
+        rs = RollingSummary(update_interval_chars=1)
+        rs.set_llm_client(FailingLLM())
+
+        chunk_template = "chunk-{index:02d}-" + ("x" * 180)
+        for index in range(40):
+            asyncio.get_event_loop().run_until_complete(
+                rs.update(chunk_template.format(index=index))
+            )
+
+        assert rs.get_pending_length() == rs.MAX_PENDING_TEXT_CHARS
+        assert "chunk-39" in rs._pending_text
+        assert "chunk-00" not in rs._pending_text
+
 
 class TestRollingSummaryHelpers:
     """Test helper methods."""
@@ -160,6 +180,25 @@ class TestRollingSummaryHelpers:
         assert rs._llm_client is mock_llm
         assert rs.summary == ""
         assert rs._pending_text == ""
+
+    def test_get_summary_uses_bounded_pending_preview(self) -> None:
+        """get_summary should only expose a bounded pending-text preview."""
+        rs = RollingSummary()
+        rs.summary = "Existing summary."
+        rs._pending_text = "".join(f"chunk-{i:03d}|" for i in range(200))
+
+        result = rs.get_summary()
+
+        assert result.startswith("Existing summary.")
+        assert "[Recent, not yet summarized]:" in result
+        assert "chunk-000|" not in result
+        assert "chunk-199|" in result
+        assert len(result) <= (
+            len("Existing summary.")
+            + len("\n\n[Recent, not yet summarized]: ")
+            + RollingSummary.MAX_PENDING_PREVIEW_CHARS
+            + 3
+        )
 
 
 # =====================================================================

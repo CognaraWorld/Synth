@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func, or_, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -82,6 +83,7 @@ async def refund_meeting_credit(
             Meeting.id == meeting_id,
             Meeting.user_id == current_user.id,
         )
+        .with_for_update()
     )
     meeting = result.scalar_one_or_none()
     if not meeting:
@@ -136,7 +138,14 @@ async def refund_meeting_credit(
     )
     db.add(transaction)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This meeting has already been refunded",
+        )
     await db.refresh(transaction)
 
     logger.info(

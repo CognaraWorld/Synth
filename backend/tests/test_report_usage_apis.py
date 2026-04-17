@@ -13,9 +13,7 @@ import pytest
 
 class TestReportFinalization:
     @pytest.mark.asyncio
-    async def test_finalize_meeting_artifacts_persists_report_and_usage(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_finalize_meeting_artifacts_persists_report_and_usage(self) -> None:
         from app.meeting.reporting import finalize_meeting_artifacts
 
         meeting = SimpleNamespace(
@@ -64,38 +62,48 @@ class TestReportFinalization:
 
         db.refresh.side_effect = refresh_side_effect
 
-        settings = SimpleNamespace(summary_dir=str(tmp_path))
+        summary_dir = Path.cwd() / "synthetic-reports"
+        pdf_path = summary_dir / f"{meeting.id}.pdf"
+        docx_path = summary_dir / f"{meeting.id}.docx"
+        settings = SimpleNamespace(summary_dir=str(summary_dir))
 
-        report, usage_record = await finalize_meeting_artifacts(
-            db=db,
-            meeting=meeting,
-            current_user=current_user,
-            settings=settings,
-            generator=generator,
-            sender=sender,
-        )
+        with patch(
+            "app.meeting.reporting.anyio.to_thread.run_sync",
+            new=AsyncMock(
+                return_value=(
+                    pdf_path,
+                    docx_path,
+                    b"%PDF-1.4 synthetic",
+                    b"PK synthetic docx",
+                )
+            ),
+        ):
+            report, usage_record = await finalize_meeting_artifacts(
+                db=db,
+                meeting=meeting,
+                current_user=current_user,
+                settings=settings,
+                generator=generator,
+                sender=sender,
+            )
 
         added_models = [call.args[0] for call in db.add.call_args_list]
         assert len(added_models) == 2
         assert report in added_models
         assert usage_record in added_models
         assert report.email_delivery_status == "skipped"
-        assert Path(report.pdf_path).exists()
-        assert Path(report.docx_path).exists()
+        assert report.pdf_path == str(pdf_path)
+        assert report.docx_path == str(docx_path)
         assert usage_record.minutes_used == 42.0
         assert usage_record.meeting_id == meeting.id
 
     @pytest.mark.asyncio
-    async def test_finalize_skips_when_already_emailed(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_finalize_skips_when_already_emailed(self) -> None:
         """Duplicate finalize calls must not regenerate after a successful send."""
         from app.meeting.reporting import finalize_meeting_artifacts
 
-        pdf = tmp_path / "done.pdf"
-        docx = tmp_path / "done.docx"
-        pdf.write_bytes(b"%PDF")
-        docx.write_bytes(b"PK")
+        pdf = Path.cwd() / "synthetic-reports" / "done.pdf"
+        docx = Path.cwd() / "synthetic-reports" / "done.docx"
 
         prior = SimpleNamespace(
             email_delivery_status="sent",
@@ -122,12 +130,15 @@ class TestReportFinalization:
         db.flush = AsyncMock()
         usage_stub = SimpleNamespace(meeting_id=meeting.id, minutes_used=5.0)
 
-        settings = SimpleNamespace(summary_dir=str(tmp_path))
+        settings = SimpleNamespace(summary_dir=str(pdf.parent))
 
-        with patch(
-            "app.meeting.reporting.upsert_usage_record",
-            new_callable=AsyncMock,
-            return_value=usage_stub,
+        with (
+            patch("app.meeting.reporting.Path.is_file", return_value=True),
+            patch(
+                "app.meeting.reporting.upsert_usage_record",
+                new_callable=AsyncMock,
+                return_value=usage_stub,
+            ),
         ):
             report, usage = await finalize_meeting_artifacts(
                 db=db,
@@ -336,11 +347,14 @@ class TestUsageApi:
 
 
 class TestReportExportSecurity:
-    def test_resolve_export_path_rejects_paths_outside_summary_dir(self, tmp_path: Path) -> None:
+    def test_resolve_export_path_rejects_paths_outside_summary_dir(self) -> None:
         from app.meeting.reporting import resolve_report_export_path
+
+        summary_dir = Path.cwd() / "synthetic-reports"
+        outside_path = Path.cwd() / "escape.pdf"
 
         with pytest.raises(ValueError, match="outside the configured summary directory"):
             resolve_report_export_path(
-                raw_path=str(tmp_path.parent / "escape.pdf"),
-                summary_dir=str(tmp_path),
+                raw_path=str(outside_path),
+                summary_dir=str(summary_dir),
             )

@@ -19,6 +19,7 @@ class TestAgentPrimaryBehavior:
 
         current_user = MagicMock(id=uuid4())
         primary_result = MagicMock()
+        primary_result.scalar.return_value = 0  # count check: 0 agents (< 10)
         primary_result.scalars.return_value.all.return_value = []
 
         db = AsyncMock()
@@ -54,6 +55,7 @@ class TestAgentPrimaryBehavior:
         primary_b = MagicMock(id=uuid4(), is_primary=True)
 
         primary_result = MagicMock()
+        primary_result.scalar.return_value = 0  # count check: 0 agents (< 10)
         primary_result.scalars.return_value.all.return_value = [primary_a, primary_b]
 
         db = AsyncMock()
@@ -86,6 +88,7 @@ class TestAgentPrimaryBehavior:
 
         current_user = MagicMock(id=uuid4())
         primary_result = MagicMock()
+        primary_result.scalar.return_value = 0  # count check: 0 agents (< 10)
         primary_result.scalars.return_value.all.return_value = []
 
         db = AsyncMock()
@@ -254,14 +257,17 @@ class TestMeetingOverrides:
         current_user = MagicMock(id=uuid4(), credits=60)
         primary_agent = MagicMock(id=uuid4(), is_primary=True)
 
-        # 1st execute: atomic reserve (rowcount=1)
+        # 1st execute: active meetings count check (< 20)
+        active_count_result = MagicMock()
+        active_count_result.scalar.return_value = 0
+        # 2nd execute: atomic reserve (rowcount=1)
         reserve_result = MagicMock(rowcount=1)
-        # 2nd execute: get_effective_primary_agent -> select agents by user
+        # 3rd execute: get_effective_primary_agent -> select agents by user
         agent_result = MagicMock()
         agent_result.scalars.return_value.all.return_value = [primary_agent]
 
         db = AsyncMock()
-        db.execute.side_effect = [reserve_result, agent_result]
+        db.execute.side_effect = [active_count_result, reserve_result, agent_result]
         db.add = MagicMock()
         db.commit = AsyncMock()
         db.refresh = AsyncMock()
@@ -285,11 +291,17 @@ class TestMeetingOverrides:
         from app.api.routes.meetings import create_meeting
 
         current_user = MagicMock(id=uuid4(), credits=3)
+        # active meetings count (first call)
+        active_count_result = MagicMock()
+        active_count_result.scalar.return_value = 0
+        # reserve credits (second call, rowcount=1)
+        reserve_result = MagicMock(rowcount=1)
+        # agent lookup (third call, returns None -> 404)
         query_result = MagicMock()
         query_result.scalar_one_or_none.return_value = None
 
         db = AsyncMock()
-        db.execute.return_value = query_result
+        db.execute.side_effect = [active_count_result, reserve_result, query_result]
 
         with pytest.raises(HTTPException, match="Agent not found"):
             await create_meeting(

@@ -32,6 +32,12 @@ _ACTION_MARKERS = (
     "follow up on", "assigned to",
 )
 _VAGUE_PRONOUNS = {"he", "she", "they", "that", "this", "it", "their", "them", "its", "his", "her"}
+_SKIP_WORDS = _VAGUE_PRONOUNS | {
+    "about", "would", "could", "should", "think", "really",
+    "there", "where", "which", "these", "those", "going",
+    "great", "right", "being", "other", "still", "after",
+    "before", "between", "under", "above",
+}
 
 
 class ContextManager:
@@ -220,14 +226,6 @@ class ContextManager:
         # Build expansion from recent context
         expansions: list[str] = []
 
-        # Common filler words to skip when extracting topics
-        _skip_words = _VAGUE_PRONOUNS | {
-            "about", "would", "could", "should", "think", "really",
-            "there", "where", "which", "these", "those", "going",
-            "great", "right", "being", "other", "still", "after",
-            "before", "between", "under", "above",
-        }
-
         if recent_text:
             # Extract key topics from the last 5 lines of buffer
             # (both speaker and bot responses for full context)
@@ -241,7 +239,7 @@ class ContextManager:
                 content = re.sub(r"\[(?:QUESTION|DECISION|ACTION)\]\s*", "", content)
                 for w in content.split():
                     cleaned = re.sub(r"[^\w]", "", w)
-                    if len(cleaned) > 4 and cleaned.lower() not in _skip_words:
+                    if len(cleaned) > 4 and cleaned.lower() not in _SKIP_WORDS:
                         if cleaned not in expansions:
                             expansions.append(cleaned)
 

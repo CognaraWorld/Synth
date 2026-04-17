@@ -165,9 +165,11 @@ async def test_create_meeting_requires_gemini_key_when_recall_enabled(
     query_result.scalars.return_value.all.return_value = [primary_agent]
 
     reserve_result = SimpleNamespace(rowcount=1)
+    active_count_result = MagicMock()
+    active_count_result.scalar.return_value = 0
 
     db = AsyncMock()
-    db.execute = AsyncMock(side_effect=[reserve_result, query_result])
+    db.execute = AsyncMock(side_effect=[active_count_result, reserve_result, query_result])
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()

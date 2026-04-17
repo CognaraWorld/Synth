@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -60,6 +60,85 @@ def test_should_cancel_output_trips_on_any_stop_flag() -> None:
     session.session_end_requested = False
     engine._interrupted[session.session_id] = True
     assert engine._should_cancel_output(session) is True
+
+
+@pytest.mark.asyncio
+async def test_check_insight_is_rate_limited_per_session() -> None:
+    from app.core.bot_engine import BotEngine
+
+    engine = BotEngine()
+    session = MagicMock(session_id="session-1", insights=[])
+
+    with patch(
+        "app.core.bot_engine.verify_claim",
+        new=AsyncMock(return_value={
+            "speaker": "Alice",
+            "claim": "Revenue was $10M",
+            "correction": "Revenue was $9M",
+        }),
+    ) as mock_verify:
+        await engine._check_insight(session, "Alice", "Revenue was $10M")
+        await engine._check_insight(session, "Alice", "Revenue was $12M")
+
+    assert mock_verify.await_count == 1
+    assert len(session.insights) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_session_logs_no_meeting_separately() -> None:
+    from app.core.bot_engine import BotEngine
+
+    engine = BotEngine()
+
+    class DummyDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, query):
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = None
+            return result
+
+    with patch("app.models.database.AsyncSessionLocal", return_value=DummyDB()), patch(
+        "app.core.bot_engine.logger"
+    ) as mock_logger:
+        result = await engine._recover_session("bot-123456")
+
+    assert result is None
+    mock_logger.info.assert_any_call(
+        "No active meeting found for bot %s during recovery",
+        "bot-123456"[:8],
+    )
+    mock_logger.error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_session_logs_db_errors_separately() -> None:
+    from app.core.bot_engine import BotEngine
+
+    engine = BotEngine()
+
+    class FailingDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, query):
+            raise RuntimeError("database unavailable")
+
+    with patch("app.models.database.AsyncSessionLocal", return_value=FailingDB()), patch(
+        "app.core.bot_engine.logger"
+    ) as mock_logger:
+        result = await engine._recover_session("bot-abcdef")
+
+    assert result is None
+    mock_logger.error.assert_called()
+    mock_logger.info.assert_not_called()
 
 
 @pytest.mark.asyncio

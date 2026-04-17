@@ -3,11 +3,17 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
 from app.config import get_settings
-from app.models.database import engine, Base, DEFAULT_STARTER_CREDITS
+from app.logging_config import configure_logging
+from app.models.database import get_engine, Base, DEFAULT_STARTER_CREDITS
+
+# Apply logging configuration before any other imports use the root logger.
+_settings_early = get_settings()
+configure_logging(json_output=_settings_early.environment == "production")
 from app.models.credit_transaction import CreditTransaction  # noqa: F401 — register model
 from app.api.routes import auth, agents, bot, meetings, live, documents, payments, credits, webhook, reports, usage, chat
 from app.api.websocket import router as ws_router
@@ -294,6 +300,30 @@ def _run_migrations(connection):
                 "Migration: dropped NOT NULL on meeting_id for credit_transactions table"
             )
 
+        if dialect_name == "postgresql":
+            try:
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "ux_credit_transactions_stripe_session_id "
+                        "ON credit_transactions (stripe_session_id) "
+                        "WHERE stripe_session_id IS NOT NULL"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "ux_credit_transactions_refund_meeting_id "
+                        "ON credit_transactions (meeting_id) "
+                        "WHERE transaction_type = 'refund' AND meeting_id IS NOT NULL"
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Migration: could not enforce credit transaction idempotency indexes: %s",
+                    exc,
+                )
+
     if inspector.has_table("credit_transactions"):
         columns = [c["name"] for c in inspector.get_columns("credit_transactions")]
         if "meeting_id" not in columns:
@@ -312,6 +342,10 @@ async def lifespan(app: FastAPI):
         if is_prod:
             raise RuntimeError("FATAL: Set SECRET_KEY before running in production")
         logger.warning("Using default secret key. Set SECRET_KEY in production!")
+    if settings.service_secret in ("", "cognara-service-secret-dev"):
+        if is_prod:
+            raise RuntimeError("FATAL: Set BACKEND_SERVICE_SECRET")
+        logger.warning("Using insecure default service secret!")
 
     required_keys = {
         "RECALL_API_KEY": settings.recall_api_key,
@@ -323,7 +357,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError(f"FATAL: Missing required config: {', '.join(missing)}")
         logger.error("Missing required configuration: %s", ", ".join(missing))
 
-    async with engine.begin() as conn:
+    async with get_engine().begin() as conn:
         # Create new tables
         await conn.run_sync(Base.metadata.create_all)
         # Backfill missing columns on existing tables
@@ -349,7 +383,16 @@ async def lifespan(app: FastAPI):
     import contextlib
     with contextlib.suppress(asyncio.CancelledError):
         await cleanup_task
-    await engine.dispose()
+
+    # Graceful engine shutdown: checkpoint + stop all active sessions
+    try:
+        from app.core.engine_singleton import get_engine as get_bot_engine
+        bot_engine = get_bot_engine()
+        await asyncio.wait_for(bot_engine.shutdown(), timeout=30.0)
+    except Exception:
+        logger.error("Graceful bot engine shutdown failed", exc_info=True)
+
+    await get_engine().dispose()
 
 
 async def _stop_orphaned_bots():
@@ -395,6 +438,12 @@ async def _stop_orphaned_bots():
                     if m.started_at:
                         duration_seconds = (now - m.started_at).total_seconds()
                     minutes_used = max(1, math.ceil(duration_seconds / 60)) if duration_seconds > 0 else 0
+                    if minutes_used == 0:
+                        m.status = "ended"
+                        if not m.ended_at:
+                            m.ended_at = now
+                        logger.info("Reconciled orphaned meeting %s with zero duration", m.id)
+                        continue
 
                     # Idempotent billing: only bill if credits_used is still 0
                     bill_result = await db.execute(
@@ -432,107 +481,121 @@ async def _stop_orphaned_bots():
         logger.error("Orphaned bot cleanup failed: %s", exc)
 
 
-async def _cleanup_stale_bots():
-    """Background task that checks every 5 minutes for stale bots (> 2 hours) and kills them."""
+async def _checkpoint_active_sessions(bot_engine) -> None:
+    """Persist context snapshots for all active sessions to DB."""
+    import json as _json
+    from sqlalchemy import update
+    from app.models.database import Meeting, AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as ckpt_db:
+            has_updates = False
+            for sid, session in list(bot_engine.sessions.items()):
+                if session.is_active and session.bot_id:
+                    checkpoint = session.context_manager.get_checkpoint_state()
+                    await ckpt_db.execute(
+                        update(Meeting)
+                        .where(Meeting.bot_id == session.bot_id)
+                        .values(context_checkpoint=_json.dumps(checkpoint, default=str))
+                    )
+                    has_updates = True
+            if has_updates:
+                await ckpt_db.commit()
+    except Exception as ckpt_exc:
+        logger.debug("Context checkpoint save failed: %s", ckpt_exc)
+
+
+async def _check_and_kill_stale_bots(bot_engine) -> None:
+    """Kill in-memory sessions and DB meetings that have run > 2 hours."""
     import math
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     from sqlalchemy import select, update
+    from app.models.database import Meeting, User, AsyncSessionLocal
+    from app.meeting.recall_client import RecallClient
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    stale_ids = [
+        sid for sid, s in list(bot_engine.sessions.items())
+        if s.get_duration() > 7200
+    ]
+    for sid in stale_ids:
+        try:
+            await bot_engine.stop_meeting(sid)
+            logger.info("Stale bot cleanup: stopped session %s (> 2 hours)", sid[:8])
+        except Exception as exc:
+            logger.warning("Stale bot cleanup failed for session %s: %s", sid[:8], exc)
+
+    async with AsyncSessionLocal() as db:
+        cutoff = now - timedelta(hours=2)
+        result = await db.execute(
+            select(Meeting).where(
+                Meeting.status == "active",
+                Meeting.started_at.isnot(None),
+                Meeting.started_at < cutoff,
+            )
+        )
+        stale_meetings = result.scalars().all()
+        for m in stale_meetings:
+            duration_seconds = (now - m.started_at).total_seconds()
+            minutes_used = max(1, math.ceil(duration_seconds / 60))
+
+            bill_result = await db.execute(
+                update(Meeting)
+                .where(Meeting.id == m.id, Meeting.credits_used == 0)
+                .values(
+                    status="ended",
+                    ended_at=now,
+                    duration_minutes=minutes_used,
+                    credits_used=minutes_used,
+                )
+            )
+
+            if bill_result.rowcount == 1:
+                delta = minutes_used - 5
+                await db.execute(
+                    update(User)
+                    .where(User.id == m.user_id)
+                    .values(credits=User.credits - delta)
+                )
+            else:
+                m.status = "ended"
+                if not m.ended_at:
+                    m.ended_at = now
+
+            if m.bot_id:
+                recall = RecallClient()
+                try:
+                    await recall.stop_bot(m.bot_id)
+                except Exception:
+                    pass
+                finally:
+                    await recall.close()
+
+            logger.info("Stale meeting cleanup: ended meeting %s (%d min)", m.id, minutes_used)
+
+        if stale_meetings:
+            await db.commit()
+
+
+async def _cleanup_stale_bots():
+    """Background task: checkpoint every 60s, stale bot kill every 300s."""
+    from app.core.engine_singleton import get_engine as get_bot_engine
+
+    checkpoint_counter = 0
     while True:
         try:
-            await asyncio.sleep(300)  # every 5 minutes
-            from app.api.routes.webhook import get_bot_engine
-            from app.models.database import Meeting, User, AsyncSessionLocal
-            from app.meeting.recall_client import RecallClient
+            await asyncio.sleep(60)
+            checkpoint_counter += 1
 
             bot_engine = get_bot_engine()
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            stale_ids = []
 
-            # Checkpoint active sessions to DB for crash recovery
-            try:
-                import json as _json
-                async with AsyncSessionLocal() as ckpt_db:
-                    has_updates = False
-                    for sid, session in list(bot_engine.sessions.items()):
-                        if session.is_active and session.bot_id:
-                            checkpoint = session.context_manager.get_checkpoint_state()
-                            await ckpt_db.execute(
-                                update(Meeting)
-                                .where(Meeting.bot_id == session.bot_id)
-                                .values(context_checkpoint=_json.dumps(checkpoint, default=str))
-                            )
-                            has_updates = True
-                    if has_updates:
-                        await ckpt_db.commit()
-            except Exception as ckpt_exc:
-                logger.debug("Context checkpoint save failed: %s", ckpt_exc)
+            # Checkpoint every iteration (60s)
+            await _checkpoint_active_sessions(bot_engine)
 
-            for sid, session in list(bot_engine.sessions.items()):
-                if session.get_duration() > 7200:  # 2 hours
-                    stale_ids.append(sid)
-
-            for sid in stale_ids:
-                try:
-                    await bot_engine.stop_meeting(sid)
-                    logger.info("Stale bot cleanup: stopped session %s (> 2 hours)", sid[:8])
-                except Exception as exc:
-                    logger.warning("Stale bot cleanup failed for session %s: %s", sid[:8], exc)
-
-            # Also check database for meetings stuck as "active" > 2 hours
-            async with AsyncSessionLocal() as db:
-                from datetime import timedelta
-                cutoff = now - timedelta(hours=2)
-                result = await db.execute(
-                    select(Meeting).where(
-                        Meeting.status == "active",
-                        Meeting.started_at.isnot(None),
-                        Meeting.started_at < cutoff,
-                    )
-                )
-                stale_meetings = result.scalars().all()
-                for m in stale_meetings:
-                    duration_seconds = (now - m.started_at).total_seconds()
-                    minutes_used = max(1, math.ceil(duration_seconds / 60))
-
-                    # Idempotent billing: only bill if credits_used is still 0
-                    bill_result = await db.execute(
-                        update(Meeting)
-                        .where(Meeting.id == m.id, Meeting.credits_used == 0)
-                        .values(
-                            status="ended",
-                            ended_at=now,
-                            duration_minutes=minutes_used,
-                            credits_used=minutes_used,
-                        )
-                    )
-
-                    if bill_result.rowcount == 1:
-                        # Settle against the 5-min reserve
-                        delta = minutes_used - 5
-                        await db.execute(
-                            update(User)
-                            .where(User.id == m.user_id)
-                            .values(credits=User.credits - delta)
-                        )
-                    else:
-                        # Already billed -- just ensure status is ended
-                        m.status = "ended"
-                        if not m.ended_at:
-                            m.ended_at = now
-
-                    # Try to stop the Recall bot
-                    if m.bot_id:
-                        try:
-                            recall = RecallClient()
-                            await recall.stop_bot(m.bot_id)
-                            await recall.close()
-                        except Exception:
-                            pass
-
-                    logger.info("Stale meeting cleanup: ended meeting %s (%d min)", m.id, minutes_used)
-
-                if stale_meetings:
-                    await db.commit()
+            # Stale bot check every 5th iteration (300s)
+            if checkpoint_counter % 5 == 0:
+                await _check_and_kill_stale_bots(bot_engine)
 
         except asyncio.CancelledError:
             break
@@ -545,7 +608,7 @@ def _preload_tts():
     try:
         from app.core.tts import TextToSpeech
         from app.utils.filler import FillerManager
-        from app.api.routes.webhook import get_bot_engine
+        from app.core.engine_singleton import get_engine as get_bot_engine
 
         engine = get_bot_engine()
         if not engine._tts:
@@ -570,6 +633,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+from app.observability.metrics import setup_prometheus  # noqa: E402
+setup_prometheus(app)
 
 # CORS: restrict to configured origins instead of wildcard
 # (OWASP A05:2021 - Security Misconfiguration)
@@ -600,6 +666,13 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = (
         "camera=(), microphone=(), geolocation=()"
     )
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; frame-ancestors 'none'"
+    )
+    if settings.environment == "production":
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=63072000; includeSubDomains"
+        )
     return response
 
 
@@ -622,6 +695,36 @@ app.include_router(ws_router, prefix="/api")
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "service": "synth-api"}
+
+
+@app.get("/api/health/ready")
+async def readiness_check():
+    checks: dict[str, object] = {}
+    try:
+        async with get_engine().begin() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception:
+        checks["db"] = "fail"
+
+    try:
+        from app.core.engine_singleton import get_engine as get_bot_engine
+
+        bot_engine = get_bot_engine()
+        checks["tts"] = "ok" if bot_engine._models_loaded else "not_loaded"
+        checks["active_sessions"] = len(bot_engine.sessions)
+    except Exception:
+        checks["tts"] = "fail"
+
+    healthy = all(
+        value in {"ok", "not_loaded"}
+        for key, value in checks.items()
+        if key != "active_sessions"
+    )
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ready" if healthy else "degraded", **checks},
+    )
 
 
 @app.get("/api/health/meeting-latency")

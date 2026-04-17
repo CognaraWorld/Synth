@@ -3,7 +3,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -28,6 +28,15 @@ async def create_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    count_result = await db.execute(
+        select(func.count(Agent.id)).where(Agent.user_id == current_user.id)
+    )
+    if (count_result.scalar() or 0) >= 10:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Maximum of 10 agents per user reached",
+        )
+
     has_primary = await get_effective_primary_agent(db, current_user.id) is not None
     persona_id = resolve_persona_id(agent_data.mode, agent_data.persona_id)
     mode = "general"

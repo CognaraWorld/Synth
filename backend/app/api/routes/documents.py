@@ -5,7 +5,7 @@ from uuid import UUID
 
 import anyio
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, status
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
@@ -138,6 +138,15 @@ if _multipart_support_available():
             agent = result.scalar_one_or_none()
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
+
+            doc_count_result = await db.execute(
+                select(func.count(Document.id)).where(Document.agent_id == agent_id)
+            )
+            if (doc_count_result.scalar() or 0) >= 50:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Maximum of 50 documents per agent reached",
+                )
 
             original_filename = Path(file.filename or "").name
             ext = get_file_extension(original_filename)

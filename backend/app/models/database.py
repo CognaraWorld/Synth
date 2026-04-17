@@ -265,13 +265,52 @@ class ChatMessage(Base):
     user = relationship("User")
 
 
-# Database engine setup
-settings = get_settings()
-engine = create_async_engine(
-    settings.database_url.replace("postgresql://", "postgresql+asyncpg://"),
-    echo=False,
-)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+# Database engine — lazily initialized to allow test environments to override
+# DATABASE_URL before the engine pool is created.
+_engine = None
+_session_factory = None
+
+
+def get_engine():
+    """Return the process-wide async engine, creating it on first call."""
+    global _engine, _session_factory
+    if _engine is None:
+        _settings = get_settings()
+        _engine = create_async_engine(
+            _settings.database_url.replace("postgresql://", "postgresql+asyncpg://"),
+            echo=False,
+        )
+        _session_factory = sessionmaker(
+            _engine, class_=AsyncSession, expire_on_commit=False
+        )
+    return _engine
+
+
+class _EngineProxy:
+    """Forwards attribute access to the lazily-created engine.
+
+    Allows `from app.models.database import engine` to work without
+    immediately creating the engine at import time.
+    """
+
+    def __getattr__(self, name: str):
+        return getattr(get_engine(), name)
+
+
+engine = _EngineProxy()
+
+
+class _AsyncSessionLocalProxy:
+    """Lazily creates the session factory and returns an async session."""
+
+    def __call__(self):
+        global _session_factory
+        if _session_factory is None:
+            get_engine()
+        return _session_factory()  # type: ignore[misc]
+
+
+AsyncSessionLocal = _AsyncSessionLocalProxy()
 
 
 async def get_db():

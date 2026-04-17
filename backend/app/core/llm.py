@@ -11,8 +11,9 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TypeVar
 
 from app.config import get_settings
 
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 _GEMINI_SYNC_WORKER_DRAIN_TIMEOUT_SECONDS = 2.0
 _GEMINI_SYNC_WORKER_MAX_WORKERS = 4
 _GEMINI_SYNC_ORPHAN_THRESHOLD = 3
+_LLM_RETRY_ATTEMPTS = 1
+_LLM_RETRY_BASE_DELAY_SECONDS = 0.25
+_LLM_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_LLM_RETRYABLE_ERROR_TOKENS = (
+    "timeout",
+    "temporar",
+    "transient",
+    "rate limit",
+    "resource exhausted",
+    "unavailable",
+    "overload",
+    "service unavailable",
+    "deadline exceeded",
+    "connection reset",
+    "gateway timeout",
+)
+T = TypeVar("T")
 
 try:
     import anthropic
@@ -47,6 +65,27 @@ def _first_name_or_empty(speaker: str) -> str:
     if not cleaned:
         return ""
     return cleaned.split()[0]
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    """Return True for transient provider failures worth retrying once."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "code", None)
+    try:
+        if int(status_code) in _LLM_RETRYABLE_STATUS_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    message_parts = [exc.__class__.__name__, str(exc)]
+    if getattr(exc, "message", None):
+        message_parts.append(str(getattr(exc, "message")))
+    haystack = " ".join(part for part in message_parts if part).lower()
+    return any(token in haystack for token in _LLM_RETRYABLE_ERROR_TOKENS)
 
 
 class LLMClient:
@@ -112,6 +151,50 @@ class LLMClient:
             return True
         return False
 
+    def _retry_sync_llm_call(self, operation: str, call: Callable[[], T]) -> T:
+        """Retry a synchronous LLM call once for transient failures."""
+        for attempt in range(_LLM_RETRY_ATTEMPTS + 1):
+            try:
+                return call()
+            except Exception as exc:
+                if attempt >= _LLM_RETRY_ATTEMPTS or not _is_retryable_llm_error(exc):
+                    raise
+                delay = _LLM_RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                logger.warning(
+                    "%s failed transiently; retrying in %.2fs (%d/%d): %s",
+                    operation,
+                    delay,
+                    attempt + 1,
+                    _LLM_RETRY_ATTEMPTS + 1,
+                    exc,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"{operation} retry loop exhausted unexpectedly")
+
+    async def _retry_async_llm_call(
+        self,
+        operation: str,
+        call: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Retry an async LLM call once for transient failures."""
+        for attempt in range(_LLM_RETRY_ATTEMPTS + 1):
+            try:
+                return await call()
+            except Exception as exc:
+                if attempt >= _LLM_RETRY_ATTEMPTS or not _is_retryable_llm_error(exc):
+                    raise
+                delay = _LLM_RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                logger.warning(
+                    "%s failed transiently; retrying in %.2fs (%d/%d): %s",
+                    operation,
+                    delay,
+                    attempt + 1,
+                    _LLM_RETRY_ATTEMPTS + 1,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"{operation} retry loop exhausted unexpectedly")
+
     # ------------------------------------------------------------------
     # Primary query — tries Gemini first, falls back to Claude
     # ------------------------------------------------------------------
@@ -147,14 +230,17 @@ class LLMClient:
         if self.gemini_client:
             try:
                 start = time.time()
-                response = self.gemini_client.models.generate_content(
-                    model=self._gemini_model,
-                    contents=user_content,
-                    config={
-                        "system_instruction": prompt,
-                        "max_output_tokens": 1024,
-                        "temperature": 0.7,
-                    },
+                response = self._retry_sync_llm_call(
+                    "Gemini query",
+                    lambda: self.gemini_client.models.generate_content(
+                        model=self._gemini_model,
+                        contents=user_content,
+                        config={
+                            "system_instruction": prompt,
+                            "max_output_tokens": 1024,
+                            "temperature": 0.7,
+                        },
+                    ),
                 )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
@@ -166,7 +252,10 @@ class LLMClient:
                 logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
         # Fallback to Claude
-        return self._claude_query(context, question, system_prompt)
+        return self._retry_sync_llm_call(
+            "Claude fallback query",
+            lambda: self._claude_query(context, question, system_prompt),
+        )
 
     async def async_query(
         self,
@@ -200,24 +289,10 @@ class LLMClient:
             try:
                 start = time.time()
                 if self._gemini_async_client:
-                    response = await asyncio.wait_for(
-                        self._gemini_async_client.models.generate_content(
-                            model=self._gemini_model,
-                            contents=user_content,
-                            config={
-                                "system_instruction": prompt,
-                                "max_output_tokens": 1024,
-                                "temperature": 0.7,
-                            },
-                        ),
-                        timeout=30.0,
-                    )
-                else:
-                    loop = asyncio.get_running_loop()
-                    response = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            lambda: self.gemini_client.models.generate_content(
+                    response = await self._retry_async_llm_call(
+                        "Gemini async query",
+                        lambda: asyncio.wait_for(
+                            self._gemini_async_client.models.generate_content(
                                 model=self._gemini_model,
                                 contents=user_content,
                                 config={
@@ -226,8 +301,28 @@ class LLMClient:
                                     "temperature": 0.7,
                                 },
                             ),
+                            timeout=30.0,
                         ),
-                        timeout=30.0,
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    response = await self._retry_async_llm_call(
+                        "Gemini async query",
+                        lambda: asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: self.gemini_client.models.generate_content(
+                                    model=self._gemini_model,
+                                    contents=user_content,
+                                    config={
+                                        "system_instruction": prompt,
+                                        "max_output_tokens": 1024,
+                                        "temperature": 0.7,
+                                    },
+                                ),
+                            ),
+                            timeout=30.0,
+                        ),
                     )
                 elapsed = time.time() - start
                 logger.info("Gemini responded in %.0fms", elapsed * 1000)
@@ -241,7 +336,10 @@ class LLMClient:
                 logger.warning("Gemini failed, falling back to Claude: %s", exc)
 
         # Fallback to Claude
-        return await self._claude_async_query(context, question, system_prompt)
+        return await self._retry_async_llm_call(
+            "Claude fallback query",
+            lambda: self._claude_async_query(context, question, system_prompt),
+        )
 
     # ------------------------------------------------------------------
     # Claude-only methods (for summaries, complex tasks, fallback)
