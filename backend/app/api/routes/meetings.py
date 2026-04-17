@@ -106,12 +106,12 @@ async def create_meeting(
     )
     db.add(meeting)
     await db.flush()
+    await db.commit()
+    await db.refresh(meeting)
 
     # Build webhook URL for real-time transcription
     if not (settings.recall_api_key or "").strip():
         logger.info("Recall.ai API key not configured; meeting %s remains pending", meeting.id)
-        await db.commit()
-        await db.refresh(meeting)
         return meeting
 
     webhook_url = None

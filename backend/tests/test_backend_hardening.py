@@ -408,7 +408,7 @@ class TestMeetingCreditAuditTrail:
         created_meeting = db.add.call_args.args[0]
         assert created_meeting.status == "failed"
         assert db.execute.await_count == 4
-        db.commit.assert_awaited_once()
+        assert db.commit.await_count == 2
         mock_recall.close.assert_awaited_once()
 
 

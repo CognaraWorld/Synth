@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+from threading import Lock
 
 
 def _utcnow():
@@ -269,20 +270,23 @@ class ChatMessage(Base):
 # DATABASE_URL before the engine pool is created.
 _engine = None
 _session_factory = None
+_engine_lock = Lock()
 
 
 def get_engine():
     """Return the process-wide async engine, creating it on first call."""
     global _engine, _session_factory
     if _engine is None:
-        _settings = get_settings()
-        _engine = create_async_engine(
-            _settings.database_url.replace("postgresql://", "postgresql+asyncpg://"),
-            echo=False,
-        )
-        _session_factory = sessionmaker(
-            _engine, class_=AsyncSession, expire_on_commit=False
-        )
+        with _engine_lock:
+            if _engine is None:
+                _settings = get_settings()
+                _engine = create_async_engine(
+                    _settings.database_url.replace("postgresql://", "postgresql+asyncpg://"),
+                    echo=False,
+                )
+                _session_factory = sessionmaker(
+                    _engine, class_=AsyncSession, expire_on_commit=False
+                )
     return _engine
 
 

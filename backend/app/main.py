@@ -386,9 +386,11 @@ async def lifespan(app: FastAPI):
 
     # Graceful engine shutdown: checkpoint + stop all active sessions
     try:
-        from app.core.engine_singleton import get_engine as get_bot_engine
-        bot_engine = get_bot_engine()
-        await asyncio.wait_for(bot_engine.shutdown(), timeout=30.0)
+        from app.core.engine_singleton import get_engine_if_initialized
+
+        bot_engine = get_engine_if_initialized()
+        if bot_engine is not None:
+            await asyncio.wait_for(bot_engine.shutdown(), timeout=30.0)
     except Exception:
         logger.error("Graceful bot engine shutdown failed", exc_info=True)
 

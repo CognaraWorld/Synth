@@ -761,15 +761,27 @@ class TestEngineSingleton:
         finally:
             set_engine(None)
 
-    def test_set_engine_none_returns_none(self) -> None:
-        """After set_engine(None), get_engine() returns a fresh default."""
+    def test_set_engine_none_rebuilds_and_caches_default_engine(self) -> None:
+        """After set_engine(None), get_engine() rebuilds and caches the default engine."""
         from app.core.engine_singleton import get_engine, set_engine
 
-        set_engine(None)
-        # Should not raise; returns either None or a fresh BotEngine
-        result = get_engine()
-        # If it returns a new default, that's fine; if None, also fine
-        assert result is None or result is not None  # always passes — just verify no exception
+        stub_engine = MagicMock(name="stub_engine")
+
+        with patch(
+            "app.core.bot_engine.BotEngine",
+            return_value=stub_engine,
+        ), patch(
+            "app.core.engine_singleton.BotEngine",
+            return_value=stub_engine,
+            create=True,
+        ):
+            set_engine(None)
+            try:
+                result = get_engine()
+                assert result is stub_engine
+                assert get_engine() is stub_engine
+            finally:
+                set_engine(None)
 
     def test_live_control_service_uses_singleton(self) -> None:
         """LiveSessionService.engine must use the shared singleton."""

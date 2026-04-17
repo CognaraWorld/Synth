@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 from app.api import websocket
 from app.api.routes import webhook
-from app.core.engine_singleton import set_engine
+from app.core.engine_singleton import get_engine_if_initialized, set_engine
 from app.meeting.live_control import LiveSessionService
 
 
@@ -21,3 +21,8 @@ def test_webhook_websocket_and_live_control_share_engine_singleton() -> None:
         assert service.engine is engine
     finally:
         set_engine(None)
+
+
+def test_get_engine_if_initialized_returns_none_when_unset() -> None:
+    set_engine(None)
+    assert get_engine_if_initialized() is None

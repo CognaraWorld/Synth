@@ -50,11 +50,11 @@ def _make_workspace_headers(
     timestamp: str = "1700000000",
     message_id: str = "msg_test_123",
 ) -> dict[str, str]:
-    signing_key = base64.b64decode(secret.removeprefix("whsec_"))
+    signing_key = webhook._urlsafe_b64decode_padded(secret.removeprefix("whsec_"))
     payload = f"{message_id}.{timestamp}.{body.decode('utf-8')}".encode("utf-8")
-    signature = base64.b64encode(
+    signature = base64.urlsafe_b64encode(
         hmac.new(signing_key, payload, hashlib.sha256).digest()
-    ).decode("ascii")
+    ).decode("ascii").rstrip("=")
     return {
         "webhook-id": message_id,
         "webhook-timestamp": timestamp,
@@ -65,6 +65,33 @@ def _make_workspace_headers(
 @pytest.mark.asyncio
 async def test_recall_webhook_accepts_valid_workspace_signature() -> None:
     secret = "whsec_" + base64.b64encode(b"recall-test-secret").decode("ascii")
+    body = {"bot": {"id": "bot-1"}, "event": "transcript.data"}
+    raw_body = json.dumps(body).encode("utf-8")
+    request = _make_request(body, _make_workspace_headers(secret, raw_body))
+
+    webhook._seen_nonces.clear()
+    try:
+        with (
+            patch(
+                "app.api.routes.webhook.get_settings",
+                return_value=SimpleNamespace(webhook_secret=secret),
+            ),
+            patch("app.api.routes.webhook.time.time", return_value=1700000000.0),
+            patch(
+                "app.api.routes.webhook.asyncio.create_task",
+                side_effect=lambda coro: (coro.close(), MagicMock())[1],
+            ),
+        ):
+            response = await webhook.recall_webhook(request)
+    finally:
+        webhook._seen_nonces.clear()
+
+    assert response == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_recall_webhook_accepts_urlsafe_workspace_signature() -> None:
+    secret = "whsec_" + base64.urlsafe_b64encode(b"recall-test-secret\xff").decode("ascii").rstrip("=")
     body = {"bot": {"id": "bot-1"}, "event": "transcript.data"}
     raw_body = json.dumps(body).encode("utf-8")
     request = _make_request(body, _make_workspace_headers(secret, raw_body))

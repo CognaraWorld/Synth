@@ -44,6 +44,7 @@ _MAX_WEBHOOK_AGE_SECONDS = 300
 _GREETED_BOT_TTL_SECONDS = 24 * 60 * 60
 _MAX_GREETED_BOTS = 2048
 _seen_nonces: dict[str, float] = {}
+_seen_nonces_lock = asyncio.Lock()
 
 
 def _prune_seen_nonces(now: float | None = None) -> None:
@@ -90,6 +91,12 @@ def _get_header(headers, *names: str) -> str:
     return ""
 
 
+def _urlsafe_b64decode_padded(value: str) -> bytes:
+    """Decode a URL-safe base64 value, tolerating missing padding."""
+    padding = (-len(value)) % 4
+    return base64.urlsafe_b64decode(value + ("=" * padding))
+
+
 def _verify_workspace_signature(
     secret: str,
     message_id: str,
@@ -102,7 +109,7 @@ def _verify_workspace_signature(
         return False
 
     try:
-        signing_key = base64.b64decode(secret.removeprefix("whsec_"))
+        signing_key = _urlsafe_b64decode_padded(secret.removeprefix("whsec_"))
     except (ValueError, binascii.Error):
         logger.warning("Configured Recall webhook secret is not valid base64")
         return False
@@ -120,7 +127,7 @@ def _verify_workspace_signature(
         if version != "v1" or not encoded_signature:
             continue
         try:
-            actual_signature = base64.b64decode(encoded_signature)
+            actual_signature = _urlsafe_b64decode_padded(encoded_signature)
         except (ValueError, binascii.Error):
             continue
         if (
@@ -288,11 +295,12 @@ async def recall_webhook(request: Request):
         if abs(current_time - request_timestamp) > _MAX_WEBHOOK_AGE_SECONDS:
             return JSONResponse(status_code=401, content={"error": "expired"})
 
-        _prune_seen_nonces(current_time)
         nonce = _build_replay_nonce(raw_body, timestamp_header, message_id)
-        if nonce in _seen_nonces:
-            return JSONResponse(status_code=409, content={"error": "duplicate"})
-        _seen_nonces[nonce] = current_time + _MAX_WEBHOOK_AGE_SECONDS
+        async with _seen_nonces_lock:
+            _prune_seen_nonces(current_time)
+            if nonce in _seen_nonces:
+                return JSONResponse(status_code=409, content={"error": "duplicate"})
+            _seen_nonces[nonce] = current_time + _MAX_WEBHOOK_AGE_SECONDS
     elif settings.webhook_secret:
         logger.warning(
             "Webhook secret configured without timestamp headers; replay protection is unavailable"
