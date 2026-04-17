@@ -49,13 +49,20 @@ class TestDocumentProcessorDependencyFallbacks:
 
 
 class TestAuthRegistrationHardening:
+    @staticmethod
+    def _request() -> MagicMock:
+        return MagicMock(headers={}, client=MagicMock(host="127.0.0.1"))
+
     @pytest.mark.asyncio
     async def test_register_requires_password_for_email_provider(self) -> None:
         from app.api.routes.auth import register
 
         db = AsyncMock()
 
-        with pytest.raises(HTTPException, match="Password is required"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            pytest.raises(HTTPException, match="Password is required"),
+        ):
             await register(
                 UserCreate(
                     email="user@example.com",
@@ -63,6 +70,7 @@ class TestAuthRegistrationHardening:
                     password=None,
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 
@@ -72,7 +80,10 @@ class TestAuthRegistrationHardening:
 
         db = AsyncMock()
 
-        with pytest.raises(HTTPException, match="at least 8 characters"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            pytest.raises(HTTPException, match="at least 8 characters"),
+        ):
             await register(
                 UserCreate(
                     email="user@example.com",
@@ -80,6 +91,7 @@ class TestAuthRegistrationHardening:
                     password="short",
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 
@@ -105,7 +117,10 @@ class TestAuthRegistrationHardening:
 
         db.flush.side_effect = flush_side_effect
 
-        with patch("app.api.routes.auth.pwd_context.hash", return_value="hashed-password"):
+        with (
+            patch("app.api.routes.auth.check_named_limit", new=AsyncMock()),
+            patch("app.api.routes.auth.pwd_context.hash", return_value="hashed-password"),
+        ):
             result = await register(
                 UserCreate(
                     email="user@example.com",
@@ -113,6 +128,7 @@ class TestAuthRegistrationHardening:
                     password="StrongPass123",
                     provider="email",
                 ),
+                request=self._request(),
                 db=db,
             )
 

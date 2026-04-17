@@ -45,6 +45,7 @@ Synth joins your meetings and participates like a real team member:
 
 - In-process **p50 / p95** rollups for Q&A stage gaps are recorded automatically; every 50 completed turns the backend logs a compact JSON line: `meeting_latency_rollup {...}`.
 - **GET `/api/health/meeting-latency`** returns the current snapshot when `ENVIRONMENT=development`, or in production when **`EXPOSE_MEETING_LATENCY_METRICS=true`** (maps to `expose_meeting_latency_metrics` in `Settings`).
+- **GET `/metrics`** exposes Prometheus metrics when `prometheus-fastapi-instrumentator` is installed.
 
 ### Setup
 
@@ -59,6 +60,9 @@ cp .env.example .env
 
 # Start Postgres + SearXNG
 docker-compose up -d
+
+# Optional: run the backend in Docker too
+docker-compose --profile backend up -d backend
 
 # Backend
 cd backend
@@ -95,7 +99,7 @@ Synth/
 │   │   ├── models/    # Database models + schemas
 │   │   └── utils/     # Wake word, routing, prompts
 ├── docs/              # Documentation
-└── docker-compose.yml # Postgres + SearXNG
+└── docker-compose.yml # Postgres + SearXNG, optional backend profile
 ```
 
 ## License
