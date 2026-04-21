@@ -2,6 +2,7 @@ import hmac
 import ipaddress
 import re
 from datetime import datetime, timedelta, timezone
+from typing import cast
 from uuid import UUID, uuid4
 
 import jwt
@@ -308,5 +309,7 @@ async def issue_ws_ticket(
     instead of the full JWT. Tickets expire after 60 seconds and are
     consumed on first use — see ``app.core.ws_tickets`` for rationale.
     """
-    ticket, expires_in = issue_ticket(current_user.id)
+    # SQLAlchemy legacy Column[UUID] is UUID at runtime; audit Q-12 tracks the
+    # Mapped[] migration that will remove this cast in v0.2.
+    ticket, expires_in = issue_ticket(cast(UUID, current_user.id))
     return WebSocketTicketResponse(ticket=ticket, expires_in=expires_in)
