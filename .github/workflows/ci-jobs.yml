@@ -190,6 +190,9 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: Run frontend unit tests
+        run: npm test -- --run
+
       - name: Build
         run: npm run build
 
