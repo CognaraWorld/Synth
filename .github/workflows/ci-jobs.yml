@@ -139,13 +139,15 @@ jobs:
           ! test -f .env || (echo ".env file should not be committed!" && exit 1)
       - name: Install pip-audit
         run: pip install pip-audit==2.7.3
-      - name: Audit Python dependencies (advisory)
-        # pip-audit is advisory for now — python-jose has a known CVE that
-        # we're tracking via the PyJWT migration (auth.py done, websocket.py
-        # tracked with Devyansh). Once jose is fully removed we can drop
-        # continue-on-error to make CVEs merge-blocking.
-        continue-on-error: true
-        run: pip-audit --requirement requirements.txt --strict --desc
+      - name: Audit Python dependencies
+        # pip-audit is BLOCKING. The two --ignore-vuln flags below are a
+        # temporary allowlist for the known python-jose CVEs (ECDSA
+        # algorithm confusion + JWT bomb DoS). Devyansh's A11 removes
+        # python-jose from requirements.txt in favour of PyJWT; once that
+        # lands, DROP both --ignore-vuln flags so any future jose CVE (or
+        # any other CVE) blocks the merge.
+        # Owner of removing these ignores: Devyansh (track-backend).
+        run: pip-audit --requirement requirements.txt --strict --desc --ignore-vuln GHSA-cjwg-qfpm-7377 --ignore-vuln PYSEC-2024-233
 
   frontend-build:
     name: Frontend Lint + Type Check + Build
