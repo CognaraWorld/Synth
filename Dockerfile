@@ -34,6 +34,7 @@ FROM python:3.12-slim-bookworm AS runtime
 # (pydub uses it for the PCM→MP3 path) and for some document export paths.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        curl \
         ffmpeg \
         libsndfile1 \
         tini \
@@ -64,8 +65,8 @@ EXPOSE 8000
 # tini reaps zombie children correctly. uvicorn stays as PID-ish (1.x).
 # Workers are pinned to 1 because BotEngine and its session state are
 # single-process (Redis/engine-singleton rework is tracked separately).
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
 
 ENTRYPOINT ["tini", "--"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]
