@@ -98,6 +98,13 @@ Synth/
 └── docker-compose.yml # Postgres + SearXNG
 ```
 
+## Operational docs
+
+- [Runbook](docs/RUNBOOK.md) — on-call reference
+- [Known Risks](docs/KNOWN-RISKS.md) — what v0.1 ships with intentionally
+- [Ingress](docs/INGRESS.md) — Cloudflare Tunnel setup
+- [Secrets Rotation](docs/SECRETS-ROTATION.md) — how to rotate each key
+
 ## License
 
 Private — All rights reserved.
