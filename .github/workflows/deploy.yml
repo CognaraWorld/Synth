@@ -67,7 +67,7 @@ jobs:
             docker compose up -d backend
             docker image prune -f
             # wait for health
-            for i in $(seq 1 30); do
+            for i in $(seq 1 45); do
               if curl -fsS http://127.0.0.1:8000/api/health >/dev/null; then
                 echo "Backend healthy"; exit 0
               fi
