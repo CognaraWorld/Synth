@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare Tunnel for Synth webhook
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=cloudflared
+ExecStart=/usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run synth-webhook
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

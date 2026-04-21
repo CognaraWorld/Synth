@@ -6,18 +6,47 @@ services:
       POSTGRES_PASSWORD: synth
       POSTGRES_DB: synth
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synth"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   searxng:
     image: searxng/searxng:latest
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./searxng:/etc/searxng
     environment:
       - SEARXNG_BASE_URL=http://localhost:8080
+
+  backend:
+    image: ghcr.io/cognaraworld/synth:${IMAGE_TAG:-latest}
+    # for local dev you can override:
+    # build:
+    #   context: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - backend/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/chroma_data:/app/chroma_data
+      - ./backend/uploads:/app/uploads
+      - ./backend/summaries:/app/summaries
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
 volumes:
   postgres_data:
