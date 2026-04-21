@@ -107,18 +107,23 @@ Response schema for `/api/health/ready`:
 
 When an ops-level refund is needed (provider outage, billing bug):
 
+You must read the current balance first; `balance_after` is NOT NULL and must be the post-update value.
+
 ```sql
 -- Connect
 docker compose exec postgres psql -U synth -d synth
 
--- Find the user
+-- Find the user + current balance
 SELECT id, email, credits FROM users WHERE email = 'user@example.com';
+-- Assume credits = 40, refunding 60 → balance_after = 100
 
--- Refund (idempotent if you use a unique meeting_id — SEE credits.py)
 BEGIN;
 UPDATE users SET credits = credits + 60 WHERE id = '<user-id>';
-INSERT INTO credit_transactions (user_id, meeting_id, amount, transaction_type, reason)
-VALUES ('<user-id>', NULL, 60, 'manual_refund', 'Recall outage 2026-04-30');
+INSERT INTO credit_transactions
+  (user_id, meeting_id, amount, balance_after, transaction_type, description)
+VALUES
+  ('<user-id>', NULL, 60, 100, 'manual_refund',
+   'Recall outage 2026-04-30 — ops manual refund');
 COMMIT;
 ```
 
@@ -144,7 +149,7 @@ curl -X POST https://api.recall.ai/api/v1/bot/<bot_id>/leave_call/ \
 
 ## <a name="sentry"></a>Read Sentry errors
 
-Sentry: https://sentry.io/organizations/cognara/issues/ <TO VERIFY: confirm Sentry org slug>
+Sentry: https://sentry.io/organizations/<org-slug>/issues/ — find your org slug in the URL of any page in the Sentry dashboard after first login, or at the project Settings page.
 
 Filter by environment:
 - `environment:production` — real users

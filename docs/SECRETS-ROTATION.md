@@ -63,7 +63,7 @@ Sourced from `backend/app/config.py` and the deploy pipeline.
 Rotate at the provider's dashboard:
 - Anthropic: https://console.anthropic.com/settings/keys
 - Gemini: https://aistudio.google.com/apikey
-- Recall.ai: <TO VERIFY: Recall dashboard URL — typically https://api.recall.ai/dashboard/api-keys or similar> → API Keys
+- Recall.ai: log in at https://recall.ai → navigate to API Keys in the dashboard. The exact dashboard URL depends on your account region (ap-northeast-1 for this deployment).
 - Stripe: https://dashboard.stripe.com/apikeys (primary), Stripe → Developers → Webhooks for `STRIPE_WEBHOOK_SECRET`
 - Deepgram: https://console.deepgram.com/ → API Keys
 - Serper: https://serper.dev/api-key
