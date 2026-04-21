@@ -68,7 +68,7 @@ Rotate at the provider's dashboard:
 - Deepgram: https://console.deepgram.com/ → API Keys
 - Serper: https://serper.dev/api-key
 - Resend: https://resend.com/api-keys
-- Sentry (DSN): https://sentry.io/settings/ → Projects → Client Keys <TO VERIFY: confirm Sentry org slug is 'cognara'>
+- Sentry (DSN): https://sentry.io/settings/ → Projects → Client Keys <TO VERIFY: confirm Sentry org slug>
 
 For each: generate new → update deploy secret (GitHub Actions secrets → production environment) → redeploy → revoke old key at the provider.
 

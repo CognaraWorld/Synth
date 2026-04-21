@@ -144,7 +144,7 @@ curl -X POST https://api.recall.ai/api/v1/bot/<bot_id>/leave_call/ \
 
 ## <a name="sentry"></a>Read Sentry errors
 
-Sentry: https://sentry.io/organizations/cognara/issues/ <TO VERIFY: confirm Sentry org slug is 'cognara'>
+Sentry: https://sentry.io/organizations/cognara/issues/ <TO VERIFY: confirm Sentry org slug>
 
 Filter by environment:
 - `environment:production` — real users
