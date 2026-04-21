@@ -50,6 +50,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - name: Validate tag input
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "${{ github.event.inputs.tag }}" | grep -qE '^[a-zA-Z0-9._-]+$' || exit 1
+
       - name: Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1
         with:
