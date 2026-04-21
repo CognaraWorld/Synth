@@ -61,4 +61,4 @@ A chatty meeting can trigger unbounded LLM + search calls.
 
 ## Acknowledgement
 
-Signed off by: Viraj Balakrishnan, Devyansh, <team lead> — 2026-04-29.
+Signed off by: Viraj Balakrishnan, Devyansh, <TO VERIFY: team lead name> — 2026-04-29.
