@@ -113,7 +113,7 @@ export function BotFormClient({ initialBot }: { initialBot: BotProfileDTO }) {
                       voice === option.value ? "border-primary bg-primary/10" : "border-border"
                     }`}
                   >
-                    <RadioGroupItem value={option.value} />
+                    <RadioGroupItem value={option.value} aria-label={option.label} />
                     <span className="text-sm font-medium">{option.label}</span>
                   </label>
                 ))}

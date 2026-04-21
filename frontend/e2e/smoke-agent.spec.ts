@@ -47,10 +47,21 @@ test.describe("Bot profile smoke", () => {
   test("voice radio group toggles between male and female", async ({ page }) => {
     await page.goto("/dashboard/bot");
 
-    // Voice options render as label-wrapped radios; target by role + name.
-    const maleOption = page.getByRole("radio").nth(0);
-    const femaleOption = page.getByRole("radio").nth(1);
+    // Voice options render as Radix RadioGroupItem with aria-label set to the
+    // option label ("Male" | "Female"); select by accessible name, never by
+    // position — a new fieldset above voice would silently shift indices.
+    const maleRadio = page.getByRole("radio", { name: /^male$/i });
+    const femaleRadio = page.getByRole("radio", { name: /^female$/i });
 
-    await expect(maleOption.or(femaleOption)).toBeVisible({ timeout: 10_000 });
+    await expect(maleRadio).toBeVisible({ timeout: 10_000 });
+    await expect(femaleRadio).toBeVisible();
+
+    await maleRadio.click();
+    await expect(maleRadio).toBeChecked();
+    await expect(femaleRadio).not.toBeChecked();
+
+    await femaleRadio.click();
+    await expect(femaleRadio).toBeChecked();
+    await expect(maleRadio).not.toBeChecked();
   });
 });
