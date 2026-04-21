@@ -2,6 +2,8 @@
 
 Run on the production VPS. Replace `<TUNNEL_ID>` and `yourdomain.com` as you go.
 
+0. Prepare backend mount points (so Docker does not auto-create them as root):
+   `sudo mkdir -p /srv/synth/backend/chroma_data /srv/synth/backend/uploads /srv/synth/backend/summaries && sudo chown -R 1000:1000 /srv/synth/backend`.
 1. Install cloudflared:
    `curl -fsSL https://pkg.cloudflare.com/install.sh | sudo bash && sudo apt-get install -y cloudflared`
 2. Authenticate: `cloudflared tunnel login` (opens browser, authorises your zone).
