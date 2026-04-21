@@ -31,11 +31,16 @@ TOKENIZERS_PARALLELISM=false uvicorn app.main:app --host 0.0.0.0 --reload --port
 # Frontend
 cd frontend
 npm run dev
-
-# Ngrok (for Recall.ai webhooks)
-ngrok http 8000
-# Update WEBHOOK_BASE_URL in backend/.env with the ngrok URL
 ```
+
+### Production webhook ingress
+
+For Recall.ai to deliver webhooks, the backend needs a public HTTPS URL. Two supported options:
+
+- **Cloudflare Tunnel** (recommended) — see `docs/INGRESS.md` for setup.
+- **Local development** — use Cloudflare Tunnel with a `dev.*` hostname, or (for quick testing) `cloudflared tunnel --url http://localhost:8000` which issues a temporary `*.trycloudflare.com` URL.
+
+Set `WEBHOOK_BASE_URL` in `backend/.env` to your stable tunnel hostname.
 
 ## Required Environment Variables (backend/.env)
 
@@ -45,7 +50,7 @@ ANTHROPIC_API_KEY=...
 GEMINI_API_KEY=...
 RECALL_API_KEY=...
 RECALL_REGION=ap-northeast-1
-WEBHOOK_BASE_URL=https://your-ngrok-url.ngrok-free.dev
+WEBHOOK_BASE_URL=https://synth-webhook.yourdomain.com
 SERPER_API_KEY=...
 DEEPGRAM_API_KEY=...
 SECRET_KEY=...              # JWT signing key (REQUIRED in production)
