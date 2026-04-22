@@ -19,18 +19,61 @@ if TYPE_CHECKING:
     from app.core.tts import TextToSpeech
 
 
-_UNIVERSAL_FILLERS: list[str] = [
-    "Sure.",
-    "One sec.",
-    "Hmm.",
-    "Yeah.",
-    "Okay.",
-    "Got it.",
-    "Let me check.",
+# Filler phrases are category-specific and length-tuned to cover the
+# full ~1.3 s user-perceived pipeline (wake detection + LLM TTFT + TTS
+# for the first sentence). Every phrase is 5-9 words; shorter "Sure."
+# / "Hmm." style fillers were removed because they leave dead air
+# between the filler and the real answer.
+_MEETING_RECAP_FILLERS: list[str] = [
+    "Let me look back through the meeting.",
+    "One second, checking what we discussed earlier.",
+    "Let me go through the conversation so far.",
+    "Let me pull that from earlier in the call.",
+]
+
+_DOCUMENT_FILLERS: list[str] = [
+    "Let me check the document for you.",
+    "One second, looking through the file.",
+    "Let me pull that from the document.",
+    "Checking the uploaded file now.",
+]
+
+_TECHNICAL_FILLERS: list[str] = [
+    "Good question, let me think about that.",
+    "Let me work through that one.",
+    "Hmm, give me a moment to think.",
+    "Let me break that down for you.",
+]
+
+_OPINION_FILLERS: list[str] = [
+    "Let me think that through for a moment.",
+    "Interesting question, give me a second.",
+    "Hmm, let me consider that.",
+    "Good one, let me think.",
+]
+
+_WEB_SEARCH_FILLERS: list[str] = [
+    "Let me look that up for you.",
+    "One second, let me search that.",
+    "Give me a moment to check on that.",
+    "Let me pull that up now.",
+]
+
+_GENERAL_FILLERS: list[str] = [
+    "Let me check on that for you.",
+    "One second, let me think about it.",
+    "Good question, let me look into that.",
+    "Give me a moment to think.",
+    "Let me figure that out.",
 ]
 
 CATEGORY_FILLERS: dict[QueryCategory, list[str]] = {
-    cat: _UNIVERSAL_FILLERS for cat in QueryCategory
+    QueryCategory.MEETING_RECAP: _MEETING_RECAP_FILLERS,
+    QueryCategory.DOCUMENT: _DOCUMENT_FILLERS,
+    QueryCategory.TECHNICAL: _TECHNICAL_FILLERS,
+    QueryCategory.OPINION: _OPINION_FILLERS,
+    QueryCategory.WEB_SEARCH: _WEB_SEARCH_FILLERS,
+    QueryCategory.GENERAL: _GENERAL_FILLERS,
 }
 
 

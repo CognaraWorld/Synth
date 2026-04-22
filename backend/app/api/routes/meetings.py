@@ -119,7 +119,7 @@ async def create_meeting(
         webhook_url = f"{settings.webhook_base_url.rstrip('/')}/api/webhook/recall"
         logger.info("Webhook URL: %s", webhook_url)
 
-    # Deploy Recall.ai bot into the meeting
+    # Deploy Recall.ai bot into the meeting.
     recall = RecallClient()
     try:
         bot_id = await recall.create_bot(
@@ -144,7 +144,7 @@ async def create_meeting(
         }
 
         # Register session directly (bot already deployed via RecallClient above)
-        from app.context.manager import ContextManager
+        from app.context.manager import ContextManager  # noqa: F401
         from app.meeting.session import MeetingSession, SessionState
 
         session = MeetingSession(
@@ -152,6 +152,18 @@ async def create_meeting(
             agent_config=agent_config,
         )
         session.bot_id = bot_id
+
+        # Register bot_id -> session mapping IMMEDIATELY so any webhooks that
+        # arrive while we're still loading docs below find the session. Without
+        # this, early transcripts fall into `get_or_recover_session`, which
+        # queries Meeting WHERE status='active' — but the row hasn't been
+        # committed yet, so recovery returns None and the transcript is
+        # silently dropped. Doc summaries load into this already-registered
+        # session object a few lines later; they're visible before the bot
+        # actually joins the meeting, so no real-world impact on answers.
+        engine.sessions[session.session_id] = session
+        engine._sessions_by_bot_id[bot_id] = session.session_id
+        engine._ensure_session_tracking(session.session_id)
 
         # Build system prompt (prefer persisted prompt; fallback for legacy rows)
         persisted_prompt = (agent_config.get("system_prompt") or "").strip()
@@ -218,17 +230,20 @@ async def create_meeting(
         # Ensure screenshare capture is wired for meetings created via REST route.
         engine.wire_screen_capture(session)
 
-        # Set session states and register
+        # Transition AFTER all wiring is done — early webhooks saw the session
+        # in PENDING state (drop-safe) and subsequent ones see it LISTENING.
         session.transition(SessionState.JOINING)
         session.transition(SessionState.LISTENING)
-        engine.sessions[session.session_id] = session
-        engine._sessions_by_bot_id[bot_id] = session.session_id
-        engine._ensure_session_tracking(session.session_id)
 
         await db.commit()
         await db.refresh(meeting)
+        doc_count = len(getattr(session.context_manager, "document_summaries", []))
+        rag_ready = session.context_manager.rag_pipeline is not None
         logger.info("Bot %s joined meeting %s", bot_id, meeting.id)
-        logger.info("BotEngine session %s ready for bot %s", session.session_id, bot_id)
+        logger.info(
+            "BotEngine session %s ready for bot %s (rag=%s, docs=%d)",
+            session.session_id, bot_id, rag_ready, doc_count,
+        )
 
     except RecallClientError as exc:
         logger.error("Failed to deploy bot for meeting %s: %s", meeting.id, exc)

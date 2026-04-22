@@ -23,6 +23,11 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
+# ChromaDB 0.5.x logs posthog-incompat errors on every operation even when
+# telemetry is disabled. Silence at the source so standalone scripts and tests
+# stay clean; configure_logging() applies the same silencer for the app.
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
+
 _HYBRID_STOPWORDS = {
     "what", "when", "where", "which", "that", "this", "with",
     "from", "about", "have", "been", "were", "they", "their",
@@ -78,7 +83,10 @@ def _get_shared_chroma_client() -> chromadb.PersistentClient:
             raise RuntimeError(
                 f"ChromaDB persistence directory {persist_dir} is not writable"
             ) from exc
-        _shared_chroma_client = chromadb.PersistentClient(path=str(persist_dir))
+        _shared_chroma_client = chromadb.PersistentClient(
+            path=str(persist_dir),
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
         return _shared_chroma_client
 
 

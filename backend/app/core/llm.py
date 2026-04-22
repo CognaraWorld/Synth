@@ -215,15 +215,20 @@ class LLMClient:
                 f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
                 f"Don't force their name into every sentence — use it once or twice at most. "
             )
+        # Prompt order is optimized for Gemini implicit prompt caching:
+        # stable template + stable-prefix context first; dynamic question
+        # and speaker instruction last. ContextManager.assemble_context
+        # already places stable sections before the LIVE CONTEXT marker.
         user_content = (
-            f"A meeting participant just asked you this question:\n"
-            f"\"{question}\"\n\n"
-            f"{speaker_instruction}"
             f"Answer the question directly. Do NOT repeat or summarize the question. "
             f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
-            f"Here is the meeting context you can reference:\n{context}"
+            f"Here is the meeting context you can reference:\n{context}\n\n"
+            f"--- QUESTION ---\n"
+            f"A meeting participant just asked:\n"
+            f"\"{question}\"\n"
+            f"{speaker_instruction}"
         )
 
         # Try Gemini first
@@ -273,15 +278,18 @@ class LLMClient:
                 f"(e.g. 'Great question {first_name},' or 'So {first_name},'). "
                 f"Don't force their name into every sentence — use it once or twice at most. "
             )
+        # See query(): stable template + context first; question + speaker
+        # instruction last so Gemini can cache the stable prefix.
         user_content = (
-            f"A meeting participant just asked you this question:\n"
-            f"\"{question}\"\n\n"
-            f"{speaker_instruction}"
             f"Answer the question directly. Do NOT repeat or summarize the question. "
             f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
-            f"Here is the meeting context you can reference:\n{context}"
+            f"Here is the meeting context you can reference:\n{context}\n\n"
+            f"--- QUESTION ---\n"
+            f"A meeting participant just asked:\n"
+            f"\"{question}\"\n"
+            f"{speaker_instruction}"
         )
 
         # Try Gemini first — native async when available, executor fallback
@@ -356,14 +364,17 @@ class LLMClient:
             return "I'm having trouble processing right now. Please try again in a moment."
 
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        # Keep prompt shape consistent with the Gemini path: static template
+        # + context first, question last. Aligns with cache-friendly layout.
         user_content = (
-            f"A meeting participant just asked you this question:\n"
-            f"\"{question}\"\n\n"
             f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
             f"Do NOT say who asked it. Just give the answer. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
-            f"Here is the meeting context you can reference:\n{context}"
+            f"Here is the meeting context you can reference:\n{context}\n\n"
+            f"--- QUESTION ---\n"
+            f"A meeting participant just asked:\n"
+            f"\"{question}\""
         )
 
         start = time.time()
@@ -390,14 +401,16 @@ class LLMClient:
             return "I'm having trouble processing right now. Please try again in a moment."
 
         prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        # See _claude_query(): context-first layout mirrors the Gemini path.
         user_content = (
-            f"A meeting participant just asked you this question:\n"
-            f"\"{question}\"\n\n"
             f"Answer the question directly. Do NOT repeat, narrate, or summarize the question. "
             f"Do NOT say who asked it. Just give the answer. "
             f"Combine information from ALL available sources — documents, web search results, "
             f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
-            f"Here is the meeting context you can reference:\n{context}"
+            f"Here is the meeting context you can reference:\n{context}\n\n"
+            f"--- QUESTION ---\n"
+            f"A meeting participant just asked:\n"
+            f"\"{question}\""
         )
 
         start = time.time()
@@ -456,14 +469,21 @@ class LLMClient:
             speaker_instruction = (
                 f"{first_name} asked this question. You may address them by name naturally. "
             )
+        # Streaming path — MUST match async_query framing exactly. Using a
+        # weaker "Context:" header on Flash Lite causes the model to treat
+        # the context as ambient prose and refuse ("I can't read the
+        # document") even when the document summary is right there. Keep
+        # the stronger "meeting context you can reference" framing.
         user_content = (
-            f"A meeting participant just asked you this question:\n"
-            f"\"{question}\"\n\n"
-            f"{speaker_instruction}"
             f"Answer the question directly. Do NOT repeat or summarize the question. "
-            f"Keep it concise and conversational — you are speaking aloud in a meeting. "
-            f"Combine information from ALL available sources.\n\n"
-            f"Context:\n{context}"
+            f"Keep it concise and conversational — you are speaking aloud in a meeting, not writing an essay. "
+            f"Combine information from ALL available sources — documents, web search results, "
+            f"meeting conversation, and your own knowledge — to give the most complete answer.\n\n"
+            f"Here is the meeting context you can reference:\n{context}\n\n"
+            f"--- QUESTION ---\n"
+            f"A meeting participant just asked:\n"
+            f"\"{question}\"\n"
+            f"{speaker_instruction}"
         )
 
         # Try Gemini native async streaming first (no executor bridge)
@@ -552,10 +572,16 @@ class LLMClient:
         user_content: str,
         should_cancel: Callable[[], bool] | None = None,
     ):
-        """Stream sentences from Gemini using the async client (true async I/O)."""
+        """Stream sentences from Gemini using the async client (true async I/O).
+
+        google-genai's async client returns a coroutine that resolves to an
+        async iterator — the coroutine must be awaited before ``async for``,
+        otherwise we fall through to the executor-based sync bridge and
+        pay ~50-200 ms of extra latency per streaming call.
+        """
         if not self._gemini_async_client:
             return
-        stream = self._gemini_async_client.models.generate_content_stream(
+        stream = await self._gemini_async_client.models.generate_content_stream(
             model=self._gemini_model,
             contents=user_content,
             config={

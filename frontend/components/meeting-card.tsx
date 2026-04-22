@@ -1,4 +1,8 @@
-import { CalendarClock, ExternalLink } from "lucide-react";
+"use client";
+
+import { useState } from "react";
+import { CalendarClock, ExternalLink, PhoneOff } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -11,6 +15,27 @@ interface MeetingCardProps {
 }
 
 export function MeetingCard({ meeting, compact = false }: MeetingCardProps) {
+  const queryClient = useQueryClient();
+  const [stopping, setStopping] = useState(false);
+  const isLive = meeting.status === "LIVE";
+
+  async function handleStop() {
+    if (!isLive || stopping) return;
+    setStopping(true);
+    try {
+      const response = await fetch(`/api/meetings/${meeting.id}/stop`, { method: "POST" });
+      if (!response.ok) {
+        throw new Error("Failed to stop meeting");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["meetings"] });
+      await queryClient.invalidateQueries({ queryKey: ["live-session", meeting.id] });
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setStopping(false);
+    }
+  }
+
   return (
     <Card className="h-full">
       <CardContent className="flex h-full flex-col gap-5 p-6">
@@ -18,7 +43,7 @@ export function MeetingCard({ meeting, compact = false }: MeetingCardProps) {
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-semibold">{meeting.title}</h3>
-              <Badge variant={meeting.status === "LIVE" ? "success" : "secondary"}>{meeting.status}</Badge>
+              <Badge variant={isLive ? "success" : "secondary"}>{meeting.status}</Badge>
             </div>
             <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
               <CalendarClock className="h-4 w-4" />
@@ -35,6 +60,12 @@ export function MeetingCard({ meeting, compact = false }: MeetingCardProps) {
               <ExternalLink className="h-4 w-4" />
             </a>
           </Button>
+          {isLive ? (
+            <Button variant="destructive" onClick={handleStop} disabled={stopping}>
+              <PhoneOff className="h-4 w-4" />
+              {stopping ? "Stopping..." : "Stop Meeting"}
+            </Button>
+          ) : null}
         </div>
       </CardContent>
     </Card>
