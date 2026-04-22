@@ -193,15 +193,19 @@ async def _get_meeting_or_raise(
     current_user: User,
     db: AsyncSession,
 ) -> Meeting:
+    # joinedload(Agent.documents) is a collection load, which SQLAlchemy
+    # requires a .unique() call on the Result before a scalar accessor.
+    # The previous try/except pattern called scalar_one_or_none() first
+    # (which raises InvalidRequestError), then .unique().scalar_one_or_none()
+    # on the same already-exhausted Result — that second call returned None
+    # and every chat endpoint 404'd with "Meeting not found" even for the
+    # meeting's owner. Call .unique() up front against the fresh Result.
     result = await db.execute(
         select(Meeting)
         .options(joinedload(Meeting.agent).joinedload(Agent.documents))
         .where(Meeting.id == meeting_id)
     )
-    try:
-        meeting = result.scalar_one_or_none()
-    except InvalidRequestError:
-        meeting = result.unique().scalar_one_or_none()
+    meeting = result.unique().scalar_one_or_none()
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
     if meeting.user_id != current_user.id:

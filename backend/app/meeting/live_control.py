@@ -19,7 +19,15 @@ from app.models.database import Agent, LiveSession, Meeting, OperatorInstruction
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    # Return NAIVE UTC. The live_sessions / meetings / operator_instructions
+    # columns are all TIMESTAMP WITHOUT TIME ZONE, and asyncpg rejects an
+    # aware datetime with DataError: "can't subtract offset-naive and
+    # offset-aware datetimes" on INSERT. When that rejection fires on every
+    # transcript webhook, last_transcript_at never persists, the UI's
+    # /live-sessions polling sees a stale record, and transcripts stop
+    # rendering. Keep this consistent with meetings.py which strips tzinfo
+    # the same way before writing started_at / ended_at.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _is_active_status(session_status: str) -> bool:
@@ -199,6 +207,7 @@ class LiveSessionService:
             session_id = await self.engine.join_meeting(
                 meeting.meeting_link,
                 self._build_agent_config(meeting.agent),
+                meeting_id=str(meeting.id),
             )
             engine_session = self.engine.sessions.get(session_id)
 

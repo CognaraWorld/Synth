@@ -27,6 +27,8 @@ export function BotFormClient({ initialBot }: { initialBot: BotProfileDTO }) {
   const [saved, setSaved] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     if (bot && !initializedRef.current) {
@@ -75,6 +77,24 @@ export function BotFormClient({ initialBot }: { initialBot: BotProfileDTO }) {
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
+    }
+  }
+
+  async function handleDeleteDocument(docId: string) {
+    if (deletingDocId) return;
+    setDeleteError(null);
+    setDeletingDocId(docId);
+    try {
+      const response = await fetch(`/api/documents/${docId}`, { method: "DELETE" });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? "Delete failed");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["bot-profile"] });
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Delete failed");
+    } finally {
+      setDeletingDocId(null);
     }
   }
 
@@ -194,6 +214,7 @@ export function BotFormClient({ initialBot }: { initialBot: BotProfileDTO }) {
           </CardHeader>
           <CardContent>
             {uploadError ? <p className="mb-4 text-sm text-destructive">{uploadError}</p> : null}
+            {deleteError ? <p className="mb-4 text-sm text-destructive">{deleteError}</p> : null}
             {bot.documents.length > 0 ? (
               <div className="space-y-3">
                 {bot.documents.map((doc) => (
@@ -205,7 +226,13 @@ export function BotFormClient({ initialBot }: { initialBot: BotProfileDTO }) {
                         <p className="text-xs text-muted-foreground">{(doc.fileSize / 1024).toFixed(0)} KB</p>
                       </div>
                     </div>
-                    <Button variant="ghost" size="icon">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => handleDeleteDocument(doc.id)}
+                      disabled={deletingDocId === doc.id}
+                      aria-label={`Delete ${doc.name}`}
+                    >
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>

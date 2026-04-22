@@ -14,6 +14,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from app.config import get_settings
 from app.core.llm import LLMClient
@@ -255,6 +256,7 @@ class BotEngine:
         self,
         meeting_link: str,
         agent_config: dict[str, Any],
+        meeting_id: str | None = None,
     ) -> str:
         """Deploy the bot into a meeting.
 
@@ -267,6 +269,13 @@ class BotEngine:
             agent_config: Agent configuration including ``system_prompt``,
                 ``mode`` ("general" or "custom"), ``agent_name``, and
                 optionally ``description`` for custom agents.
+            meeting_id: Stable scope identifier (DB ``Meeting.id`` UUID).
+                Propagated to ``ContextManager`` and into RAG metadata so
+                transcripts and embeddings are isolated per meeting. If
+                omitted, a fresh UUID is generated. Callers MUST NOT pass
+                the meeting URL — two users joining the same Google Meet
+                URL would otherwise share the same scope and could read
+                each other's RAG chunks.
 
         Returns:
             A unique session ID for tracking and controlling this session.
@@ -277,9 +286,10 @@ class BotEngine:
         # Ensure heavy models are loaded
         await self._lazy_load_models()
 
-        # Build session
-        meeting_id = meeting_link  # Use the link as the meeting identifier
-        session = MeetingSession(meeting_id=meeting_id, agent_config=agent_config)
+        # Build session. Scope ID must NEVER default to the meeting URL —
+        # see docstring above for the cross-user leak it would create.
+        scope_id = (meeting_id or "").strip() or str(uuid4())
+        session = MeetingSession(meeting_id=scope_id, agent_config=agent_config)
 
         # Build the system prompt (prefer persisted prompt; fallback for legacy records)
         mode = agent_config.get("mode", "general")
@@ -1074,6 +1084,17 @@ class BotEngine:
             logger.warning("Could not transition to RESPONDING for session %s", session.session_id)
             return None
 
+        # Reset per-question cancellation flags. A previous question's abort
+        # path can return without clearing _interrupted / output_stop_requested
+        # (e.g. when a participant spoke during the bot's last response, or
+        # the operator hit Stop). Without this reset, the early-cancel check
+        # below sees the stale True flag and aborts every fresh question
+        # right after the filler — bot greets with filler then goes silent.
+        # session_end_requested is intentionally NOT reset; it is a sticky
+        # shutdown signal set by stop_meeting().
+        session.output_stop_requested = False
+        self._interrupted[session.session_id] = False
+
         # Pre-drain: before emitting ANY audio for a new answer, cut any
         # residual chunks Recall may still be playing from the previous
         # response. stop_output_audio is best-effort on the provider side
@@ -1183,6 +1204,12 @@ class BotEngine:
                     session.transition(SessionState.LISTENING)
                 except ValueError:
                     pass
+                # Defense-in-depth: also clear per-question flags here so any
+                # path that bails between filler and LLM-stream leaves a clean
+                # slate for the next question. Without this, a true one-time
+                # interrupt can pin the bot into "filler-only" mode forever.
+                session.output_stop_requested = False
+                self._interrupted[session.session_id] = False
                 timer.mark("aborted_session_end")
                 timer.log_summary({"aborted": True})
                 return None

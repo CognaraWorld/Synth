@@ -147,8 +147,12 @@ async def create_meeting(
         from app.context.manager import ContextManager  # noqa: F401
         from app.meeting.session import MeetingSession, SessionState
 
+        # Scope ID is the DB Meeting UUID, NOT the meeting URL. Using the
+        # URL would cause cross-user RAG leakage when two users join the
+        # same Google Meet / Zoom link (chunks share metadata and surface
+        # in each other's hybrid search results).
         session = MeetingSession(
-            meeting_id=meeting_data.meeting_link,
+            meeting_id=str(meeting.id),
             agent_config=agent_config,
         )
         session.bot_id = bot_id

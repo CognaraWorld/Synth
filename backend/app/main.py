@@ -1,10 +1,12 @@
 import asyncio
+import io
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydub import AudioSegment
 from sqlalchemy import inspect, text
 
 from app.config import get_settings
@@ -20,6 +22,32 @@ from app.api.websocket import router as ws_router
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def check_ffmpeg_available() -> bool:
+    """Probe whether the ffmpeg binary is callable via pydub.
+
+    Synthesises a short PCM buffer and asks pydub to encode it to MP3.
+    pydub shells out to ffmpeg, so a missing or broken binary surfaces
+    here. Returns True on success, False otherwise.
+
+    Why this matters: if ffmpeg is missing, ``RecallClient.pcm_to_mp3_b64``
+    silently returns an empty string for every TTS chunk, and the bot
+    plays no audio in the meeting. Catching it at startup prevents that
+    silent failure mode.
+    """
+    try:
+        # 10 ms of silence at 24 kHz mono int16 — minimal valid PCM
+        pcm = b"\x00\x00" * 240
+        segment = AudioSegment(
+            data=pcm, sample_width=2, frame_rate=24000, channels=1
+        )
+        buf = io.BytesIO()
+        segment.export(buf, format="mp3", bitrate="64k")
+    except Exception as exc:  # noqa: BLE001 — pydub raises a variety of types
+        logger.error("ffmpeg probe failed: %s", exc)
+        return False
+    return True
 
 
 def _add_column_if_missing(
@@ -356,6 +384,20 @@ async def lifespan(app: FastAPI):
         if is_prod:
             raise RuntimeError(f"FATAL: Missing required config: {', '.join(missing)}")
         logger.error("Missing required configuration: %s", ", ".join(missing))
+
+    # Audio conversion path requires ffmpeg via pydub. Without it the bot
+    # plays NO audio in meetings (every TTS chunk converts to "" and is
+    # sent as a no-op). Surface this at startup, not silently at runtime.
+    if not check_ffmpeg_available():
+        if is_prod:
+            raise RuntimeError(
+                "FATAL: ffmpeg is required for audio output but is not "
+                "available. Install ffmpeg and ensure it is on PATH."
+            )
+        logger.error(
+            "ffmpeg not available — bot audio will be silent. Install ffmpeg "
+            "to enable TTS playback in meetings."
+        )
 
     async with get_engine().begin() as conn:
         # Create new tables
