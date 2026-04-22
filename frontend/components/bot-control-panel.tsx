@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { MessageSquare, Mic, MicOff, PhoneOff, SendHorizonal, Square } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useChatInsights } from "@/hooks/use-chat-insights";
 import { useLiveControls } from "@/hooks/use-live-controls";
 import { Button } from "@/components/ui/button";
@@ -20,6 +21,7 @@ export function BotControlPanel({
   onOpenChat?: () => void;
 }) {
   const [instruction, setInstruction] = useState("");
+  const queryClient = useQueryClient();
   const controls = useLiveControls(meetingId ?? "");
   const { unreadCount, clearUnread } = useChatInsights(meetingId, !!meetingId);
   const status = useTranscriptStore((state) => state.status);
@@ -67,6 +69,8 @@ export function BotControlPanel({
     try {
       await controls.leave();
       reset();
+      await queryClient.invalidateQueries({ queryKey: ["meetings"] });
+      await queryClient.invalidateQueries({ queryKey: ["live-session", meetingId] });
     } catch {
       setStatus(previousStatus);
     }

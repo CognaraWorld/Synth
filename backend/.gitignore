@@ -1,0 +1,4 @@
+
+# Large TTS model files — fetched at setup time from kokoro-onnx releases
+models/kokoro/*.onnx
+models/kokoro/*.bin

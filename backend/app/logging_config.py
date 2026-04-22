@@ -43,6 +43,10 @@ _PLAIN_LOGGING_CONFIG = {
             "level": "WARNING",
             "propagate": True,
         },
+        "chromadb.telemetry.product.posthog": {
+            "level": "CRITICAL",
+            "propagate": False,
+        },
     },
 }
 

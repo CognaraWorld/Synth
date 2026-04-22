@@ -539,19 +539,27 @@ class ContextManager:
     def assemble_context(self, question: str, session_id: str) -> str:
         """Build the full context string for an LLM query.
 
-        Assembles context in priority order:
-        0. Past meeting summaries (cross-meeting memory)
-        1. Rolling summary of the full conversation
-        2. Recent raw transcript (last ~10 minutes)
-        3. Document summaries (full-document understanding)
-        4. Shared screen content (Gemini-extracted from screenshare frames)
-        5. RAG-retrieved chunks (specific passages) — PRIMARY SOURCE
+        Section order is optimized for Gemini implicit prompt caching:
+        stable content that does not change within a meeting sits at the
+        top (cacheable prefix), dynamic content sits below the LIVE
+        CONTEXT marker.
+
+        STABLE (cacheable prefix):
+        0. Past meeting summaries (cross-meeting memory) — fixed on meeting start
+        1. Document overviews (full-document understanding) — uploaded pre-meeting
+
+        DYNAMIC (changes during the meeting):
+        2. Rolling summary of the conversation — updates every ~60 s
+        3. Tracked entities (people, decisions, action items)
+        4. Recent raw transcript (last ~10 minutes) — new every line
+        5. Shared screen content (Gemini-extracted from screenshare frames)
+        6. RAG-retrieved chunks (specific passages) — PRIMARY SOURCE, per-question
 
         Token budget allocation (approximate):
         - 10 % past meeting summaries
-        - 15 % meeting summary
-        - 25 % recent buffer
         - 10 % document summaries
+        - 15 % rolling summary
+        - 25 % recent buffer
         - 20 % shared screen content
         - 20 % RAG chunks
 
@@ -717,18 +725,30 @@ class ContextManager:
                 screen_text = "\n\n---\n\n".join(reversed(parts))
 
         # --- Assemble (skip empty sections to avoid confusing the LLM) ---
+        #
+        # Section order matters for Gemini implicit prompt caching: anything
+        # byte-identical across successive calls within a meeting sits at the
+        # TOP so it can be cached; anything that changes per-line or per-
+        # question sits BELOW the DYNAMIC marker.
+        #
+        # Stable (cacheable): past meetings, document overviews.
+        # Dynamic: rolling summary (changes ~60s), tracked entities (new
+        #   people/decisions/actions), shared screen, recent transcript
+        #   (every new line), RAG hits (per-question).
         sections: list[str] = []
 
+        # ---------------- STABLE BLOCK (cacheable prefix) ----------------
         if past_text.strip():
             sections.append("=== PAST MEETINGS ===")
             sections.append(past_text)
             sections.append("")
 
-        if summary_text.strip():
-            sections.append("=== MEETING SUMMARY ===")
-            sections.append(summary_text)
+        if doc_summary_text.strip():
+            sections.append("=== DOCUMENT OVERVIEWS ===")
+            sections.append(doc_summary_text)
             sections.append("")
 
+        # ---------------- DYNAMIC BLOCK (changes during meeting) ---------
         # Entities section — give the LLM quick reference to tracked items
         entity_parts: list[str] = []
         if entities_snap["people"]:
@@ -739,6 +759,23 @@ class ContextManager:
         if entities_snap["action_items"]:
             for a in sorted(entities_snap["action_items"])[-3:]:
                 entity_parts.append(f"Action: {a}")
+
+        has_dynamic = bool(
+            summary_text.strip()
+            or entity_parts
+            or recent_text.strip()
+            or screen_text.strip()
+            or rag_text.strip()
+        )
+        if has_dynamic:
+            sections.append("=== LIVE CONTEXT (updates during meeting) ===")
+            sections.append("")
+
+        if summary_text.strip():
+            sections.append("=== MEETING SUMMARY ===")
+            sections.append(summary_text)
+            sections.append("")
+
         if entity_parts:
             sections.append("=== TRACKED ENTITIES ===")
             sections.append("\n".join(entity_parts))
@@ -747,11 +784,6 @@ class ContextManager:
         if recent_text.strip():
             sections.append("=== RECENT CONVERSATION (last 10 minutes) ===")
             sections.append(recent_text)
-            sections.append("")
-
-        if doc_summary_text.strip():
-            sections.append("=== DOCUMENT OVERVIEWS ===")
-            sections.append(doc_summary_text)
             sections.append("")
 
         if screen_text.strip():

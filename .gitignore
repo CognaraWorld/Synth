@@ -9,6 +9,12 @@ venv/
 .env
 .env.local
 .env.production
+.env.bak
+.env.bak*
+*.env.bak
+*.env.bak*
+.env.*.bak
+.env.*.bak*
 
 # Next.js
 frontend/.next/
@@ -19,11 +25,13 @@ frontend/out/
 dist/
 build/
 
-# IDE
+# IDE / tooling
 .vscode/
 .idea/
 *.swp
 *.swo
+.serena/
+frontend/tsconfig.tsbuildinfo
 
 # OS
 .DS_Store

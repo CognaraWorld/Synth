@@ -107,11 +107,13 @@ class RecallClient:
         self,
         operation_name: str,
         operation,
+        *,
+        max_attempts: int = 3,
     ) -> httpx.Response:
         self._check_circuit_breaker()
         try:
             async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(3),
+                stop=stop_after_attempt(max_attempts),
                 wait=wait_exponential(multiplier=1, min=1, max=4),
                 retry=retry_if_exception(self._is_retryable_exception),
                 reraise=True,
@@ -177,20 +179,17 @@ class RecallClient:
                 "transcript": {
                     "provider": transcript_provider,
                 },
-                # video_separate_png delivers per-participant frames (including
-                # screenshare) as base64 PNG at ~2fps. gallery_view_v2 is
-                # required for per-participant streams to work.
-                "video_mixed_layout": "gallery_view_v2",
-                "video_separate_png": {},
+                # Screenshare/video pipeline is unfinished (tracked in PR #42)
+                # and the `video_separate_png.data` event is rejected by the
+                # current Recall.ai API ("not a valid choice"). Keeping the
+                # bot on transcript-only gets meetings usable; the video
+                # block will be re-enabled alongside the OCR work.
                 "realtime_endpoints": [
                     {
                         "type": "webhook",
                         "url": webhook_url,
                         "events": [
                             "transcript.data",
-                            "video_separate_png.data",
-                            "participant_events.screenshare_on",
-                            "participant_events.screenshare_off",
                         ],
                     },
                 ],
@@ -371,6 +370,10 @@ class RecallClient:
             return
 
         try:
+            # Use max_attempts=1 (no retry) for streamed sentence audio.
+            # A retry that fires AFTER the user interrupted would replay the
+            # cancelled sentence over the next response, which is the core
+            # "two voices talking over each other" bug.
             await self._run_with_retry(
                 f"send_audio:{bot_id}",
                 lambda: self._client.post(
@@ -380,6 +383,7 @@ class RecallClient:
                         "b64_data": b64_audio,
                     },
                 ),
+                max_attempts=1,
             )
             logger.info("Sent %d audio bytes to bot %s", len(audio_bytes), bot_id)
         except httpx.HTTPStatusError as exc:
@@ -402,12 +406,15 @@ class RecallClient:
             logger.debug("Skipping empty pre-encoded audio payload for bot %s", bot_id)
             return
         try:
+            # Same rationale as send_audio — no retry, because a replayed
+            # audio chunk after an interrupt is the overlap bug.
             await self._run_with_retry(
                 f"send_audio_b64:{bot_id}",
                 lambda: self._client.post(
                     f"/bot/{bot_id}/output_audio",
                     json={"kind": "mp3", "b64_data": b64_audio},
                 ),
+                max_attempts=1,
             )
         except httpx.HTTPStatusError as exc:
             logger.error(

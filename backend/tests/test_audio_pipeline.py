@@ -239,18 +239,42 @@ class TestFillerManager:
                 assert isinstance(phrase, str)
                 assert len(phrase) > 0
 
-    def test_filler_phrases_are_unique(self) -> None:
-        """All filler phrases within the universal set are distinct."""
-        from app.utils.filler import _UNIVERSAL_FILLERS
+    def test_filler_phrases_are_unique_within_category(self) -> None:
+        """Phrases within each category must be distinct (no dup picks)."""
+        from app.utils.filler import CATEGORY_FILLERS
 
-        assert len(_UNIVERSAL_FILLERS) == len(set(_UNIVERSAL_FILLERS))
+        for category, phrases in CATEGORY_FILLERS.items():
+            assert len(phrases) == len(set(phrases)), (
+                f"Duplicate phrases in {category.value}"
+            )
 
-    def test_universal_fillers_are_short(self) -> None:
-        """Universal fillers should be short phrases for quick delivery."""
-        from app.utils.filler import _UNIVERSAL_FILLERS
+    def test_filler_phrases_cover_llm_latency(self) -> None:
+        """Fillers must be long enough (>=4 words) to mask LLM TTFT + TTS.
 
-        for phrase in _UNIVERSAL_FILLERS:
-            assert len(phrase.split()) <= 4, f"Filler too long: {phrase}"
+        Short phrases like "Sure." synthesize to ~0.5 s of audio, leaving
+        dead air before the real answer. At Kokoro 1.1x speed, ~4 words
+        yields ~1.3 s of audio — enough to cover the ~1.3 s pipeline.
+        """
+        from app.utils.filler import CATEGORY_FILLERS
+
+        for category, phrases in CATEGORY_FILLERS.items():
+            for phrase in phrases:
+                word_count = len(phrase.split())
+                assert 4 <= word_count <= 10, (
+                    f"{category.value}: phrase word count {word_count} "
+                    f"outside [4, 10] range: {phrase!r}"
+                )
+
+    def test_every_query_category_has_fillers(self) -> None:
+        """All QueryCategory values have at least one filler configured."""
+        from app.utils.filler import CATEGORY_FILLERS
+        from app.utils.query_router import QueryCategory
+
+        for category in QueryCategory:
+            assert category in CATEGORY_FILLERS, f"missing {category.value}"
+            assert len(CATEGORY_FILLERS[category]) > 0, (
+                f"empty filler list for {category.value}"
+            )
 
     def test_filler_manager_attributes_after_init(self) -> None:
         """A FillerManager has the expected attributes after construction."""

@@ -361,11 +361,15 @@ class BotEngine:
                 sample_rate=16000, threshold=0.5,
             )
 
+            doc_count = len(getattr(session.context_manager, "document_summaries", []))
+            rag_ready = session.context_manager.rag_pipeline is not None
             logger.info(
-                "Bot joined meeting %s (session=%s, bot=%s)",
+                "Bot joined meeting %s (session=%s, bot=%s, rag=%s, docs=%d)",
                 meeting_link,
                 session.session_id,
                 bot_id,
+                rag_ready,
+                doc_count,
             )
 
             return session.session_id
@@ -739,7 +743,12 @@ class BotEngine:
                     sample_rate=16000, threshold=0.5,
                 )
 
-                logger.info("Recovered session %s for bot %s (with RAG + docs)", session.session_id, bot_id)
+                doc_count = len(getattr(session.context_manager, "document_summaries", []))
+                rag_ready = session.context_manager.rag_pipeline is not None
+                logger.info(
+                    "Recovered session %s for bot %s (rag=%s, docs=%d)",
+                    session.session_id, bot_id, rag_ready, doc_count,
+                )
                 return session
 
         except Exception as exc:
@@ -784,9 +793,17 @@ class BotEngine:
         if session.get_state() == SessionState.RESPONDING:
             sid = session.session_id
             self._interrupted[sid] = True
-            # Tell Recall.ai to stop playing audio right now
+            # Tell Recall.ai to stop playing audio right now. Fire twice
+            # with a small gap — Recall's audio queue has latency so a
+            # single stop_output_audio can miss chunks that were in-flight
+            # when the interrupt fired, which is what the user perceives
+            # as "voice overlap".
             if session.bot_id:
-                _task = asyncio.create_task(self._recall_client.stop_audio(session.bot_id))
+                async def _double_stop(bot_id: str) -> None:
+                    await self._recall_client.stop_audio(bot_id)
+                    await asyncio.sleep(0.15)
+                    await self._recall_client.stop_audio(bot_id)
+                _task = asyncio.create_task(_double_stop(session.bot_id))
                 _task.add_done_callback(_log_task_exception)
             # Only queue as follow-up question if it's NOT a stop phrase
             if not is_stop:
@@ -839,31 +856,16 @@ class BotEngine:
                 is_question = True
                 question = clean
             else:
-                # Wake word detected but no question yet (e.g. "Hey Assistant.")
-                # Acknowledge immediately so the user knows the bot heard them,
-                # then wait for the actual question in the next chunk.
+                # Wake word with no question yet ("Hey Nova.") — just open the
+                # follow-up window and wait for the question text. The previous
+                # "Yes?" ack audio bypassed the per-session processing lock
+                # and could overlap a subsequent filler when the question
+                # chunk arrived milliseconds later, so we drop it.
                 self._pending_question[sid] = {
                     "question": "",
                     "speaker": speaker,
                     "timestamp": time.time(),
                 }
-                # Send a quick acknowledgment audio
-                if session.bot_id and self._tts:
-                    try:
-                        ack_phrase = "Yes?"
-                        ack_mp3 = self._filler_manager._mp3_cache.get(ack_phrase)
-                        if not ack_mp3:
-                            # Synthesize and cache a short acknowledgment
-                            ack_audio = self._tts.synthesize(ack_phrase)
-                            if ack_audio:
-                                ack_mp3 = self._recall_client.pcm_to_mp3_b64(ack_audio)
-                                self._filler_manager._mp3_cache[ack_phrase] = ack_mp3
-                        if ack_mp3:
-                            await self._recall_client.send_audio_b64(session.bot_id, ack_mp3)
-                            logger.info("Acknowledgment sent for session %s", sid[:8])
-                    except Exception as exc:
-                        logger.debug("Ack send failed: %s", exc)
-                # Open follow-up window so the next speech is captured
                 self._last_response_time[sid] = time.time()
                 return
         else:
@@ -1072,11 +1074,27 @@ class BotEngine:
             logger.warning("Could not transition to RESPONDING for session %s", session.session_id)
             return None
 
+        # Pre-drain: before emitting ANY audio for a new answer, cut any
+        # residual chunks Recall may still be playing from the previous
+        # response. stop_output_audio is best-effort on the provider side
+        # (the MP3 queue has network + server-side buffer latency) so one
+        # call can miss chunks already in flight. Twice-with-gap is cheap
+        # insurance against the "two voices talking over each other" bug.
+        if session.bot_id:
+            try:
+                await self._recall_client.stop_audio(session.bot_id)
+                await asyncio.sleep(0.15)
+                await self._recall_client.stop_audio(session.bot_id)
+            except Exception as exc:
+                logger.debug("Pre-drain stop_audio failed (non-fatal): %s", exc)
+
         try:
             timer = QuestionStageTimer(session.session_id, question)
             from app.utils.query_router import classify_query, needs_web_search
             category = classify_query(question)
             filler_duration = 0.0
+            total_playback = 0.0
+            playback_started_at: float | None = None
             if session.bot_id:
                 persona_voice = get_persona_tts_voice(session.agent_config.get("persona_id"))
 
@@ -1110,6 +1128,11 @@ class BotEngine:
                     _echo_record(session.bot_id, filler_phrase)
                     if filler_pcm:
                         filler_duration = len(filler_pcm) / 48000
+                        # Include filler in the playback tracker so the end-of-
+                        # response drain loop waits for filler tail too.
+                        total_playback, playback_started_at = self._enqueue_playback_chunk(
+                            total_playback, playback_started_at, filler_pcm,
+                        )
             filler_sent_at = time.time()
             timer.mark("filler_sent")
 
@@ -1211,6 +1234,17 @@ class BotEngine:
             system_prompt = session.agent_config.get("system_prompt", "")
             self._interrupted[session.session_id] = False
 
+            # One-line diagnostic so we can confirm from logs whether the
+            # LLM actually saw the document + RAG sections for this question.
+            logger.info(
+                "LLM PROMPT session=%s ctx=%d docs=%s rag=%s web=%s",
+                session.session_id[:8],
+                len(context),
+                "DOCUMENT OVERVIEWS" in context,
+                "PRIMARY SOURCE" in context,
+                "WEB SEARCH" in context,
+            )
+
             # Wait for filler to finish playing before first sentence
             elapsed = time.time() - filler_sent_at
             remaining = filler_duration - elapsed
@@ -1221,9 +1255,9 @@ class BotEngine:
             # --- Streaming pipeline: LLM sentence -> TTS -> send audio ---
             # Each sentence is synthesized and sent as soon as it arrives
             # from the LLM, cutting perceived latency by 60-70%.
+            # (total_playback/playback_started_at were seeded above with the
+            # filler audio so the final drain loop waits for filler tail too.)
             response_parts: list[str] = []
-            total_playback = 0.0
-            playback_started_at: float | None = None
             stream_timed_out = False
 
             try:
@@ -1265,6 +1299,11 @@ class BotEngine:
                                 tts_piece,
                                 session.agent_config.get("persona_id"),
                             )
+                            # Re-check cancel between synth and POST — otherwise
+                            # we ship audio that was produced right as the user
+                            # interrupted, which plays over the new response.
+                            if self._should_cancel_output(session):
+                                break
                             if session.bot_id and sentence_audio:
                                 await self._recall_client.send_audio(session.bot_id, sentence_audio)
                                 total_playback, playback_started_at = self._enqueue_playback_chunk(
@@ -1375,6 +1414,9 @@ class BotEngine:
                 wake_word_cfg = session.agent_config.get("wake_word", "nova")
                 wake_detected, q = detect_wake_word(queued["question"], wake_word=wake_word_cfg)
                 if wake_detected and q:
+                    # The pre-drain at the top of _handle_question will cut
+                    # residual audio when the next invocation runs, so we
+                    # don't need to double-stop here.
                     logger.info("Processing queued question for session %s", session.session_id[:8])
                     # Route through _process_pending_question to acquire the processing lock
                     self._pending_question[session.session_id] = {

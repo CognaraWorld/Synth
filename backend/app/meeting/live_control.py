@@ -127,13 +127,9 @@ class RecallMeetingControlProvider:
                 provider_status="missing_bot",
                 detail="No provider bot id is available for this meeting.",
             )
-        return ProviderActionResult(
-            provider_status="pending_integration",
-            detail=(
-                "Provider-side playback interruption is not wired yet. "
-                "The backend records the stop request and drops any unsent response audio."
-            ),
-        )
+        client = await self._get_client()
+        await client.stop_audio(bot_id)
+        return ProviderActionResult(provider_status="applied")
 
     async def leave(self, bot_id: str | None) -> ProviderActionResult:
         if not self.is_configured():

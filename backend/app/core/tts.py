@@ -4,24 +4,40 @@ Converts text responses into natural-sounding audio bytes that can be
 streamed back into the meeting via the Recall.ai bot. Also generates
 filler responses ("Let me think about that...") to reduce perceived latency.
 
-Phase 3 implementation.
+Backed by kokoro-onnx — same model and voices as the original Kokoro
+package but runs via ONNX Runtime. Avoids the PydanticSchemaGenerationError
+the torch-based package throws with pydantic 2.10, and is typically
+20-30% faster per synthesis.
 """
 
 from __future__ import annotations
 
 import io
-import random
+import logging
+import os
 import wave
+from pathlib import Path
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 try:
-    from kokoro import KPipeline
-except (ImportError, ModuleNotFoundError, Exception):  # pragma: no cover - pydantic compat
-    KPipeline = None
+    from kokoro_onnx import Kokoro
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    Kokoro = None
+
+
+# Default model-file locations relative to the backend package root.
+# Overridable via KOKORO_ONNX_MODEL_PATH / KOKORO_ONNX_VOICES_PATH env vars
+# so the same code works in Docker where files live at a different path.
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_MODEL_PATH = _BACKEND_ROOT / "models" / "kokoro" / "kokoro-v1.0.onnx"
+_DEFAULT_VOICES_PATH = _BACKEND_ROOT / "models" / "kokoro" / "voices-v1.0.bin"
+
 
 class TextToSpeech:
-    """Wrapper around the Kokoro TTS model for speech synthesis.
+    """Wrapper around Kokoro TTS for speech synthesis.
 
     Generates audio bytes from text, supporting both full responses
     and quick filler phrases for latency masking.
@@ -45,20 +61,33 @@ class TextToSpeech:
                 codes like ``af_heart`` (American female) or ``am_adam``
                 (American male).
             sample_rate: Desired output sample rate in Hz. Kokoro natively
-                outputs at 24000 Hz.
+                outputs at 24000 Hz — resampling is NOT applied; callers
+                should request 24000.
             speed: Speech speed multiplier. Values > 1.0 are faster.
         """
         self.voice = voice
         self.sample_rate = sample_rate
         self.speed = speed
 
-        # Initialize Kokoro pipeline — 'a' = American English
+        model_path = os.environ.get("KOKORO_ONNX_MODEL_PATH", str(_DEFAULT_MODEL_PATH))
+        voices_path = os.environ.get("KOKORO_ONNX_VOICES_PATH", str(_DEFAULT_VOICES_PATH))
+
         self._pipeline = None
-        if KPipeline is not None:
-            try:
-                self._pipeline = KPipeline(lang_code="a")
-            except Exception:
-                self._pipeline = None
+        if Kokoro is None:
+            logger.warning("kokoro-onnx not installed; TTS will return empty audio")
+            return
+        if not Path(model_path).exists() or not Path(voices_path).exists():
+            logger.warning(
+                "Kokoro ONNX files missing (model=%s, voices=%s); TTS disabled",
+                model_path, voices_path,
+            )
+            return
+        try:
+            self._pipeline = Kokoro(model_path, voices_path)
+            logger.info("Kokoro ONNX TTS initialized (voice=%s, speed=%.2fx)", voice, speed)
+        except Exception as exc:
+            logger.error("Kokoro ONNX init failed: %s", exc)
+            self._pipeline = None
 
     def synthesize(self, text: str) -> bytes:
         """Convert text to speech audio.
@@ -67,31 +96,30 @@ class TextToSpeech:
             text: The text to synthesize into audio.
 
         Returns:
-            Raw audio bytes (PCM int16 format) suitable for streaming
-            into the meeting via Recall.ai.
+            Raw audio bytes (PCM int16 format at 24 kHz) suitable for
+            streaming into the meeting via Recall.ai. Returns empty bytes
+            if TTS is unavailable or the input is empty.
         """
-        if self._pipeline is None:
+        if self._pipeline is None or not text or not text.strip():
             return b""
 
-        audio_chunks: list[np.ndarray] = []
-
-        for _graphemes, _phonemes, audio_tensor in self._pipeline(
-            text, voice=self.voice, speed=self.speed
-        ):
-            if audio_tensor is not None:
-                # audio_tensor is a 1-D torch tensor of float32 samples
-                audio_np = audio_tensor.numpy()
-                audio_chunks.append(audio_np)
-
-        if not audio_chunks:
+        try:
+            samples, _sr = self._pipeline.create(
+                text,
+                voice=self.voice,
+                speed=self.speed,
+                lang="en-us",
+            )
+        except Exception as exc:
+            logger.error("Kokoro synthesis failed: %s", exc)
             return b""
 
-        # Concatenate all chunks into a single float32 array
-        full_audio = np.concatenate(audio_chunks)
+        if samples is None or len(samples) == 0:
+            return b""
 
-        # Clamp to [-1, 1] and convert to PCM int16 bytes
-        full_audio = np.clip(full_audio, -1.0, 1.0)
-        pcm_int16 = (full_audio * 32767).astype(np.int16)
+        # samples is a float32 numpy array in [-1.0, 1.0]; convert to PCM int16.
+        clipped = np.clip(samples, -1.0, 1.0)
+        pcm_int16 = (clipped * 32767).astype(np.int16)
         return pcm_int16.tobytes()
 
     def synthesize_to_wav(self, text: str) -> bytes:
@@ -114,6 +142,4 @@ class TextToSpeech:
             wf.setsampwidth(2)  # int16 = 2 bytes per sample
             wf.setframerate(self.sample_rate)
             wf.writeframes(pcm_data)
-
         return buf.getvalue()
-

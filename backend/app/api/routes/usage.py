@@ -13,11 +13,16 @@ router = APIRouter(prefix="/usage", tags=["usage"])
 
 
 def _month_window(year: int, month: int) -> tuple[datetime, datetime]:
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    # Return naive UTC datetimes. UsageRecord.recorded_at is mapped as
+    # DateTime (no timezone) in SQLAlchemy — asyncpg raises DataError if
+    # we compare it to tz-aware values ("can't subtract offset-naive and
+    # offset-aware datetimes"). The values are still UTC by convention,
+    # same as what UsageRecord.default=_utcnow produces.
+    start = datetime(year, month, 1)
     if month == 12:
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        end = datetime(year + 1, 1, 1)
     else:
-        end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        end = datetime(year, month + 1, 1)
     return start, end
 
 
