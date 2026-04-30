@@ -60,10 +60,17 @@ def _build_pattern(wake_word: str) -> re.Pattern:
         )
     if (len(parts) == 1 and parts[0] == "nova") or (len(parts) == 2 and parts[0] == "hey" and parts[1] == "nova"):
         # "nova" or "hey nova" — accepts both with phonetic variants.
-        prefix = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"  # optional prefix
-        name = r"(?:nova|no\s*va|nora|noah|mova)"
+        # Two variant tiers:
+        #   bare-allowed   — distinctive enough to fire without a prefix
+        #   prefix-required — common-sounding two-word phrases that would
+        #                     fire on phrases like "I'm in over my head"
+        #                     unless we require the wake prefix in front.
+        prefix_optional = r"(?:(?:hey|he|hay|hi|they|okay)[,.\s]+)?"
+        prefix_required = r"(?:hey|he|hay|hi|they|okay|hay)[,.\s]+"
+        bare_allowed = r"(?:nova|no\s*va|nora|noah|mova|nove|noma|knowva)"
+        prefix_only = r"(?:inn?\s*over|in\s*nova|know\s*va|no\s*over|an?\s*over|the\s*nova)"
         return re.compile(
-            rf"\b{prefix}{name}\b",
+            rf"\b(?:{prefix_optional}{bare_allowed}|{prefix_required}{prefix_only})\b",
             re.IGNORECASE,
         )
     if len(parts) == 2 and parts[0] == "hey":

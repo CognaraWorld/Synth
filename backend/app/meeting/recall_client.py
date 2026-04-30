@@ -27,6 +27,11 @@ _RETRYABLE_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _CIRCUIT_BREAKER_THRESHOLD = 5
 _CIRCUIT_BREAKER_COOLDOWN_SECONDS = 30.0
 
+# One-shot flag so we only emit the loud "ffmpeg missing" ERROR the first
+# time a conversion attempt fails. The startup check in main.py is the
+# primary guard; this is the fallback if ffmpeg vanishes after startup.
+_FFMPEG_MISSING_LOGGED = False
+
 
 class RecallClientError(Exception):
     """Base exception for Recall.ai client errors."""
@@ -267,9 +272,14 @@ class RecallClient:
             bot_id: The Recall.ai bot identifier.
         """
         try:
+            # Recall.ai endpoint is /bot/{id}/leave_call/ — the bare /leave
+            # path returns 404, which the handler below silently swallows
+            # as "bot already gone" while the bot in fact stays in the call
+            # and keeps streaming transcripts. See
+            # https://docs.recall.ai/reference/bot_leave_call_create
             await self._run_with_retry(
                 f"stop_bot:{bot_id}",
-                lambda: self._client.post(f"/bot/{bot_id}/leave"),
+                lambda: self._client.post(f"/bot/{bot_id}/leave_call/"),
             )
             logger.info("Stopped Recall.ai bot %s", bot_id)
         except httpx.HTTPStatusError as exc:
@@ -352,8 +362,17 @@ class RecallClient:
         try:
             audio_seg.export(mp3_buf, format="mp3", bitrate="64k")
         except FileNotFoundError:
-            # pydub invokes ffmpeg; missing binary should not crash callers
-            logger.warning("ffmpeg not available; skipping PCM→MP3 conversion")
+            # pydub invokes ffmpeg; a missing binary turns every TTS chunk
+            # into b"" silently. Shout the first occurrence at ERROR so it
+            # appears in production logs, then suppress repeats.
+            global _FFMPEG_MISSING_LOGGED
+            if not _FFMPEG_MISSING_LOGGED:
+                logger.error(
+                    "ffmpeg not available — PCM→MP3 conversion failed; bot "
+                    "audio will be silent until ffmpeg is installed. This "
+                    "message is logged once per process."
+                )
+                _FFMPEG_MISSING_LOGGED = True
             return ""
         return base64.b64encode(mp3_buf.getvalue()).decode("ascii")
 
@@ -425,9 +444,17 @@ class RecallClient:
             logger.error("Send audio failed for bot %s (network): %s", bot_id, exc)
 
     async def stop_audio(self, bot_id: str) -> None:
-        """Stop any currently playing audio output immediately."""
+        """Stop any currently playing audio output immediately.
+
+        Recall's documented endpoint is ``DELETE /bot/{id}/output_audio/``
+        (with trailing slash). The previous ``POST /stop_output_audio``
+        path returns 404 for active bots, which the handler then
+        silently swallows as "nothing playing" — meaning the Stop
+        button in the UI does not actually interrupt speech.
+        See https://docs.recall.ai/reference/bot_output_audio_destroy
+        """
         try:
-            response = await self._client.post(f"/bot/{bot_id}/stop_output_audio")
+            response = await self._client.delete(f"/bot/{bot_id}/output_audio/")
             response.raise_for_status()
             logger.info("Stopped audio output for bot %s", bot_id)
         except httpx.HTTPStatusError as exc:

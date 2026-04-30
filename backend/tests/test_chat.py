@@ -48,6 +48,7 @@ class TestMeetingOwnership:
         user = _make_user()
         db = AsyncMock()
         fake_result = MagicMock()
+        fake_result.unique.return_value = fake_result
         fake_result.scalar_one_or_none.return_value = None
         db.execute.return_value = fake_result
 
@@ -66,6 +67,7 @@ class TestMeetingOwnership:
 
         db = AsyncMock()
         fake_result = MagicMock()
+        fake_result.unique.return_value = fake_result
         fake_result.scalar_one_or_none.return_value = meeting
         db.execute.return_value = fake_result
 
@@ -83,6 +85,7 @@ class TestMeetingOwnership:
 
         db = AsyncMock()
         fake_result = MagicMock()
+        fake_result.unique.return_value = fake_result
         fake_result.scalar_one_or_none.return_value = meeting
         db.execute.return_value = fake_result
 
@@ -105,6 +108,7 @@ class TestSendChatMessage:
         db.add = MagicMock()
         # _get_meeting_or_raise
         meeting_result = MagicMock()
+        meeting_result.unique.return_value = meeting_result
         meeting_result.scalar_one_or_none.return_value = meeting
         # chat history (empty)
         history_result = MagicMock()
@@ -153,6 +157,7 @@ class TestSendChatMessage:
         db = AsyncMock()
         db.add = MagicMock()
         meeting_result = MagicMock()
+        meeting_result.unique.return_value = meeting_result
         meeting_result.scalar_one_or_none.return_value = meeting
         history_result = MagicMock()
         history_result.scalars.return_value.all.return_value = []
@@ -210,6 +215,7 @@ class TestChatHistory:
         db = AsyncMock()
         # _get_meeting_or_raise
         meeting_result = MagicMock()
+        meeting_result.unique.return_value = meeting_result
         meeting_result.scalar_one_or_none.return_value = meeting
         # Combined window-function query: rows expose both the ChatMessage
         # and a total column. The endpoint reads total from the first row.
@@ -245,6 +251,7 @@ class TestChatHistory:
 
         db = AsyncMock()
         meeting_result = MagicMock()
+        meeting_result.unique.return_value = meeting_result
         meeting_result.scalar_one_or_none.return_value = meeting
         # Empty page still needs to return total=0 via window-function path.
         messages_result = MagicMock()
